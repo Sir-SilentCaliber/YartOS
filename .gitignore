@@ -1,0 +1,9 @@
+build/
+iso_root/
+limine/
+yart.iso
+*.o
+*.d
+*.elf
+initrd_root/etc/motd
+initrd_root/etc/yart.conf

@@ -6,6 +6,11 @@
 
 typedef enum { VN_FILE = 1, VN_DIR = 2 } vnode_type_t;
 
+/* Forward-declare so vnode can store a custom icon. */
+#ifndef ICON_COUNT
+typedef int icon_id_t;
+#endif
+
 typedef struct vnode {
     char         name[VFS_MAX_NAME];
     vnode_type_t type;
@@ -13,6 +18,7 @@ typedef struct vnode {
     size_t       cap;         /* allocated capacity for files             */
     void        *data;        /* heap-owned for files                     */
     u64          mtime;        /* unix-ish epoch from RTC                  */
+    icon_id_t    icon;        /* custom icon override (-1 = auto-detect)  */
     struct vnode *parent;
     struct vnode *child;       /* first child if dir                       */
     struct vnode *sibling;     /* next sibling                             */

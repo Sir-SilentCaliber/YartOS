@@ -77,10 +77,90 @@ static void ws_forget(window_t *w) {
 /* ---------- click hooks (back-compat for apps that poll) ---------- */
 int  g_files_click_x, g_files_click_y;
 bool g_files_click_pending;
+int  g_files_right_x, g_files_right_y;
+bool g_files_right_pending;
 int  g_term_click_x,  g_term_click_y;
 bool g_term_click_pending;
 int  g_editor_click_x, g_editor_click_y;
 bool g_editor_click_pending;
+
+/* ---------- desktop icons (shortcuts on the desktop) ---------- */
+#define MAX_DESKTOP_ICONS 32
+
+typedef struct {
+    char     name[VFS_MAX_NAME];
+    char     path[VFS_MAX_PATH];   /* vfs path for files, empty for apps */
+    icon_id_t icon;
+    int      x, y;
+    bool     is_app;
+    const yart_app_t *app;         /* if is_app */
+} desktop_icon_t;
+
+static desktop_icon_t g_desktop_icons[MAX_DESKTOP_ICONS];
+static int g_desktop_icon_count;
+static int g_desktop_drag = -1;    /* index being dragged */
+static int g_desktop_drag_ox, g_desktop_drag_oy;
+
+/* drag from file manager or drawer to desktop */
+static struct {
+    bool active;
+    bool from_drawer;              /* true=app from drawer, false=file from files */
+    char name[VFS_MAX_NAME];
+    char path[VFS_MAX_PATH];
+    icon_id_t icon;
+    const yart_app_t *app;
+} g_drop_drag;
+
+/* forward decls from app_files.c */
+extern bool files_drag_active(void);
+extern const char *files_drag_name(void);
+extern const char *files_drag_path(void);
+extern icon_id_t   files_drag_icon(void);
+extern void        files_drag_cancel(void);
+
+static void desktop_icon_add(const char *name, const char *path,
+                             icon_id_t icon, int x, int y,
+                             bool is_app, const yart_app_t *app) {
+    if (g_desktop_icon_count >= MAX_DESKTOP_ICONS) return;
+    desktop_icon_t *di = &g_desktop_icons[g_desktop_icon_count++];
+    strncpy(di->name, name, VFS_MAX_NAME - 1);
+    if (path) strncpy(di->path, path, VFS_MAX_PATH - 1);
+    else di->path[0] = 0;
+    di->icon = icon;
+    di->x = x; di->y = y;
+    di->is_app = is_app;
+    di->app = app;
+}
+
+static int desktop_icon_at(int x, int y) {
+    for (int i = 0; i < g_desktop_icon_count; i++) {
+        desktop_icon_t *d = &g_desktop_icons[i];
+        if (x >= d->x && x < d->x + 72 && y >= d->y && y < d->y + 72)
+            return i;
+    }
+    return -1;
+}
+
+static void draw_desktop_icons(void) {
+    for (int i = 0; i < g_desktop_icon_count; i++) {
+        desktop_icon_t *d = &g_desktop_icons[i];
+        int cx, cy; cursor_get_pos(&cx, &cy);
+        bool hover = (cx >= d->x && cx < d->x + 72 && cy >= d->y && cy < d->y + 72);
+        if (hover) {
+            draw_rounded_rect(d->x - 2, d->y - 2, 76, 76, 6,
+                              (u32)(0x20 << 24) | 0xFFFFFF);
+        }
+        draw_icon_sized(d->x + 20, d->y + 4, d->icon, 32);
+        /* label */
+        char buf[12];
+        int n = (int)strlen(d->name); if (n > 10) n = 10;
+        memcpy(buf, d->name, n); buf[n] = 0;
+        if ((int)strlen(d->name) > 10) { buf[7]='.'; buf[8]='.'; buf[9]='.'; }
+        int tw = text_width(buf);
+        draw_text(d->x + 36 - tw/2, d->y + 42, buf, TH_TEXT, 0xFF000000);
+    }
+}
+
 
 /* ---------- window list (head = top of z-order) ---------- */
 static window_t *windows;
@@ -659,13 +739,46 @@ void desktop_handle_mouse(int dx, int dy, u8 buttons) {
     if (drawer_open) {
         if (left && !prev_left) {
             if (drawer_hover >= 0) {
-                drawer_open = false;
-                drawer_query_len = 0; drawer_query[0] = 0;
-                yart_app_catalog[drawer_hover].launch();
+                /* start a potential drag from drawer */
+                g_drop_drag.active = true;
+                g_drop_drag.from_drawer = true;
+                g_drop_drag.app = &yart_app_catalog[drawer_hover];
+                g_drop_drag.icon = yart_app_catalog[drawer_hover].icon;
+                strncpy(g_drop_drag.name, yart_app_catalog[drawer_hover].name, VFS_MAX_NAME - 1);
+                g_drop_drag.path[0] = 0;
+                /* don't close drawer yet – wait to see if it's a click or drag */
+                prev_left = left; prev_right = right; return;
             } else {
                 drawer_open = false;
                 drawer_query_len = 0; drawer_query[0] = 0;
             }
+        }
+        /* if dragging from drawer and mouse released */
+        if (g_drop_drag.active && g_drop_drag.from_drawer && !left) {
+            /* if released outside drawer area → create desktop shortcut */
+            drawer_open = false;
+            drawer_query_len = 0; drawer_query[0] = 0;
+            if (cy < dock_y() && cy >= BAR_H + 40) {
+                desktop_icon_add(g_drop_drag.name, NULL, g_drop_drag.icon,
+                                 cx - 36, cy - 36, true, g_drop_drag.app);
+                toast("Added %s to desktop", g_drop_drag.name);
+            } else {
+                /* just launch the app */
+                g_drop_drag.app->launch();
+            }
+            g_drop_drag.active = false;
+            prev_left = left; prev_right = right; return;
+        }
+        /* if quick click (pressed and released without drag) → just launch */
+        if (g_drop_drag.active && g_drop_drag.from_drawer && !left && prev_left) {
+            drawer_open = false;
+            drawer_query_len = 0; drawer_query[0] = 0;
+            g_drop_drag.app->launch();
+            g_drop_drag.active = false;
+            prev_left = left; prev_right = right; return;
+        }
+        if (!g_drop_drag.active) {
+            prev_left = left; prev_right = right; return;
         }
         prev_left = left; prev_right = right; return;
     }
@@ -689,7 +802,17 @@ void desktop_handle_mouse(int dx, int dy, u8 buttons) {
         } else if (cy >= BAR_H) {
             window_t *w = window_at(cx, cy);
             if (!w) {
+                /* desktop right-click */
                 open_desktop_menu(cx, cy);
+                prev_left = left; prev_right = right; return;
+            }
+            /* route right-click to the focused window for context menus */
+            hit_t h = hit_test(w, cx, cy);
+            if (h == HIT_BODY) {
+                /* check if this is a Files window by icon */
+                g_files_right_x = cx; g_files_right_y = cy;
+                g_files_right_pending = true;
+                wm_dirty();
                 prev_left = left; prev_right = right; return;
             }
         }
@@ -753,6 +876,39 @@ void desktop_handle_mouse(int dx, int dy, u8 buttons) {
                 break;
             default: break;
             }
+        } else if (cy >= BAR_H && cy < dock_y()) {
+            /* click on desktop area - check desktop icons */
+            int di = desktop_icon_at(cx, cy);
+            if (di >= 0) {
+                g_desktop_drag = di;
+                g_desktop_drag_ox = cx - g_desktop_icons[di].x;
+                g_desktop_drag_oy = cy - g_desktop_icons[di].y;
+                /* double-click detection: if icon was already "focused", open it */
+                static int last_icon_click = -1;
+                static u64 last_icon_time = 0;
+                u64 now = pit_ticks() * 10;
+                if (di == last_icon_click && now - last_icon_time < 500) {
+                    /* double click: open */
+                    desktop_icon_t *d = &g_desktop_icons[di];
+                    if (d->is_app && d->app) {
+                        d->app->launch();
+                    } else if (d->path[0]) {
+                        vnode_t *v = vfs_lookup(d->path);
+                        if (v && v->type == VN_DIR) {
+                            extern void open_files(const char *);
+                            open_files(d->path);
+                        } else {
+                            open_editor(d->path);
+                        }
+                    }
+                    last_icon_click = -1;
+                } else {
+                    last_icon_click = di;
+                    last_icon_time = now;
+                }
+            } else {
+                /* clicked empty desktop - nothing selected */
+            }
         }
     }
 
@@ -809,6 +965,28 @@ void desktop_handle_mouse(int dx, int dy, u8 buttons) {
         }
     }
 
+    /* desktop icon dragging */
+    if (left && g_desktop_drag >= 0) {
+        desktop_icon_t *d = &g_desktop_icons[g_desktop_drag];
+        d->x = cx - g_desktop_drag_ox;
+        d->y = cy - g_desktop_drag_oy;
+        if (d->y < BAR_H) d->y = BAR_H;
+    }
+
+    /* file drop from file manager onto desktop */
+    if (g_drop_drag.active && !g_drop_drag.from_drawer) {
+        /* currently dragging a file from files manager */
+        if (!left) {
+            /* dropped on desktop */
+            if (cy >= BAR_H && cy < dock_y()) {
+                desktop_icon_add(g_drop_drag.name, g_drop_drag.path,
+                                 g_drop_drag.icon, cx - 36, cy - 36, false, NULL);
+                toast("Dropped %s on desktop", g_drop_drag.name);
+            }
+            g_drop_drag.active = false;
+        }
+    }
+
     if (!left && dragging) {
         window_t *w = dragging;
         if (drag_hit == HIT_TITLE) {
@@ -830,6 +1008,7 @@ void desktop_handle_mouse(int dx, int dy, u8 buttons) {
         dragging = 0;
     } else if (!left) {
         dragging = 0;
+        g_desktop_drag = -1;
     }
     prev_left = left;
 }
@@ -937,6 +1116,20 @@ void desktop_init(void) {
     session_init();
     login_overlay_init();
     cursor_set_pos(g_fb.width / 2, g_fb.height / 2);
+
+    /* create default user directories */
+    vfs_mkdir_p("/home/yart/Desktop");
+    vfs_mkdir_p("/home/yart/Documents");
+    vfs_mkdir_p("/home/yart/Pictures");
+    vfs_mkdir_p("/home/yart/Music");
+    vfs_mkdir_p("/home/yart/Videos");
+    vfs_mkdir_p("/home/yart/Downloads");
+
+    /* seed a few default desktop icons */
+    desktop_icon_add("Home", "/home/yart", ICON_HOME,
+                     40, BAR_H + 20, false, NULL);
+    desktop_icon_add("Files", "/home/yart", ICON_FILES,
+                     40, BAR_H + 100, false, NULL);
 }
 
 static bool any_animated(void) {
@@ -952,6 +1145,7 @@ static bool any_animated(void) {
 
 void desktop_render(void) {
     draw_wallpaper();
+    draw_desktop_icons();
     draw_statusbar();
     window_t *stack[32]; int n = 0;
     for (window_t *w = windows; w && n < 32; w = w->next) stack[n++] = w;

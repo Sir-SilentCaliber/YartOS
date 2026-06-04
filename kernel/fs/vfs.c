@@ -6,6 +6,7 @@
  * unlink syscalls.
  */
 #include <yart/fs.h>
+#include <yart/icons.h>
 #include <yart/mm.h>
 #include <yart/string.h>
 #include <yart/console.h>
@@ -53,6 +54,7 @@ static vnode_t *mknode(const char *name, vnode_type_t t) {
     strncpy(v->name, name, VFS_MAX_NAME - 1);
     v->type = t;
     v->mtime = now_epoch();
+    v->icon  = (icon_id_t)-1;    /* -1 = auto-detect from extension */
     return v;
 }
 

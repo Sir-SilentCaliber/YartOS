@@ -134,5 +134,5 @@ initrd_root/etc/wallpaper.bmp: scripts/gen_wallpaper_bmp.py
 kernel/gui/font_data.c: scripts/gen_fonts.py
 	python3 scripts/gen_fonts.py $@
 
-kernel/gui/asset_icons.c kernel/gui/asset_cursor.c kernel/gui/asset_wallpaper.c: scripts/gen_assets.py
-	python3 scripts/gen_assets.py
+kernel/gui/asset_icons.c kernel/gui/asset_cursor.c kernel/gui/asset_wallpaper.c: scripts/gen_assets_win.py
+	python3 scripts/gen_assets_win.py

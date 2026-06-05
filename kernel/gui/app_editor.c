@@ -201,9 +201,11 @@ static void ed_on_key(window_t *w, int sc, char ch, u32 mods) {
     /* arrow keys + navigation */
     switch (sc) {
     case 0x4B:                                       /* left */
-        if (e->caret > 0) e->caret--; return;
+        if (e->caret > 0) e->caret--;
+        return;
     case 0x4D:                                       /* right */
-        if (e->caret < e->size) e->caret++; return;
+        if (e->caret < e->size) e->caret++;
+        return;
     case 0x48: {                                     /* up */
         int col = e->caret - line_start(e, e->caret);
         int prev_end = line_start(e, e->caret) - 1;

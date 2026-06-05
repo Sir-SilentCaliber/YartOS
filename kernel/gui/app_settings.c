@@ -66,7 +66,8 @@ static bool slider(int x, int y, int w, int *val, int lo, int hi, const char *la
     /* click-on-track sets value */
     if (clicked_rect(x, ty - 4, w, 22)) {
         int p = g_editor_click_x - x;
-        if (p < 0) p = 0; if (p > w) p = w;
+        if (p < 0) p = 0;
+        if (p > w) p = w;
         int nv = lo + p * range / w;
         if (nv != *val) { *val = nv; return true; }
     }
@@ -277,7 +278,7 @@ static void settings_paint(window_t *w) {
     draw_vline(x + strip_w, y + 1, H - 2, TH_WIN_BORDER);
     int ty = y + 10;
     for (int i = 0; i < TAB_COUNT; i++) {
-        bool active = (st->tab == i);
+        bool active = (st->tab == (settings_tab_t)i);
         if (active) draw_rect(x + 4, ty - 2, strip_w - 8, 24, TH_ACCENT_BG);
         draw_text(x + 14, ty + 2, tab_names[i], active ? g_config.accent : TH_TEXT, 0);
         if (clicked_rect(x + 4, ty - 2, strip_w - 8, 24)) st->tab = i;

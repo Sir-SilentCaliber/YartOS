@@ -36,9 +36,9 @@ void session_init(void) {
     session_load_users();
 
     if (g_session.user_count == 0) {
-        g_session.setup_wizard_visible = true;
-        g_session.login_screen_visible = false;
+        session_create_user("demo", "demo", true);
     }
+    session_login(0);
 
     session_input_activity();
 }

@@ -118,6 +118,16 @@ extern const char *files_drag_path(void);
 extern icon_id_t   files_drag_icon(void);
 extern void        files_drag_cancel(void);
 
+/* called by files app to start a drag-to-desktop for a file/folder */
+void desktop_begin_file_drop(const char *name, const char *path, icon_id_t icon) {
+    g_drop_drag.active = true;
+    g_drop_drag.from_drawer = false;
+    strncpy(g_drop_drag.name, name, VFS_MAX_NAME - 1);
+    strncpy(g_drop_drag.path, path, VFS_MAX_PATH - 1);
+    g_drop_drag.icon = icon;
+    g_drop_drag.app = NULL;
+}
+
 static void desktop_icon_add(const char *name, const char *path,
                              icon_id_t icon, int x, int y,
                              bool is_app, const yart_app_t *app) {
@@ -979,9 +989,13 @@ void desktop_handle_mouse(int dx, int dy, u8 buttons) {
         if (!left) {
             /* dropped on desktop */
             if (cy >= BAR_H && cy < dock_y()) {
-                desktop_icon_add(g_drop_drag.name, g_drop_drag.path,
-                                 g_drop_drag.icon, cx - 36, cy - 36, false, NULL);
-                toast("Dropped %s on desktop", g_drop_drag.name);
+                window_t *w = window_at(cx, cy);
+                if (!w) {
+                    /* only drop if landed on bare desktop (not over another window) */
+                    desktop_icon_add(g_drop_drag.name, g_drop_drag.path,
+                                     g_drop_drag.icon, cx - 36, cy - 36, false, NULL);
+                    toast("Dropped %s on desktop", g_drop_drag.name);
+                }
             }
             g_drop_drag.active = false;
         }

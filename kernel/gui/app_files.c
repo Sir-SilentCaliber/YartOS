@@ -96,7 +96,6 @@ static void build_path(files_state_t *st, const char *name, char *out, int cap) 
 /* ---------- icon picker overlay ---------- */
 static void draw_icon_picker(window_t *w, files_state_t *st) {
     /* darken background */
-    const u32 MASK = 0x007F7F7FU;
     int x0 = w->x, y0 = w->y + WIN_TITLE_H;
     int ww = w->w, hh = w->h - WIN_TITLE_H;
     /* modal panel centered in the window */
@@ -430,6 +429,9 @@ extern bool g_files_click_pending;
 extern int  g_files_right_x, g_files_right_y;
 extern bool g_files_right_pending;
 
+/* from desktop.c */
+extern void desktop_begin_file_drop(const char *name, const char *path, icon_id_t icon);
+
 static void files_handle_click(window_t *w) {
     files_state_t *st = w->ud;
     int cx = g_files_click_x, cy = g_files_click_y;
@@ -513,6 +515,14 @@ static void files_handle_click(window_t *w) {
             } else {
                 st->sel = idx;
             }
+            /* start potential drag to desktop (drop only happens on release over bare desktop) */
+            {
+                char p[VFS_MAX_PATH];
+                build_path(st, c->name, p, VFS_MAX_PATH);
+                icon_id_t ic = (c->icon >= 0 && c->icon < ICON_COUNT) ? (icon_id_t)c->icon :
+                               icon_for_file(c->name, c->type == VN_DIR);
+                desktop_begin_file_drop(c->name, p, ic);
+            }
             return;
         }
     }
@@ -555,8 +565,7 @@ static void files_handle_rightclick(window_t *w) {
 }
 
 /* public entry: called each paint frame */
-int g_files_right_x, g_files_right_y;
-bool g_files_right_pending;
+/* (globals defined in desktop.c and shared via externs) */
 
 static void files_paint_entry(window_t *w) {
     files_paint(w);

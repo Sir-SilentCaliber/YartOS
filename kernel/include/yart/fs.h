@@ -6,10 +6,9 @@
 
 typedef enum { VN_FILE = 1, VN_DIR = 2 } vnode_type_t;
 
-/* Forward-declare so vnode can store a custom icon. */
-#ifndef ICON_COUNT
-typedef int icon_id_t;
-#endif
+/* icon_id_t is defined in icons.h (the real enum with all ICON_* values).
+ * Include it here so vnode can use the proper type in any include order. */
+#include <yart/icons.h>
 
 typedef struct vnode {
     char         name[VFS_MAX_NAME];

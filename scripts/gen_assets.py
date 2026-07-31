@@ -185,20 +185,168 @@ def icon_monitor():
     d.line((7,28,24,28), fill=PANEL_HI, width=2)
     return img
 
+# --- file-type icons (12-17) ---
+def icon_img():
+
+    img = new_icon(); d = ImageDraw.Draw(img)
+    rrect(d, (4,4,27,27), 3, fill=(45,120,190,255), outline=BLK, w=1)
+    d.ellipse((8,8,13,13), fill=WARN)
+    d.polygon([(6,24),(14,15),(21,24)], fill=(120,200,120,255), outline=BLK)
+    d.polygon([(15,24),(21,17),(26,24)], fill=(80,160,90,255), outline=BLK)
+    return img
+
+def icon_video():
+    img = new_icon(); d = ImageDraw.Draw(img)
+    rrect(d, (3,5,28,26), 3, fill=(180,50,60,255), outline=BLK, w=1)
+    d.polygon([(12,10),(22,15),(12,21)], fill=TEXT, outline=BLK)
+    for y in (7, 12, 17, 22):
+        d.rectangle((4,y,6,y+2), fill=TEXT)
+        d.rectangle((25,y,27,y+2), fill=TEXT)
+    return img
+
+def icon_code():
+    img = new_icon(); d = ImageDraw.Draw(img)
+    rrect(d, (4,4,27,27), 2, fill=PANEL_HI, outline=BLK, w=1)
+    d.line((11,10,6,15), fill=ACCENT, width=2)
+    d.line((6,15,11,21), fill=ACCENT, width=2)
+    d.line((20,10,25,15), fill=ACCENT, width=2)
+    d.line((25,15,20,21), fill=ACCENT, width=2)
+    d.line((17,9,14,22), fill=TEXT_DIM, width=2)
+    return img
+
+def icon_music():
+    img = new_icon(); d = ImageDraw.Draw(img)
+    rrect(d, (4,4,27,27), 3, fill=(140,70,180,255), outline=BLK, w=1)
+    d.ellipse((7,19,13,24), fill=TEXT, outline=BLK)
+    d.ellipse((17,17,23,22), fill=TEXT, outline=BLK)
+    d.line((13,21,13,9), fill=TEXT, width=2)
+    d.line((23,19,23,7), fill=TEXT, width=2)
+    d.polygon([(13,9),(23,7),(23,11),(13,13)], fill=TEXT)
+    return img
+
+def icon_archive():
+    img = new_icon(); d = ImageDraw.Draw(img)
+    rrect(d, (5,6,26,27), 2, fill=(210,160,50,255), outline=BLK, w=1)
+    for y in range(8, 22, 4):
+        d.rectangle((14,y,17,y+2), fill=DGREY, outline=BLK)
+    rrect(d, (13,22,18,26), 1, fill=TEXT, outline=BLK)
+    return img
+
+def icon_text():
+    return icon_file()
+
+# --- folder variants (18-23) ---
+def icon_folder_open():
+    img = new_icon(); d = ImageDraw.Draw(img)
+    d.polygon([(3,11),(11,7),(17,7),(17,11)], fill=ACCENT_DIM, outline=BLK)
+    rrect(d, (3,10,27,24), 2, fill=ACCENT_DIM, outline=BLK)
+    d.polygon([(1,28),(6,14),(30,14),(25,28)], fill=ACCENT, outline=BLK)
+    return img
+
+def _folder_badge(badge_fn):
+    img = new_icon(); d = ImageDraw.Draw(img)
+    d.polygon([(3,11),(11,7),(17,7),(17,11)], fill=ACCENT_DIM, outline=BLK)
+    rrect(d, (3,10,29,27), 3, fill=ACCENT, outline=BLK, w=1)
+    rrect(d, (3,11,29,15), 1, fill=(255,210,170,255))
+    badge_fn(d)
+    return img
+
+def icon_folder_pic():
+    def b(d):
+        rrect(d, (16,14,28,26), 2, fill=(45,120,190,255), outline=BLK)
+        d.ellipse((18,16,21,19), fill=WARN)
+        d.polygon([(17,24),(21,19),(26,24)], fill=(120,200,120,255))
+    return _folder_badge(b)
+
+def icon_folder_music():
+    def b(d):
+        rrect(d, (16,14,28,26), 2, fill=(140,70,180,255), outline=BLK)
+        d.ellipse((18,21,22,25), fill=TEXT)
+        d.line((22,23,22,16), fill=TEXT, width=1)
+        d.line((22,16,26,15), fill=TEXT, width=1)
+    return _folder_badge(b)
+
+def icon_folder_video():
+    def b(d):
+        rrect(d, (16,14,28,26), 2, fill=(180,50,60,255), outline=BLK)
+        d.polygon([(20,17),(26,20),(20,23)], fill=TEXT)
+    return _folder_badge(b)
+
+def icon_folder_doc():
+    def b(d):
+        rrect(d, (16,14,28,26), 2, fill=TEXT, outline=BLK)
+        for y in (17, 20, 23):
+            d.line((18,y,26,y), fill=TEXT_MUT, width=1)
+    return _folder_badge(b)
+
+def icon_folder_dl():
+    def b(d):
+        rrect(d, (16,14,28,26), 2, fill=OK, outline=BLK)
+        d.line((22,16,22,22), fill=BLK, width=2)
+        d.polygon([(19,20),(22,24),(25,20)], fill=BLK)
+    return _folder_badge(b)
+
+# --- system icons (24-26) ---
+def icon_recycle():
+    img = new_icon(); d = ImageDraw.Draw(img)
+    rrect(d, (7,9,24,27), 2, fill=DGREY, outline=BLK, w=1)
+    rrect(d, (5,6,26,9), 1, fill=PANEL_HI, outline=BLK)
+    d.rectangle((13,4,18,6), fill=PANEL_HI, outline=BLK)
+    for x in (11, 15, 19):
+        d.line((x,12,x,24), fill=OK, width=2)
+    return img
+
+def icon_network():
+    img = new_icon(); d = ImageDraw.Draw(img)
+    d.ellipse((4,4,27,27), fill=(40,140,220,255), outline=BLK, width=1)
+    d.ellipse((9,4,22,27), fill=(0,0,0,0), outline=TEXT, width=1)
+    d.line((4,15,27,15), fill=TEXT, width=1)
+    d.line((6,10,25,10), fill=TEXT, width=1)
+    d.line((6,21,25,21), fill=TEXT, width=1)
+    return img
+
+def icon_lock():
+    img = new_icon(); d = ImageDraw.Draw(img)
+    d.arc((9,4,22,18), start=180, end=0, fill=WARN, width=3)
+    rrect(d, (6,13,25,27), 3, fill=WARN, outline=BLK, w=1)
+    d.ellipse((14,17,17,20), fill=BLK)
+    d.line((15,19,15,23), fill=BLK, width=2)
+    return img
+
 ICONS = [
-    ("FILES",   icon_files),
-    ("TERM",    icon_terminal),
-    ("EDITOR",  icon_editor),
-    ("CLOCK",   icon_clock),
-    ("INFO",    icon_info),
-    ("FOLDER",  icon_folder),
-    ("FILE",    icon_file),
-    ("HOME",    icon_home),
-    ("CONFIG",  icon_config),
-    ("DRAWER",  icon_drawer),
-    ("CALC",    icon_calc),
-    ("MONITOR", icon_monitor),
+    # 0-11: app/system
+    ("FILES",        icon_files),
+    ("TERM",         icon_terminal),
+    ("EDITOR",       icon_editor),
+    ("CLOCK",        icon_clock),
+    ("INFO",         icon_info),
+    ("FOLDER",       icon_folder),
+    ("FILE",         icon_file),
+    ("HOME",         icon_home),
+    ("CONFIG",       icon_config),
+    ("DRAWER",       icon_drawer),
+    ("CALC",         icon_calc),
+    ("MONITOR",      icon_monitor),
+    # 12-17: file types
+    ("IMG",          icon_img),
+    ("VIDEO",        icon_video),
+    ("CODE",         icon_code),
+    ("MUSIC",        icon_music),
+    ("ARCHIVE",      icon_archive),
+    ("TEXT",         icon_text),
+    # 18-23: folder variants
+    ("FOLDER_OPEN",  icon_folder_open),
+    ("FOLDER_PIC",   icon_folder_pic),
+    ("FOLDER_MUSIC", icon_folder_music),
+    ("FOLDER_VIDEO", icon_folder_video),
+    ("FOLDER_DOC",   icon_folder_doc),
+    ("FOLDER_DL",    icon_folder_dl),
+    # 24-26: system
+    ("RECYCLE",      icon_recycle),
+    ("NETWORK",      icon_network),
+    ("LOCK",         icon_lock),
 ]
+
 
 # ---------- cursor ----------
 CURSOR_W, CURSOR_H = 12, 18

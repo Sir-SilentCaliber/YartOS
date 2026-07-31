@@ -9,10 +9,16 @@
 # =============================================================================
 
 CROSS    ?= x86_64-elf
-CC       := $(CROSS)-gcc
-LD       := $(CROSS)-ld
+ifeq ($(shell which $(CROSS)-gcc 2>/dev/null),)
+  CC      := gcc
+  LD      := ld
+  OBJCOPY := objcopy
+else
+  CC      := $(CROSS)-gcc
+  LD      := $(CROSS)-ld
+  OBJCOPY := $(CROSS)-objcopy
+endif
 AS       := nasm
-OBJCOPY  := $(CROSS)-objcopy
 
 KERNEL   := build/yart.elf
 USER_ELF := build/init.elf

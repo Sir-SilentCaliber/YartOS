@@ -75,7 +75,7 @@ def main(out):
             f.write(f"  {{ {','.join(f'0x{b:02X}' for b in rows)} }},\n")
         f.write("};\n\n")
     # Registry
-    f.write("typedef struct { const char *name; const u8 (*data)[16]; } yart_font_t;\n")
+    
     f.write("const yart_font_t yart_fonts[] = {\n")
     for name, _ in FONTS:
         f.write(f'  {{ "{name}", yart_font_{name} }},\n')

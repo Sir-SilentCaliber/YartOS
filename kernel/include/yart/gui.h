@@ -79,7 +79,8 @@ struct yart_window {
     color_t bg;
     void  *ud;                                /* per-app state */
     void (*paint)(window_t *win);
-    void (*on_key)(window_t *win, int sc, char ch, u32 mods);
+    void (*on_key)(window_t *win, int sc, int ch, u32 mods);
+    void (*on_scroll)(window_t *win, int dy); /* mouse wheel / PgUp-PgDn  */
     void (*on_close)(window_t *win);
     window_t *next;
 };
@@ -105,5 +106,5 @@ void cursor_get_pos(int *x, int *y);
 void cursor_draw(void);
 
 /* input bridge from desktop loop */
-void desktop_handle_key(int scancode, char ascii, u32 mods);
-void desktop_handle_mouse(int dx, int dy, u8 buttons);
+void desktop_handle_key(int scancode, int ascii, u32 mods);
+void desktop_handle_mouse(int dx, int dy, u8 buttons, int wheel);

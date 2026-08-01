@@ -28,12 +28,21 @@ else
     FW=()
 fi
 
+# Virtual disk for persistent storage (created on first run)
+DISK="$ROOT/yart-disk.img"
+if [ ! -f "$DISK" ]; then
+    echo "(!) creating 32 MiB virtual disk: $DISK"
+    dd if=/dev/zero of="$DISK" bs=1M count=32 status=none
+fi
+
 exec qemu-system-x86_64 \
   $ACCEL \
   -smp 4 -m 1024 \
   -machine q35 \
   "${FW[@]}" \
   -cdrom "$ISO" \
+  -drive "file=$DISK,format=raw,if=none,id=vda" \
+  -device virtio-blk-pci,drive=vda \   # modern virtio 1.0 + MSI-X
   -boot d \
   -serial stdio \
   -vga std \

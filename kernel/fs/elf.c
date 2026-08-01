@@ -36,6 +36,8 @@ typedef struct PACKED {
 
 #define PT_LOAD 1
 
+#define ELF_EM_X86_64 62
+
 u64 elf_load(vnode_t *v) {
     if (!v || v->type != VN_FILE || v->size < sizeof(elf64_ehdr_t)) return 0;
     elf64_ehdr_t *eh = v->data;
@@ -43,8 +45,17 @@ u64 elf_load(vnode_t *v) {
         kprintf("elf: bad magic in %s\n", v->name);
         return 0;
     }
-    if (eh->cls != 2 /* 64-bit */) {
-        kprintf("elf: not 64-bit\n");
+    if (eh->cls != 2 /* 64-bit */ || eh->machine != ELF_EM_X86_64) {
+        kprintf("elf: not x86_64 64-bit\n");
+        return 0;
+    }
+    if (eh->phentsize < sizeof(elf64_phdr_t) || eh->phnum == 0 || eh->phnum > 64) {
+        kprintf("elf: bad program headers\n");
+        return 0;
+    }
+    if (eh->phoff > v->size ||
+        eh->phoff + (u64)eh->phnum * sizeof(elf64_phdr_t) > v->size) {
+        kprintf("elf: headers out of file bounds\n");
         return 0;
     }
     elf64_phdr_t *ph = (elf64_phdr_t *)((u8 *)v->data + eh->phoff);
@@ -54,6 +65,11 @@ u64 elf_load(vnode_t *v) {
         u64 va    = ph[i].vaddr;
         u64 mem   = ph[i].memsz;
         u64 file  = ph[i].filesz;
+        if (va + mem < va || ph[i].offset > v->size ||
+            ph[i].offset + file > v->size) {
+            kprintf("elf: corrupt segment in %s\n", v->name);
+            return 0;
+        }
         u64 first = PAGE_ALIGN_DOWN(va);
         u64 last  = PAGE_ALIGN_UP(va + mem);
         u64 flags = PTE_RW | PTE_US;

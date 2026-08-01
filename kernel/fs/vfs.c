@@ -6,11 +6,13 @@
  * unlink syscalls.
  */
 #include <yart/fs.h>
+#include <yart/blk.h>
 #include <yart/icons.h>
 #include <yart/mm.h>
 #include <yart/string.h>
 #include <yart/console.h>
 #include <yart/hal.h>
+#include <yart/sched.h>   /* sched_current_euid() for file ownership */
 
 typedef struct PACKED {
     char name[100];
@@ -55,7 +57,45 @@ static vnode_t *mknode(const char *name, vnode_type_t t) {
     v->type = t;
     v->mtime = now_epoch();
     v->icon  = (icon_id_t)-1;    /* -1 = auto-detect from extension */
+    v->refs  = 1;                /* owned by the tree until unlinked  */
+    v->uid   = sched_current_euid();  /* creator owns the file (0=boot) */
+    v->gid   = sched_current_egid();
+    v->mode  = (t == VN_DIR) ? 0755u : 0644u;
+    {
+        u16 um = sched_current_umask();
+        v->mode &= (u16)~um;                 /* umask strips bits at create */
+    }
     return v;
+}
+
+bool vfs_check_perm(vnode_t *v, u32 euid, const u32 *groups, int ngroups, int want) {
+    if (!v) return false;
+    if (euid == 0) return true;              /* root bypasses everything  */
+    /* ACL: an explicit per-user grant is checked FIRST and overrides the
+     * mode bits (POSIX ACL semantics for the named-user class) */
+    for (int i = 0; i < v->acl_count && i < VFS_ACL_MAX; i++)
+        if (v->acl[i].uid == euid)
+            return (v->acl[i].mask & want) == want;
+    int bits;
+    if (v->uid == euid)        bits = (v->mode >> 6) & PERM_RWX;  /* owner */
+    else {
+        bool in_group = false;
+        for (int g = 0; g < ngroups; g++)
+            if (v->gid == groups[g]) { in_group = true; break; }
+        bits = in_group ? ((v->mode >> 3) & PERM_RWX)          /* group */
+                        : ((v->mode >> 0) & PERM_RWX);         /* other */
+    }
+    return (bits & want) == want;
+}
+
+void vnode_ref(vnode_t *v) { if (v) v->refs++; }
+
+void vnode_unref(vnode_t *v) {
+    if (!v || v->refs == 0) return;
+    if (--v->refs == 0) {
+        if (v->data) kfree(v->data);
+        kfree(v);
+    }
 }
 
 static void attach(vnode_t *parent, vnode_t *child) {
@@ -89,6 +129,8 @@ vnode_t *vfs_create(vnode_t *parent, const char *name, vnode_type_t t) {
     if (!parent || parent->type != VN_DIR) return NULL;
     if (find_child(parent, name)) return NULL;
     vnode_t *n = mknode(name, t);
+    n->dirty = true;                       /* needs persisting to disk     */
+    n->dirty_blocks = 0xFFFFFFFFu;
     attach(parent, n);
     return n;
 }
@@ -224,6 +266,13 @@ int vfs_write(vnode_t *v, const void *buf, size_t off, size_t n) {
     memcpy((u8 *)v->data + off, buf, n);
     if (off + n > v->size) v->size = off + n;
     v->mtime = now_epoch();
+    v->dirty = true;
+    /* mark the affected 512-byte blocks dirty (incremental disk sync) */
+    {
+        u32 b0 = (u32)(off / BLK_SECTOR_SIZE);
+        u32 b1 = (u32)((off + n + BLK_SECTOR_SIZE - 1) / BLK_SECTOR_SIZE);
+        for (u32 b = b0; b < b1 && b < 32; b++) v->dirty_blocks |= (1u << b);
+    }
     return (int)n;
 }
 
@@ -235,6 +284,8 @@ int vfs_truncate(vnode_t *v, size_t n) {
     }
     v->size = n;
     v->mtime = now_epoch();
+    v->dirty = true;
+    v->dirty_blocks = 0xFFFFFFFFu;   /* truncate: rewrite every block */
     return 0;
 }
 
@@ -242,14 +293,21 @@ int vfs_unlink(vnode_t *v) {
     if (!v || !v->parent) return -1;
     /* don't allow non-empty dir delete */
     if (v->type == VN_DIR && v->child) return -1;
+    {
+        char pth[VFS_MAX_PATH];
+        if (vfs_path_of(v, pth, sizeof pth) > 0)
+            blkfs_note_delete(pth);        /* remove from disk on next sync */
+    }
     vnode_t *p = v->parent;
     if (p->child == v) p->child = v->sibling;
     else {
         for (vnode_t *c = p->child; c; c = c->sibling)
             if (c->sibling == v) { c->sibling = v->sibling; break; }
     }
-    if (v->data) kfree(v->data);
-    kfree(v);
+    v->sibling = NULL;
+    v->parent  = NULL;          /* detached: no longer reachable by lookup */
+    vnode_unref(v);             /* drop the tree's reference; freed only
+                                   when the last open fd closes it too */
     return 0;
 }
 

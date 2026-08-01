@@ -4,6 +4,7 @@
 #include <yart/string.h>
 #include <yart/gui.h>
 #include <yart/theme.h>
+#include <yart/spinlock.h>
 #include <stdarg.h>
 
 #define COM1 0x3f8
@@ -18,13 +19,41 @@ void serial_init(void) {
     outb(COM1 + 4, 0x0B);
 }
 
-void serial_putc(char c) {
-    if (c == '\n') { while (!(inb(COM1 + 5) & 0x20)); outb(COM1, '\r'); }
-    while (!(inb(COM1 + 5) & 0x20));
-    outb(COM1, c);
+unsigned int g_cpu_count_hint = 1;   /* set by smp.c once APs are up */
+static spinlock_t g_console_lock;
+static u64 console_acquire(void) {
+    u64 iflags = irq_save();               /* no IRQ while we hold it      */
+    if (g_cpu_count_hint > 1) spin_lock(&g_console_lock);
+    return iflags;
+}
+static void console_release(u64 iflags) {
+    if (g_cpu_count_hint > 1) spin_unlock(&g_console_lock);
+    irq_restore(iflags);
 }
 
-void serial_puts(const char *s) { while (*s) serial_putc(*s++); }
+/* Bounded wait for the 16550 transmitter: under QEMU/TCG with many CPUs
+ * hammering the console, the chardev backend can stall and THRE never sets.
+ * Waiting forever would hold the console spinlock (IRQs off) and freeze the
+ * whole system, so after a bounded spin we drop the character instead. */
+static void serial_tx_wait(void) {
+    u32 tries = 0;
+    while (!(inb(COM1 + 5) & 0x20)) {
+        if (++tries > 200000u) return;   /* give up: don't hang the OS */
+        __asm__ volatile("pause");
+    }
+}
+
+void serial_putc(char c) {
+    if (c == '\n') { serial_tx_wait(); if (inb(COM1 + 5) & 0x20) outb(COM1, '\r'); }
+    serial_tx_wait();
+    if (inb(COM1 + 5) & 0x20) outb(COM1, c);
+}
+
+void serial_puts(const char *s) {
+    u64 fl = console_acquire();
+    while (*s) serial_putc(*s++);
+    console_release(fl);
+}
 
 static int tcx = 8, tcy = 8;
 static bool fb_ready = false;
@@ -42,7 +71,11 @@ void kputc(char c) {
     }
 }
 
-void kputs(const char *s) { while (*s) kputc(*s++); }
+void kputs(const char *s) {
+    u64 fl = console_acquire();
+    while (*s) kputc(*s++);
+    console_release(fl);
+}
 
 int kprintf(const char *fmt, ...) {
     char buf[1024];

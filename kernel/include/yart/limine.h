@@ -181,3 +181,34 @@ struct limine_rsdp_request {
     uint64_t revision;
     LIMINE_PTR(struct limine_rsdp_response *) response;
 };
+
+/* ---------- SMP (bootloader-started APs) ---------- */
+#define LIMINE_SMP_REQUEST { LIMINE_COMMON_MAGIC, 0x95a67b819a1b857e, 0xa0b61b723b6a73e0 }
+
+struct limine_smp_info;
+typedef void (*limine_goto_address)(struct limine_smp_info *);
+
+#define LIMINE_SMP_X2APIC (1 << 0)
+
+struct limine_smp_info {
+    uint32_t processor_id;
+    uint32_t lapic_id;
+    uint64_t reserved;
+    LIMINE_PTR(limine_goto_address) goto_address;
+    uint64_t extra_argument;
+};
+
+struct limine_smp_response {
+    uint64_t revision;
+    uint32_t flags;
+    uint32_t bsp_lapic_id;
+    uint64_t cpu_count;
+    LIMINE_PTR(struct limine_smp_info **) cpus;
+};
+
+struct limine_smp_request {
+    uint64_t id[4];
+    uint64_t revision;
+    LIMINE_PTR(struct limine_smp_response *) response;
+    uint64_t flags;
+};

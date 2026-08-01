@@ -1,4 +1,11 @@
 ; Yart OS - 256 ISR stubs that all converge on isr_common -> isr_dispatch(C)
+;
+; Privilege handling: if the interrupted context was ring-3 (CS.RPL == 3),
+; swapgs so GS.base points at the kernel per-CPU area.  The reverse swapgs
+; happens on exit, with interrupts masked for the single-instruction window.
+;
+; Stack layout at isr_common entry (same for NOERR and ERR stubs):
+;   [rsp+0]=vector  [rsp+8]=err  [rsp+16]=RIP  [rsp+24]=CS
 bits 64
 section .text
 extern isr_dispatch
@@ -40,12 +47,23 @@ extern isr_dispatch
 %endmacro
 
 isr_common:
+    test byte [rsp+24], 3       ; CS.RPL: 3 => came from ring 3
+    jz   .from_kernel
+    swapgs
+.from_kernel:
     PUSHALL
     cld
-    mov rdi, rsp        ; cpu_regs_t *
+    mov rdi, rsp                ; cpu_regs_t *
     call isr_dispatch
+    mov rsp, rax                ; scheduler may have switched stacks: the
+                                ; returned rsp is the frame to resume from
     POPALL
-    add rsp, 16         ; vector + err
+    add rsp, 16                 ; vector + err
+    cli                         ; close the swapgs/iretq race for IRQs
+    test byte [rsp+8], 3        ; CS.RPL after popping vector+err
+    jz   .to_kernel
+    swapgs
+.to_kernel:
     iretq
 
 ; vectors that push their own error code on the CPU stack

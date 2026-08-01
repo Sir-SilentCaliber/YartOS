@@ -3,7 +3,7 @@
 
 #define MAX_USERS       8
 #define USER_NAME_LEN   32
-#define USER_PASS_LEN   64
+#define USER_PASS_LEN   96   /* '$'+16-hex-salt+'$'+64-hex-sha256 */
 #define USER_HOME_LEN   128
 
 typedef struct {
@@ -51,4 +51,4 @@ void session_switch_user(void);
 void session_input_activity(void);
 bool session_is_idle(void);
 
-void session_hash_password(const char *password, char *out_hash, int out_len);
+void session_hash_password(const char *password, const char *salt, char *out_hash, int out_len);

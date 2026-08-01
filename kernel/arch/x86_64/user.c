@@ -1,15 +1,19 @@
-/* Yart OS - launch a ring-3 task from an ELF file in the VFS.
+/* Yart OS - prepare a ring-3 task from an ELF file in the VFS.
  *
  * Pattern:
- *   1) parse ELF64, allocate user pages with PTE_US|PTE_RW for each
- *      PT_LOAD segment, copy file bytes in.
- *   2) allocate a user stack with PTE_US|PTE_RW.
- *   3) save callee-saved kernel context (jmpbuf-style) so SYS_EXIT can
- *      longjmp back here.
- *   4) push the IRETQ frame and dive.
+ *   1) parse ELF64 (must be ET_DYN / PIE so it can be loaded anywhere),
+ *      pick a RANDOM load base (ASLR), reserve + map each PT_LOAD segment
+ *      at base+offset honouring the segment's exec/write/read flags, and
+ *      apply NX (no-execute) to every non-executable page.
+ *   2) reserve a user stack at a RANDOM address (ASLR), with a guard page
+ *      below it, NX-marked.
+ *   3) return the entry/stack; the scheduler (sched_create_user) turns this
+ *      into a real task with its own page tables (private PML4).
  *
- * No scheduler.  When the task calls SYS_EXIT we longjmp back and the
- * kernel's own loop resumes.
+ * ASLR: on every boot/exec the code lands at a different address and the
+ * stack at a different address, so attackers cannot predict where anything
+ * is.  NX: data/stack pages refuse to execute, killing the classic
+ * stack-smashing exploit.
  */
 #include <yart/user.h>
 #include <yart/mm.h>
@@ -17,62 +21,13 @@
 #include <yart/string.h>
 #include <yart/console.h>
 #include <yart/io.h>
-
-/* setjmp/longjmp-style context save */
-typedef struct { u64 rbx, rbp, r12, r13, r14, r15, rsp, rip; } yart_jmpbuf_t;
-static yart_jmpbuf_t g_kctx;
-static i64           g_user_status;
-static bool          g_user_returned;
-
-static int yart_setjmp(yart_jmpbuf_t *b) {
-    int r;
-    __asm__ volatile (
-        "mov %%rbx,  0(%%rdi)\n\t"
-        "mov %%rbp,  8(%%rdi)\n\t"
-        "mov %%r12, 16(%%rdi)\n\t"
-        "mov %%r13, 24(%%rdi)\n\t"
-        "mov %%r14, 32(%%rdi)\n\t"
-        "mov %%r15, 40(%%rdi)\n\t"
-        "mov %%rsp, 48(%%rdi)\n\t"
-        "lea 1f(%%rip), %%rax\n\t"
-        "mov %%rax, 56(%%rdi)\n\t"
-        "xor %%eax, %%eax\n\t"
-        "jmp 2f\n"
-        "1:\n\t"
-        "mov $1, %%eax\n"
-        "2:\n\t"
-        : "=a"(r) : "D"(b) : "memory", "cc"
-    );
-    return r;
-}
-
-static NORETURN void yart_longjmp(yart_jmpbuf_t *b, int v) {
-    __asm__ volatile (
-        "mov  0(%%rdi), %%rbx\n\t"
-        "mov  8(%%rdi), %%rbp\n\t"
-        "mov 16(%%rdi), %%r12\n\t"
-        "mov 24(%%rdi), %%r13\n\t"
-        "mov 32(%%rdi), %%r14\n\t"
-        "mov 40(%%rdi), %%r15\n\t"
-        "mov 48(%%rdi), %%rsp\n\t"
-        "mov %%esi, %%eax\n\t"
-        "test %%eax, %%eax\n\t"
-        "jnz 1f\n\t"
-        "mov $1, %%eax\n"
-        "1:\n\t"
-        "jmp *56(%%rdi)\n\t"
-        :: "D"(b), "S"(v) : "memory"
-    );
-    __builtin_unreachable();
-}
-
-void user_return(i64 status) {
-    g_user_status = status;
-    g_user_returned = true;
-    yart_longjmp(&g_kctx, 1);
-}
+#include <yart/cpu.h>      /* rdtsc seed for ASLR */
+#include <yart/hal.h>      /* pit_ticks() for the ASLR seed */
 
 #define ELF_MAGIC 0x464C457FU
+#define EM_X86_64 62
+#define ET_EXEC   2
+#define ET_DYN    3
 typedef struct PACKED {
     u32 magic; u8 cls,data,ver,osabi; u8 pad[8];
     u16 type, machine; u32 version;
@@ -86,71 +41,169 @@ typedef struct PACKED {
 } phdr_t;
 #define PT_LOAD 1
 
-static u64 load_user_elf(vnode_t *v) {
+/* ELF program-header permission bits */
+#define PF_X 1
+#define PF_W 2
+#define PF_R 4
+
+/* ---------- ASLR ---------- */
+static u64 g_aslr_state;
+
+static u64 aslr_rand(void) {
+    /* xorshift64* - good enough entropy for address randomization */
+    u64 x = g_aslr_state;
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    g_aslr_state = x;
+    return x * 0x2545F4914F6CDD1DULL;
+}
+
+/* Code lands in [USER_VBASE, USER_VBASE+256MiB), stack in
+ * [0x60000000, USER_STACK_TOP).  Both page-aligned; gap >= 256 MiB. */
+#define CODE_ASLR_SPAN   (256u * 1024 * 1024)
+#define STACK_ASLR_SPAN  (128u * 1024 * 1024)
+
+static u64 pick_code_base(void) {
+    return USER_VBASE +
+           (aslr_rand() % (CODE_ASLR_SPAN >> 12)) * PAGE_SIZE;
+}
+static u64 pick_stack_top(void) {
+    return USER_STACK_TOP -
+           (aslr_rand() % (STACK_ASLR_SPAN >> 12)) * PAGE_SIZE;
+}
+
+/* A malicious or corrupt ELF must not map pages over kernel memory: every
+ * segment's virtual range is checked to stay inside the user VA region and
+ * every file range is checked against the on-disk size.  Each segment is
+ * *reserved* as a demand-paged region; file bytes are mapped + copied
+ * eagerly, the memsz-filesz tail (BSS) faults in later.  Permissions come
+ * from the ELF p_flags: writable -> RW, non-executable -> NX. */
+static u64 load_user_elf(vnode_t *v, u64 bias) {
     if (!v || v->type != VN_FILE || v->size < sizeof(ehdr_t)) return 0;
     ehdr_t *eh = v->data;
-    if (eh->magic != ELF_MAGIC || eh->cls != 2) {
-        kprintf("user: bad ELF\n");
+    if (eh->magic != ELF_MAGIC || eh->cls != 2 || eh->machine != EM_X86_64) {
+        kprintf("user: bad ELF header (magic/cls/machine)\n");
+        return 0;
+    }
+    if (eh->type != ET_DYN) {
+        kprintf("user: ELF must be PIE (ET_DYN) for ASLR, got type %u\n",
+                eh->type);
+        return 0;
+    }
+    if (eh->phentsize < sizeof(phdr_t) || eh->phnum == 0 || eh->phnum > 64) {
+        kprintf("user: ELF bad program headers\n");
+        return 0;
+    }
+    if (eh->phoff > v->size ||
+        eh->phoff + (u64)eh->phnum * sizeof(phdr_t) > v->size) {
+        kprintf("user: ELF headers out of file bounds\n");
         return 0;
     }
     phdr_t *ph = (phdr_t *)((u8 *)v->data + eh->phoff);
+
+    /* Pass 1: validate every PT_LOAD and compute one combined VA span so we
+     * reserve a single region (the segments share page boundaries, and the
+     * region model forbids overlapping reservations).  BSS tails fault in
+     * with the safe default RW+NX, which matches how compilers lay out
+     * zero-filled data. */
+    u64 span_first = ~0ULL, span_last = 0;
     for (int i = 0; i < eh->phnum; i++) {
         if (ph[i].type != PT_LOAD) continue;
-        u64 va    = ph[i].vaddr;
-        u64 mem   = ph[i].memsz;
-        u64 file  = ph[i].filesz;
-        u64 first = PAGE_ALIGN_DOWN(va);
-        u64 last  = PAGE_ALIGN_UP(va + mem);
-        for (u64 a = first; a < last; a += PAGE_SIZE) {
-            paddr_t p = pmm_alloc_page();
-            vmm_map(a, p, PTE_RW | PTE_US);
+        u64 va  = bias + ph[i].vaddr;
+        u64 mem = ph[i].memsz, file = ph[i].filesz;
+        if (va + mem < va) {                       /* overflow              */
+            kprintf("user: ELF segment overflow\n");
+            return 0;
         }
-        memcpy((void *)va, (u8 *)v->data + ph[i].offset, file);
-        if (mem > file) memset((void *)(va + file), 0, mem - file);
+        if (va < USER_VBASE || va + mem > USER_STACK_TOP) {
+            kprintf("user: ELF segment outside user region (va=0x%lx)\n", va);
+            return 0;
+        }
+        if (ph[i].offset > v->size ||
+            ph[i].offset + file > v->size) {       /* reads out of the file */
+            kprintf("user: ELF segment reads out of file\n");
+            return 0;
+        }
+        u64 f = PAGE_ALIGN_DOWN(va);
+        u64 l = PAGE_ALIGN_UP(va + mem);
+        if (f < span_first) span_first = f;
+        if (l > span_last)  span_last  = l;
     }
-    return eh->entry;
+    if (span_first == ~0ULL || span_last <= span_first) return 0;
+    if (vmm_user_reserve(span_first, (span_last - span_first) / PAGE_SIZE,
+                         PTE_RW | PTE_US | PTE_NX, VMM_USER_LAZY) != 0) {
+        kprintf("user: ELF span reserve failed (va=0x%lx)\n", span_first);
+        return 0;
+    }
+
+    /* Pass 2: map each page of the span ONCE (pages can be shared between
+     * segments - the boundary page holds the tail of the text segment and
+     * the head of the data segment).  For every page:
+     *   - allocate + zero it,
+     *   - copy in the file bytes of every segment that intersects it,
+     *   - set the UNION of permissions: executable if any covering segment
+     *     is executable, writable if any is writable, NX otherwise. */
+    for (u64 a = span_first; a < span_last; a += PAGE_SIZE) {
+        paddr_t p = pmm_alloc_page();              /* zeroed by the PMM    */
+        vmm_map(a, p, PTE_RW | PTE_US);            /* writable during copy */
+        bool want_exec = false, want_write = false;
+        for (int i = 0; i < eh->phnum; i++) {
+            if (ph[i].type != PT_LOAD) continue;
+            u64 sva = bias + ph[i].vaddr;
+            u64 sfile = ph[i].filesz;
+            if (a + PAGE_SIZE <= sva || a >= sva + sfile) continue;
+            /* copy the intersection of [a, a+4096) and [sva, sva+sfile) */
+            u64 src_off = (a > sva ? a : sva) - sva;
+            u64 dst = (a > sva ? a : sva);
+            u64 n = (a + PAGE_SIZE < sva + sfile ? a + PAGE_SIZE : sva + sfile) - dst;
+            stac();   /* writing into user pages while SMAP is on */
+            memcpy((void *)dst, (u8 *)v->data + ph[i].offset + src_off, n);
+            clac();
+            if (ph[i].flags & PF_X) want_exec = true;
+            if (ph[i].flags & PF_W) want_write = true;
+        }
+        u64 flags = PTE_US;
+        if (want_write) flags |= PTE_RW;
+        if (!want_exec) flags |= PTE_NX;
+        vmm_set_flags(a, flags);
+    }
+    return bias + eh->entry;                 /* PIE entry is an offset      */
 }
 
-static u64 alloc_user_stack(void) {
-    for (int i = 0; i < USER_STACK_PAGES; i++) {
-        u64 va = USER_STACK_TOP - (i + 1) * PAGE_SIZE;
-        paddr_t p = pmm_alloc_page();
-        vmm_map(va, p, PTE_RW | PTE_US);
+/* User stack: a lazy region at a random address with one guard page below
+ * (never mapped), NX-marked (data must not run), so a stack overflow
+ * SIGSEGVs instead of silently clobbering memory. */
+static u64 alloc_user_stack(u64 top) {
+    u64 base = top - USER_STACK_PAGES * PAGE_SIZE;
+    if (vmm_user_reserve(base, USER_STACK_PAGES,
+                         PTE_RW | PTE_NX, VMM_USER_LAZY) != 0) {
+        kprintf("user: stack region reserve failed\n");
+        return 0;
     }
-    return USER_STACK_TOP - 16;
+    /* SysV function-call convention: gcc compiles _start like any function
+     * and expects rsp%16 == 8 at entry (as if a return address were on the
+     * stack), so its movaps/movdqa stay 16-byte aligned.  With SSE enabled
+     * this alignment is mandatory or every stack spill misaligns -> #GP. */
+    return top - 8;
 }
 
-void user_run_elf(vnode_t *v) {
-    u64 entry = load_user_elf(v);
+bool user_prepare_elf(vnode_t *v, u64 *entry_out, u64 *rsp_out) {
+    /* seed the ASLR generator with hardware + time entropy */
+    u64 tsc;
+    __asm__ volatile ("rdtsc" : "=A"(tsc) :: "memory");
+    g_aslr_state = tsc ^ ((u64)pit_ticks() << 32) ^ (u64)(u64)v;
+
+    u64 bias = pick_code_base();
+    u64 top  = pick_stack_top();
+    u64 entry = load_user_elf(v, bias);
     if (!entry) {
         kprintf("user: load failed\n");
-        return;
+        return false;
     }
-    u64 user_rsp = alloc_user_stack();
-    kprintf("user: launching ring-3 entry=%p stack=%p\n",
+    u64 user_rsp = alloc_user_stack(top);
+    if (!user_rsp) return false;
+    if (entry_out) *entry_out = entry;
+    if (rsp_out)   *rsp_out = user_rsp;
+    kprintf("user: prepared ring-3 (ASLR) entry=%p stack=%p\n",
             (void *)entry, (void *)user_rsp);
-
-    g_user_returned = false;
-    if (yart_setjmp(&g_kctx) != 0) {
-        kprintf("user: task exited with status %ld\n", g_user_status);
-        return;
-    }
-
-    __asm__ volatile (
-        "cli\n\t"
-        "mov $0x23, %%rax\n\t"
-        "mov %%ax, %%ds\n\t"
-        "mov %%ax, %%es\n\t"
-        "mov %%ax, %%fs\n\t"
-        "mov %%ax, %%gs\n\t"
-        "push $0x23\n\t"
-        "push %0\n\t"
-        "push $0x202\n\t"
-        "push $0x1B\n\t"
-        "push %1\n\t"
-        "iretq\n\t"
-        :: "r"(user_rsp), "r"(entry)
-        : "rax", "memory"
-    );
-    __builtin_unreachable();
+    return true;
 }

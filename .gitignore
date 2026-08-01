@@ -7,3 +7,4 @@ yart.iso
 *.elf
 initrd_root/etc/motd
 initrd_root/etc/yart.conf
+yart-disk.img

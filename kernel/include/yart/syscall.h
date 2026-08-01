@@ -22,6 +22,24 @@ enum {
     SYS_YIELD    = 14,
     SYS_TRUNCATE = 15,
     SYS_KLOG     = 16,    /* write to kernel serial */
+    SYS_FORK     = 17,    /* clone the calling process (CoW) */
+    SYS_WAITPID  = 18,    /* reap a child (0 = still running, -1 = none) */
+    SYS_DOAS     = 19,    /* elevate euid to 0 after password auth (admin) */
+    SYS_CHMOD    = 20,    /* change a file's permission bits (owner/root)  */
+    SYS_DROP     = 21,    /* drop privileges: euid = uid                   */
+    SYS_KILL     = 22,    /* SIGKILL another process (minimal signal)      */
+    SYS_MMAP     = 23,    /* reserve dynamic user memory (demand-paged)    */
+    SYS_MUNMAP   = 24,    /* release it back                              */
+    SYS_SETUID   = 25,    /* change uid/gid (root only)                      */
+    SYS_RENAME   = 26,    /* rename/move a file or directory                  */
+    SYS_BRK      = 27,    /* grow/shrink the program break (sbrk)                 */
+    SYS_SIGACTION = 28,  /* install a signal handler                        */
+    SYS_RAISE    = 29,    /* send a signal to another process                */
+    SYS_FSYNC    = 30,    /* force dirty files to disk now (fsync)               */
+    SYS_SETGID   = 31,    /* change gid (root only)                             */
+    SYS_UMASK    = 32,    /* set file-creation mask, returns old                 */
+    SYS_ACL      = 33,    /* set/clear an ACL entry on a file (owner/root)       */
+    SYS_GETCPU   = 34,    /* which CPU am I running on (SMP)                     */
     SYS_MAX
 };
 

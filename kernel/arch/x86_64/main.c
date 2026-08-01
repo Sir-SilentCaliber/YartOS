@@ -27,6 +27,12 @@
 #include <yart/config.h>
 #include <yart/pci.h>
 #include <yart/user.h>
+#include <yart/sched.h>
+#include <yart/blk.h>
+#include <yart/session.h>
+#include <yart/cpu.h>    /* fpu_enable() */
+int smp_start_aps(void);   /* smp.c */
+void smp_ap_kwork_demo(void); /* smp.c */
 
 LIMINE_BASE_REVISION(2);
 LIMINE_REQUESTS_START_MARKER;
@@ -88,6 +94,7 @@ void kmain(void) {
     /* HAL */
     gdt_init();
     idt_init();
+    fpu_enable();                /* x87 + SSE on; clean FPU state         */
     pic_remap(32, 40);
     /* mask all PIC IRQs initially; drivers will unmask theirs */
     for (int i = 0; i < 16; i++) pic_mask(i);
@@ -96,6 +103,12 @@ void kmain(void) {
     pmm_init(memmap_request.response);
     vmm_init();
     heap_init();
+
+    /* memory-subsystem selftests (allocator accounting, refcounts, demand
+     * paging, copy-on-write, per-process page tables, heap canaries) */
+    pmm_selftest();
+    vmm_selftest();
+    heap_selftest();
 
     /* framebuffer + desktop */
     fb_init(fb_request.response->framebuffers[0]);
@@ -109,7 +122,9 @@ void kmain(void) {
         kprintf("initrd: %lu KiB at %p\n", initrd_size / 1024, initrd);
     }
     vfs_init(initrd, initrd_size);
-    config_load("/etc/yart.conf");
+    blk_init();          /* find + bring up the virtio-blk disk (if any) */
+    blkfs_init();        /* format on first boot, otherwise mount disk   */
+    config_load("/etc/yart.conf");   /* disk copy wins over initrd copy  */
 
     /* ACPI */
     if (rsdp_request.response)
@@ -131,39 +146,87 @@ void kmain(void) {
     }
 
     /* timing + drivers */
-    pit_init(100);             /* 100 Hz */
+    pit_init(100);             /* 100 Hz (APIC timer takes over if available) */
+    apic_init();               /* LAPIC/IOAPIC + APIC timer, PIC fallback   */
+    smp_start_aps();           /* bring the other cores online (SMP)       */
     kbd_init();
     mouse_init();
 
     /* desktop */
     desktop_init();
 
-    /* go */
-    sti();
+    /* preemptive scheduler: the desktop loop becomes the idle task (pid 0) */
+    sched_init();
 
-    /* Bring up /bin/init as a real ring-3 task before entering the
-       desktop loop.  init writes to /home/yart/INIT_RAN.txt and exits;
-       sys_exit longjmps back here. */
+    /* A root-owned secret file used by the permission/doas boot test. */
     {
-        vnode_t *initbin = vfs_lookup("/bin/init");
-        if (initbin) {
-            kprintf("yart: launching /bin/init in ring 3...\n");
-            user_run_elf(initbin);
-        } else {
-            kprintf("yart: /bin/init not found, skipping ring-3 launch\n");
+        vnode_t *d = vfs_lookup("/etc");
+        if (d) {
+            vnode_t *v = vfs_lookup("/etc/secret.txt");
+            if (!v) v = vfs_create(d, "secret.txt", VN_FILE);
+            if (v) {
+                v->uid = 0; v->mode = 0600; v->dirty = true;
+                vfs_truncate(v, 0);
+                const char *data = "TOP-SECRET: 42\n";
+                vfs_write(v, data, 0, strlen(data));
+            }
         }
     }
 
-    kprintf("yart: kernel up; entering desktop loop.\n");
+    /* Bring up /bin/init as a preemptively-scheduled ring-3 task.  It runs
+       alongside the desktop loop; the scheduler time-slices it. */
+    vnode_t *initbin = vfs_lookup("/bin/init");
+    if (initbin) {
+        u64 entry = 0, rsp = 0;
+        kprintf("yart: preparing /bin/init for ring 3...\n");
+        if (user_prepare_elf(initbin, &entry, &rsp)) {
+            task_t *it = sched_create_user("init", entry, rsp);
+            if (it) {
+                /* assign the logged-in user's identity to the init task */
+                u32 uid = 1000;
+                const char *acct = "root";
+                bool admin = true;
+                if (g_session.current_user >= 0) {
+                    uid  = 1000u + (u32)g_session.current_user;
+                    acct = g_session.users[g_session.current_user].username;
+                    admin = g_session.users[g_session.current_user].is_admin;
+                }
+                it->uid = uid; it->euid = uid; it->gid = uid;
+                it->elev_allowed = admin;
+                strncpy(it->account, acct, sizeof it->account - 1);
+                /* give the user their home directory */
+                vnode_t *hy = vfs_lookup("/home/yart");
+                if (hy) { hy->uid = uid; hy->mode = 0755; hy->dirty = true; }
+                kprintf("yart: init task uid=%u account=%s admin=%d\n",
+                        uid, acct, admin ? 1 : 0);
+            }
+        } else {
+            kprintf("yart: /bin/init prepare failed\n");
+        }
+    } else {
+        kprintf("yart: /bin/init not found, skipping ring-3 launch\n");
+    }
 
-    /* The longjmp out of sys_exit returns with IF=0 because the CPU
-       cleared it on the int 0x80 entry.  Re-enable IRQs before the loop
-       or the PIT and PS/2 will never wake hlt. */
+    kprintf("yart: kernel up; entering desktop loop (idle task pid 0).\n");
     sti();
+    smp_ap_kwork_demo();   /* queue kernel work to every AP (wake-IPI proof) */
 
-    /* event loop */
+    /* event loop - runs as the idle task; sched_idle_sleep() hands the CPU
+       to user tasks when they are ready.  User tasks run on the APs too:
+       /bin/init forks children and the scheduler load-balances them onto
+       the least-loaded core (see the 'smp:' lines for each child's CPU). */
+    u64 last_sync = 0;
     for (;;) {
-        desktop_tick(pit_ticks() * 10);   /* PIT @100Hz -> ms */
-        __asm__ volatile ("hlt");
+        desktop_tick(pit_ticks() * 10);   /* PIT/APIC @100Hz -> ms */
+        sched_reap_orphans();
+        /* persist dirty files about once a second (disk-backed) */
+        if (blkfs_active() && pit_ticks() - last_sync >= 100) {
+            int n = blkfs_sync();
+            last_sync = pit_ticks();
+            if (n > 0)
+                kprintf("blkfs: synced %d file(s) to disk (blk irqs=%u)\n",
+                        n, blk_irq_count());
+        }
+        sched_idle_sleep();
     }
 }

@@ -27,7 +27,7 @@ ISO_ROOT := iso_root
 LIMINE   := limine
 
 C_SRCS   := $(shell find kernel -name '*.c')
-ASM_SRCS := $(shell find kernel -name '*.asm')
+ASM_SRCS := $(shell find kernel -name '*.asm' ! -name 'smp_tramp.asm')
 C_OBJS   := $(C_SRCS:%.c=build/%.o)
 ASM_OBJS := $(ASM_SRCS:%.asm=build/%.o)
 OBJS     := $(C_OBJS) $(ASM_OBJS)
@@ -45,10 +45,12 @@ LDFLAGS := -nostdlib -static -m elf_x86_64 -z max-page-size=0x1000 \
 
 ASFLAGS := -f elf64 -Ikernel/arch/x86_64/
 
-# Userland flags: small mcmodel, freestanding, link to fixed va.
-UCFLAGS := -std=gnu11 -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
-           -mno-red-zone -mno-sse -mno-mmx -mno-80387 -O2 -Wall -Wextra
-ULDFLAGS := -nostdlib -static -m elf_x86_64 -z max-page-size=0x1000 \
+# Userland flags: freestanding PIE so the kernel can ASLR-load it anywhere.
+# SSE/x87 are ENABLED here (the kernel now saves/restores FPU state per task),
+# so userland can use floats normally.
+UCFLAGS := -std=gnu11 -ffreestanding -fno-stack-protector -fPIC -fPIE \
+           -mno-red-zone -O2 -Wall -Wextra
+ULDFLAGS := -nostdlib -static -pie -m elf_x86_64 -z max-page-size=0x1000 \
             -T userland/init.ld
 
 .PHONY: all iso run clean distclean limine

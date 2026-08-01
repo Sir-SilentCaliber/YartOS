@@ -1,8 +1,15 @@
 #pragma once
 #include <yart/types.h>
+#include <yart/cpu.h>   /* cpu_local_t (per-CPU GDT/TSS helpers) */
 
-/* GDT */
+/* GDT / TSS */
 void gdt_init(void);
+void gdt_reload(void);   /* re-load this CPU's GDT+TSS */
+void smp_ap_switch_gdt(u32 cpu_index); /* AP-safe: lgdt(own GDT) + far-jump to 0x08 */
+void ap_install_tss(u32 cpu_index, u64 rsp0); /* per-AP TSS + TR (0x38) */
+void tss_set_rsp0(u64 rsp0);   /* sets THIS CPU's TSS RSP0 (per-CPU) */
+u64  tss_get_rsp0(void);
+cpu_local_t *bsp_cpu_local(void); /* the BSP's per-CPU area (id 0) */
 
 /* IDT / interrupts */
 typedef struct PACKED {
@@ -15,16 +22,32 @@ typedef struct PACKED {
 typedef void (*irq_handler_t)(cpu_regs_t *r);
 
 void idt_init(void);
+void idt_reload(void);   /* re-load IDT on this CPU */
 void irq_register(u8 irq, irq_handler_t h);
-void isr_dispatch(cpu_regs_t *r);  /* called from asm */
+/* Called from asm; returns the RSP the ISR stub must resume from (a task
+ * switch returns a different task's cpu_regs_t frame). */
+u64 isr_dispatch(cpu_regs_t *r);
 
 /* PIC */
 void pic_remap(int offset1, int offset2);
 void pic_mask(u8 irq);
 void pic_unmask(u8 irq);
 void pic_eoi(u8 irq);
+void pic_eoi_careful(u8 irq);   /* spurious-IRQ aware EOI */
+void pic_disable_all(void);     /* stop the legacy 8259s */
 
-/* PIT */
+/* APIC / IOAPIC / APIC timer (apic.c).  Falls back to PIC + PIT. */
+void apic_init(void);
+bool apic_active(void);
+void interrupt_eoi(u8 vector);          /* LAPIC or (careful) PIC EOI */
+u8   apic_local_id(void);            /* BSP LAPIC id (MSI-X targeting)  */
+void lapic_start_ap(u32 dest_apic, u32 tramp_page); /* INIT-SIPI-SIPI     */
+void lapic_send_ipi(u32 dest_apic, u8 vector);      /* fixed IPI          */
+u32  lapic_read_id_reg(void);
+void apic_timer_start_this_cpu(void);   /* per-CPU APIC timer */
+void lapic_spurious_irq(cpu_regs_t *r); /* spurious vector handler    */
+
+/* PIT / time */
 void pit_init(u32 hz);
 u64  pit_ticks(void);
 void sleep_ms(u32 ms);

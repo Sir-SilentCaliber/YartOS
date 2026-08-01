@@ -1,6 +1,7 @@
 /* Yart OS - PIT (channel 0, mode 3 square wave) */
 #include <yart/hal.h>
 #include <yart/io.h>
+#include <yart/cpu.h>
 
 #define PIT_CH0  0x40
 #define PIT_CMD  0x43
@@ -9,7 +10,15 @@
 static volatile u64 ticks;
 static u32 freq_hz;
 
-static void pit_irq(cpu_regs_t *r) { (void)r; ticks++; }
+/* Shared tick handler: driven by the PIT (vector 32) or, once apic.c has
+ * switched delivery, by the LAPIC timer (vector 48). */
+void yart_timer_irq(cpu_regs_t *r) {
+    (void)r;
+    ticks++;
+    /* per-CPU tick counter (SMP: each AP's APIC timer bumps its own) */
+    cpu_local_t *c = get_cpu_local();
+    if (c && c->magic == CPU_LOCAL_MAGIC) c->ap_ticks++;
+}
 
 void pit_init(u32 hz) {
     freq_hz = hz;
@@ -17,7 +26,7 @@ void pit_init(u32 hz) {
     outb(PIT_CMD, 0x36);
     outb(PIT_CH0, div & 0xFF);
     outb(PIT_CH0, (div >> 8) & 0xFF);
-    irq_register(32 + 0, pit_irq);
+    irq_register(32 + 0, yart_timer_irq);
     pic_unmask(0);
 }
 

@@ -1,13 +1,18 @@
-/* Yart OS - desktop / window manager / dock / app drawer / taskbar.
+/* Yart OS - desktop / window manager / dock / taskbar (no bundled apps).
  *
- * Stage-10 features:
- *   - pinned apps come from /etc/yart.conf (not a hardcoded array)
- *   - right-click on a dock slot offers pin/unpin/close-window
- *   - drawer overlay has a live search box
- *   - 4 virtual workspaces, Ctrl+Alt+Left/Right to switch
- *   - wallpaper can be a real BMP or a procedural gradient
- *   - cursor is rendered last every frame (decoupled from app paint)
- *   - night-light tint applied at the end
+ * All in-kernel applications have been removed: this file is a pure shell /
+ * compositor.  The dock shows running windows + a drawer that (for now)
+ * reports "no applications installed".  Applications return later as real
+ * ring-3 programs that talk to the desktop over IPC.
+ *
+ * Features kept from the old shell:
+ *   - window manager core: create/focus/min/max/restore, 9 resize zones,
+ *     drag with edge snap, 4 virtual workspaces (Ctrl+Alt+Left/Right)
+ *   - wallpaper (BMP or procedural), night-light tint
+ *   - top status bar (clock, workspaces, audio/net presence, power menu)
+ *   - dock with running-window slots + drawer
+ *   - toast notifications + context-menu system
+ *   - login / session / setup overlays
  */
 #include <yart/gui.h>
 #include <yart/drivers.h>
@@ -20,7 +25,6 @@
 #include <yart/fs.h>
 #include <yart/task.h>
 #include <yart/menu.h>
-#include <yart/apps.h>
 #include <yart/config.h>
 #include <yart/bmp.h>
 #include <yart/pci.h>
@@ -34,11 +38,6 @@
 #define BTN_R        7
 #define WORKSPACES   4
 
-/* ---------- forward declarations of bundled apps ---------- */
-extern void open_terminal(void);
-extern void open_files(const char *path);
-extern void open_editor(const char *path);
-
 /* ---------- frame scheduling ---------- */
 static bool g_dirty = true;
 static u64  g_last_frame_ms;
@@ -46,8 +45,6 @@ void wm_dirty(void) { g_dirty = true; }
 
 /* ---------- workspaces ---------- */
 static int current_ws = 0;
-/* workspace each window belongs to, looked up via win->ud_workspace
-   stored in the high bits of win->flags; cheaper: a tiny side map. */
 #define MAX_TRACK 64
 static struct { window_t *w; int ws; } ws_map[MAX_TRACK];
 static int ws_map_count;
@@ -74,109 +71,14 @@ static void ws_forget(window_t *w) {
         }
 }
 
-/* ---------- click hooks (back-compat for apps that poll) ---------- */
-int  g_files_click_x, g_files_click_y;
-bool g_files_click_pending;
-int  g_files_right_x, g_files_right_y;
-bool g_files_right_pending;
-int  g_term_click_x,  g_term_click_y;
-bool g_term_click_pending;
-int  g_editor_click_x, g_editor_click_y;
-bool g_editor_click_pending;
-
-/* ---------- desktop icons (shortcuts on the desktop) ---------- */
-#define MAX_DESKTOP_ICONS 32
-
-typedef struct {
-    char     name[VFS_MAX_NAME];
-    char     path[VFS_MAX_PATH];   /* vfs path for files, empty for apps */
-    icon_id_t icon;
-    int      x, y;
-    bool     is_app;
-    const yart_app_t *app;         /* if is_app */
-} desktop_icon_t;
-
-static desktop_icon_t g_desktop_icons[MAX_DESKTOP_ICONS];
-static int g_desktop_icon_count;
-static int g_desktop_drag = -1;    /* index being dragged */
-static int g_desktop_drag_ox, g_desktop_drag_oy;
-
-/* drag from file manager or drawer to desktop */
-static struct {
-    bool active;
-    bool from_drawer;              /* true=app from drawer, false=file from files */
-    char name[VFS_MAX_NAME];
-    char path[VFS_MAX_PATH];
-    icon_id_t icon;
-    const yart_app_t *app;
-} g_drop_drag;
-
-/* forward decls from app_files.c */
-extern bool files_drag_active(void);
-extern const char *files_drag_name(void);
-extern const char *files_drag_path(void);
-extern icon_id_t   files_drag_icon(void);
-extern void        files_drag_cancel(void);
-
-/* called by files app to start a drag-to-desktop for a file/folder */
-void desktop_begin_file_drop(const char *name, const char *path, icon_id_t icon) {
-    g_drop_drag.active = true;
-    g_drop_drag.from_drawer = false;
-    strncpy(g_drop_drag.name, name, VFS_MAX_NAME - 1);
-    strncpy(g_drop_drag.path, path, VFS_MAX_PATH - 1);
-    g_drop_drag.icon = icon;
-    g_drop_drag.app = NULL;
-}
-
-static void desktop_icon_add(const char *name, const char *path,
-                             icon_id_t icon, int x, int y,
-                             bool is_app, const yart_app_t *app) {
-    if (g_desktop_icon_count >= MAX_DESKTOP_ICONS) return;
-    desktop_icon_t *di = &g_desktop_icons[g_desktop_icon_count++];
-    strncpy(di->name, name, VFS_MAX_NAME - 1);
-    if (path) strncpy(di->path, path, VFS_MAX_PATH - 1);
-    else di->path[0] = 0;
-    di->icon = icon;
-    di->x = x; di->y = y;
-    di->is_app = is_app;
-    di->app = app;
-}
-
-static int desktop_icon_at(int x, int y) {
-    for (int i = 0; i < g_desktop_icon_count; i++) {
-        desktop_icon_t *d = &g_desktop_icons[i];
-        if (x >= d->x && x < d->x + 72 && y >= d->y && y < d->y + 72)
-            return i;
-    }
-    return -1;
-}
-
-static void draw_desktop_icons(void) {
-    for (int i = 0; i < g_desktop_icon_count; i++) {
-        desktop_icon_t *d = &g_desktop_icons[i];
-        int cx, cy; cursor_get_pos(&cx, &cy);
-        bool hover = (cx >= d->x && cx < d->x + 72 && cy >= d->y && cy < d->y + 72);
-        if (hover) {
-            draw_rounded_rect(d->x - 2, d->y - 2, 76, 76, 6,
-                              (u32)(0x20 << 24) | 0xFFFFFF);
-        }
-        draw_icon_sized(d->x + 20, d->y + 4, d->icon, 32);
-        /* label */
-        char buf[12];
-        int n = (int)strlen(d->name); if (n > 10) n = 10;
-        memcpy(buf, d->name, n); buf[n] = 0;
-        if ((int)strlen(d->name) > 10) { buf[7]='.'; buf[8]='.'; buf[9]='.'; }
-        int tw = text_width(buf);
-        draw_text(d->x + 36 - tw/2, d->y + 42, buf, TH_TEXT, 0xFF000000);
-    }
-}
-
-
 /* ---------- window list (head = top of z-order) ---------- */
 static window_t *windows;
 
+/* File-scope so window_destroy() can clear them (use-after-free protection). */
+static window_t *dragging;
+static window_t *task_target_win;
+
 window_t *window_focused(void) {
-    /* return first visible, non-min, on-current-workspace */
     for (window_t *w = windows; w; w = w->next)
         if ((w->flags & WIN_VIS) && !(w->flags & WIN_MIN) && ws_of(w) == current_ws)
             return w;
@@ -213,6 +115,8 @@ void window_destroy(window_t *w) {
     if (*link) *link = w->next;
     if (windows) windows->flags |= WIN_FOCUS;
     ws_forget(w);
+    if (dragging == w)        dragging = NULL;
+    if (task_target_win == w) task_target_win = NULL;
     if (w->ud) kfree(w->ud);
     kfree(w);
     g_dirty = true;
@@ -293,7 +197,6 @@ static void draw_wallpaper(void) {
         bmp_blit(&g_wallpaper, 0, 0, g_fb.width, g_fb.height);
         return;
     }
-    /* fallback: stretched ARGB asset */
     u32 fbw = g_fb.width, fbh = g_fb.height;
     int aw = yart_wallpaper_w, ah = yart_wallpaper_h;
     for (u32 y = 0; y < fbh; y++) {
@@ -368,6 +271,7 @@ static void draw_traffic_lights(window_t *w) {
 }
 
 static void draw_window(window_t *w) {
+    if (!w) return;                      /* never deref a NULL window node */
     if (!(w->flags & WIN_VIS) || (w->flags & WIN_MIN)) return;
     if (ws_of(w) != current_ws) return;
     for (int s = 1; s <= 6; s++) {
@@ -430,7 +334,6 @@ static void draw_statusbar(void) {
 
     /* applets to the left of the clock */
     int ax = clock_x - 12;
-    /* audio - mini speaker */
     {
         const char *a = pci_audio_name();
         const char *txt = a ? a : "no-audio";
@@ -439,7 +342,6 @@ static void draw_statusbar(void) {
         draw_text(ax, 5, txt, g_audio_present ? TH_TEXT_DIM : TH_TEXT_MUTED, 0);
         ax -= 12;
     }
-    /* network */
     {
         const char *n = pci_nic_name();
         const char *txt = n ? n : "no-net";
@@ -463,9 +365,8 @@ static void draw_statusbar(void) {
 /* ---------- dock ---------- */
 typedef struct {
     int x, y, w, h;
-    enum { SLOT_PINNED, SLOT_TASK, SLOT_DRAWER } kind;
-    const yart_app_t *app;   /* for SLOT_PINNED */
-    window_t         *win;   /* for SLOT_TASK   */
+    enum { SLOT_TASK, SLOT_DRAWER } kind;
+    window_t *win;   /* for SLOT_TASK */
 } dock_slot_t;
 
 static dock_slot_t slots[64];
@@ -479,33 +380,23 @@ static void layout_dock(void) {
     int icon_box = g_config.dock_icon_size + 16;
     if (icon_box < 36) icon_box = 36;
 
-    /* count pinned + tasks (only current workspace) */
-    int pinned_count = 0;
-    for (int i = 0; i < g_config.dock_pinned_count; i++) {
-        if (app_find(g_config.dock_pinned[i])) pinned_count++;
-    }
+    /* count running windows on the current workspace */
     int task_count = 0;
     for (window_t *w = windows; w; w = w->next)
         if ((w->flags & WIN_VIS) && ws_of(w) == current_ws) task_count++;
 
-    int total = pinned_count + task_count + 1; /* +1 drawer */
+    int total = task_count + 1; /* +1 drawer */
     int total_w = total * icon_box + (total - 1) * gap;
     int x0 = (g_fb.width - total_w) / 2;
     int yy = dock_y() + (DOCK_H - icon_box) / 2;
     int xx = x0;
 
-    for (int i = 0; i < g_config.dock_pinned_count; i++) {
-        const yart_app_t *a = app_find(g_config.dock_pinned[i]);
-        if (!a) continue;
-        slots[nslots++] = (dock_slot_t){ xx, yy, icon_box, icon_box, SLOT_PINNED, a, 0 };
-        xx += icon_box + gap;
-    }
     for (window_t *w = windows; w; w = w->next) {
         if (!(w->flags & WIN_VIS) || ws_of(w) != current_ws) continue;
-        slots[nslots++] = (dock_slot_t){ xx, yy, icon_box, icon_box, SLOT_TASK, 0, w };
+        slots[nslots++] = (dock_slot_t){ xx, yy, icon_box, icon_box, SLOT_TASK, w };
         xx += icon_box + gap;
     }
-    slots[nslots++] = (dock_slot_t){ xx, yy, icon_box, icon_box, SLOT_DRAWER, 0, 0 };
+    slots[nslots++] = (dock_slot_t){ xx, yy, icon_box, icon_box, SLOT_DRAWER, 0 };
 }
 
 static void draw_dock(void) {
@@ -525,6 +416,12 @@ static void draw_dock(void) {
         }
         if (s->kind == SLOT_DRAWER) {
             draw_icon(s->x + (s->w - 32)/2, s->y + (s->h - 32)/2, ICON_DRAWER);
+            if (hover) {
+                const char *tt = "Applications";
+                int tw = text_width(tt);
+                draw_text(s->x + (s->w - tw)/2, s->y + s->h + 2, tt,
+                          TH_TEXT_DIM, 0);
+            }
         } else if (s->kind == SLOT_TASK && s->win) {
             draw_icon(s->x + (s->w - 32)/2, s->y + (s->h - 32)/2, s->win->icon);
             if (s->win->flags & WIN_FOCUS) {
@@ -533,95 +430,28 @@ static void draw_dock(void) {
             } else {
                 draw_hline(s->x + 16, s->y + s->h + 2, s->w - 32, TH_TEXT_MUTED);
             }
-        } else if (s->kind == SLOT_PINNED && s->app) {
-            draw_icon(s->x + (s->w - 32)/2, s->y + (s->h - 32)/2, s->app->icon);
+            /* tooltip with the window title */
             if (hover) {
-                int tw = text_width(s->app->name);
-                draw_text(s->x + (s->w - tw)/2, s->y + s->h + 2, s->app->name,
+                int tw = text_width(s->win->title);
+                draw_text(s->x + (s->w - tw)/2, s->y + s->h + 2, s->win->title,
                           TH_TEXT_DIM, 0);
             }
         }
     }
 }
 
-/* ---------- app drawer (with search) ---------- */
+/* ---------- app drawer (no bundled apps yet) ---------- */
 static bool drawer_open;
-static char drawer_query[40];
-static int  drawer_query_len;
-static int  drawer_hover = -1;
 
-/* dock right-click "pin" ack-helper */
-static const yart_app_t *pin_target_app;
-static window_t          *task_target_win;
-
-static void cm_pin(void *u)    { (void)u; if (pin_target_app)  config_pin  (pin_target_app->name); }
-static void cm_unpin(void *u)  { (void)u; if (pin_target_app)  config_unpin(pin_target_app->name); }
-static void cm_close(void *u)  { (void)u; if (task_target_win) window_close_requested(task_target_win); }
-static void cm_pin_t(void *u)  { (void)u; if (task_target_win) {
-    /* find app whose icon matches; fallback: use title */
-    for (int i = 0; i < yart_app_catalog_count; i++)
-        if (yart_app_catalog[i].icon == task_target_win->icon) {
-            config_pin(yart_app_catalog[i].name); return;
-        }
-}}
-
-bool drawer_open_request;
-static void cm_drawer(void *u)  { (void)u; drawer_open_request = true; }
-
-/* desktop context menu */
-extern void open_calc(void);
-extern void open_sysmon(void);
-static void cm_terminal(void *u){ (void)u; open_terminal(); }
-static void cm_files(void *u)   { (void)u; open_files("/home/yart"); }
-static void cm_editor(void *u)  { (void)u; open_editor(0); }
-static void cm_calc(void *u)    { (void)u; open_calc(); }
-static void cm_sysmon(void *u)  { (void)u; open_sysmon(); }
-
-static void open_desktop_menu(int x, int y) {
-    static menu_item_t items[] = {
-        { "New Terminal Here", cm_terminal, 0, false, false },
-        { "Open Files",        cm_files,    0, false, false },
-        { "New Editor",        cm_editor,   0, false, false },
-        { "",                  0,           0, true,  false },
-        { "Calculator",        cm_calc,     0, false, false },
-        { "System Monitor",    cm_sysmon,   0, false, false },
-        { "",                  0,           0, true,  false },
-        { "Show All Apps",     cm_drawer,   0, false, false },
-    };
-    menu_open(x, y, items, sizeof items / sizeof items[0]);
-}
-
-static void open_pinned_menu(int x, int y, const yart_app_t *a) {
-    pin_target_app = a;
-    static menu_item_t items_pin[2];
-    bool pinned = config_is_pinned(a->name);
-    strncpy(items_pin[0].label, pinned ? "Unpin from Dock" : "Pin to Dock",
-            MENU_LABEL_LEN - 1);
-    items_pin[0].on_click = pinned ? cm_unpin : cm_pin;
-    items_pin[0].ud = 0;
-    items_pin[0].separator = false;
-    items_pin[0].disabled  = false;
-    strncpy(items_pin[1].label, "Launch", MENU_LABEL_LEN - 1);
-    items_pin[1].on_click = 0;
-    items_pin[1].ud = 0;
-    items_pin[1].separator = false;
-    items_pin[1].disabled  = true;
-    menu_open(x, y, items_pin, 2);
-}
+static void cm_close(void *u) { (void)u; if (task_target_win) window_close_requested(task_target_win); }
 
 static void open_task_menu(int x, int y, window_t *w) {
     task_target_win = w;
-    static menu_item_t items_task[3];
-    strncpy(items_task[0].label, "Pin App to Dock", MENU_LABEL_LEN - 1);
-    items_task[0].on_click = cm_pin_t;
+    static menu_item_t items_task[1];
+    strncpy(items_task[0].label, "Close Window", MENU_LABEL_LEN - 1);
+    items_task[0].on_click = cm_close;
     items_task[0].ud = 0; items_task[0].separator = false; items_task[0].disabled = false;
-    items_task[1].label[0] = 0;
-    items_task[1].on_click = 0; items_task[1].ud = 0;
-    items_task[1].separator = true; items_task[1].disabled = false;
-    strncpy(items_task[2].label, "Close Window", MENU_LABEL_LEN - 1);
-    items_task[2].on_click = cm_close;
-    items_task[2].ud = 0; items_task[2].separator = false; items_task[2].disabled = false;
-    menu_open(x, y, items_task, 3);
+    menu_open(x, y, items_task, 1);
 }
 
 static void draw_drawer(void) {
@@ -634,11 +464,7 @@ static void draw_drawer(void) {
             row[x] = 0xFF000000U | ((row[x] >> 1) & MASK);
         }
     }
-    int cols = 4;
-    int cell_w = 130, cell_h = 110;
-    int rows = (yart_app_catalog_count + cols - 1) / cols;
-    int pw = cols * cell_w + 40;
-    int ph = rows * cell_h + 130;
+    int pw = 420, ph = 200;
     int px = (g_fb.width - pw) / 2;
     int py = (g_fb.height - ph) / 2;
     draw_rounded_rect(px, py, pw, ph, 10, TH_PANEL);
@@ -646,70 +472,12 @@ static void draw_drawer(void) {
     draw_text(px + 20, py + 16, "Applications", TH_TEXT, 0);
     draw_text(px + pw - text_width("Esc to close") - 20, py + 16,
               "Esc to close", TH_TEXT_MUTED, 0);
-
-    /* search box */
-    int sb_x = px + 20, sb_y = py + 40;
-    int sb_w = pw - 40, sb_h = 28;
-    draw_rounded_rect(sb_x, sb_y, sb_w, sb_h, 4, TH_EDITOR_BG);
-    draw_rounded_rect_outline(sb_x, sb_y, sb_w, sb_h, 4, TH_ACCENT_DIM);
-    if (drawer_query_len == 0) {
-        draw_text(sb_x + 10, sb_y + 6, "Type to search",
-                  TH_TEXT_MUTED, 0xFF000000);
-    } else {
-        draw_text(sb_x + 10, sb_y + 6, drawer_query, TH_TEXT, 0xFF000000);
-    }
-    /* caret */
-    if ((pit_ticks() / 30) & 1) {
-        int cx = sb_x + 10 + drawer_query_len * FONT_W;
-        draw_vline(cx, sb_y + 4, sb_h - 8, g_config.accent);
-    }
-
-    int cxm, cym; cursor_get_pos(&cxm, &cym);
-    drawer_hover = -1;
-    int gx = px + 20, gy = py + 80;
-    int visible = 0;
-    for (int i = 0; i < yart_app_catalog_count; i++) {
-        const yart_app_t *a = &yart_app_catalog[i];
-        /* filter by query */
-        if (drawer_query_len > 0) {
-            /* simple case-insensitive substring */
-            const char *hs = a->name; const char *needle = drawer_query;
-            bool match = false;
-            for (const char *h = hs; *h && !match; h++) {
-                int k;
-                for (k = 0; needle[k]; k++) {
-                    char a_ = h[k], b_ = needle[k];
-                    if (a_ >= 'A' && a_ <= 'Z') a_ += 32;
-                    if (b_ >= 'A' && b_ <= 'Z') b_ += 32;
-                    if (a_ != b_) break;
-                }
-                if (needle[k] == 0) match = true;
-            }
-            if (!match) continue;
-        }
-        int col = visible % cols, row = visible / cols;
-        visible++;
-        int x = gx + col * cell_w;
-        int y = gy + row * cell_h;
-        bool hover = (cxm >= x && cxm < x + cell_w && cym >= y && cym < y + cell_h);
-        if (hover) {
-            drawer_hover = i;
-            draw_rounded_rect(x, y, cell_w, cell_h, 8, TH_PANEL_HI);
-            draw_rounded_rect_outline(x, y, cell_w, cell_h, 8, g_config.accent);
-        }
-        draw_icon_sized(x + (cell_w - 48)/2, y + 14, a->icon, 48);
-        int tw = text_width(a->name);
-        draw_text(x + (cell_w - tw)/2, y + cell_h - 22, a->name, TH_TEXT, 0);
-    }
-    if (visible == 0) {
-        const char *msg = "No matches.";
-        int tw = text_width(msg);
-        draw_text(px + (pw - tw)/2, gy + 40, msg, TH_TEXT_MUTED, 0);
-    }
+    const char *msg = "No applications installed.";
+    int tw = text_width(msg);
+    draw_text(px + (pw - tw)/2, py + (ph - FONT_H)/2, msg, TH_TEXT_DIM, 0);
 }
 
 /* ---------- input ---------- */
-static window_t *dragging;
 static hit_t     drag_hit;
 static int       drag_dx, drag_dy;
 static int       drag_ox, drag_oy, drag_ow, drag_oh;
@@ -725,11 +493,20 @@ static window_t *window_at(int x, int y) {
     return 0;
 }
 
-void desktop_handle_mouse(int dx, int dy, u8 buttons) {
+void desktop_handle_mouse(int dx, int dy, u8 buttons, int wheel) {
     int cx, cy; cursor_get_pos(&cx, &cy);
     cursor_set_pos(cx + dx, cy + dy);
     cursor_get_pos(&cx, &cy);
     g_dirty = true;
+
+    /* scroll wheel: hand it to the focused window's scroll handler */
+    if (wheel != 0) {
+        window_t *fw = window_focused();
+        if (fw && fw->on_scroll) {
+            fw->on_scroll(fw, wheel);
+            g_dirty = true;
+        }
+    }
 
     bool left  = buttons & 1;
     bool right = buttons & 2;
@@ -746,84 +523,24 @@ void desktop_handle_mouse(int dx, int dy, u8 buttons) {
     if (menu_handle_click(cx, cy, left && !prev_left)) {
         prev_left = left; prev_right = right; return;
     }
+
+    /* drawer: any left click closes it */
     if (drawer_open) {
-        if (left && !prev_left) {
-            if (drawer_hover >= 0) {
-                /* start a potential drag from drawer */
-                g_drop_drag.active = true;
-                g_drop_drag.from_drawer = true;
-                g_drop_drag.app = &yart_app_catalog[drawer_hover];
-                g_drop_drag.icon = yart_app_catalog[drawer_hover].icon;
-                strncpy(g_drop_drag.name, yart_app_catalog[drawer_hover].name, VFS_MAX_NAME - 1);
-                g_drop_drag.path[0] = 0;
-                /* don't close drawer yet – wait to see if it's a click or drag */
-                prev_left = left; prev_right = right; return;
-            } else {
-                drawer_open = false;
-                drawer_query_len = 0; drawer_query[0] = 0;
-            }
-        }
-        /* if dragging from drawer and mouse released */
-        if (g_drop_drag.active && g_drop_drag.from_drawer && !left) {
-            /* if released outside drawer area → create desktop shortcut */
-            drawer_open = false;
-            drawer_query_len = 0; drawer_query[0] = 0;
-            if (cy < dock_y() && cy >= BAR_H + 40) {
-                desktop_icon_add(g_drop_drag.name, NULL, g_drop_drag.icon,
-                                 cx - 36, cy - 36, true, g_drop_drag.app);
-                toast("Added %s to desktop", g_drop_drag.name);
-            } else {
-                /* just launch the app */
-                g_drop_drag.app->launch();
-            }
-            g_drop_drag.active = false;
-            prev_left = left; prev_right = right; return;
-        }
-        /* if quick click (pressed and released without drag) → just launch */
-        if (g_drop_drag.active && g_drop_drag.from_drawer && !left && prev_left) {
-            drawer_open = false;
-            drawer_query_len = 0; drawer_query[0] = 0;
-            g_drop_drag.app->launch();
-            g_drop_drag.active = false;
-            prev_left = left; prev_right = right; return;
-        }
-        if (!g_drop_drag.active) {
-            prev_left = left; prev_right = right; return;
-        }
+        if (left && !prev_left) drawer_open = false;
         prev_left = left; prev_right = right; return;
     }
 
     if (right && !prev_right) {
-        /* dock right-click? */
+        /* dock right-click: close-window menu on a running task */
         if (cy >= dock_y()) {
             for (int i = 0; i < nslots; i++) {
                 dock_slot_t *s = &slots[i];
                 if (cx < s->x || cx >= s->x + s->w ||
                     cy < s->y || cy >= s->y + s->h) continue;
-                if (s->kind == SLOT_PINNED && s->app) {
-                    open_pinned_menu(cx, cy, s->app);
-                    prev_left = left; prev_right = right; return;
-                }
                 if (s->kind == SLOT_TASK && s->win) {
                     open_task_menu(cx, cy, s->win);
                     prev_left = left; prev_right = right; return;
                 }
-            }
-        } else if (cy >= BAR_H) {
-            window_t *w = window_at(cx, cy);
-            if (!w) {
-                /* desktop right-click */
-                open_desktop_menu(cx, cy);
-                prev_left = left; prev_right = right; return;
-            }
-            /* route right-click to the focused window for context menus */
-            hit_t h = hit_test(w, cx, cy);
-            if (h == HIT_BODY) {
-                /* check if this is a Files window by icon */
-                g_files_right_x = cx; g_files_right_y = cy;
-                g_files_right_pending = true;
-                wm_dirty();
-                prev_left = left; prev_right = right; return;
             }
         }
     }
@@ -841,8 +558,6 @@ void desktop_handle_mouse(int dx, int dy, u8 buttons) {
                         window_minimize(s->win);
                     else
                         window_restore(s->win);
-                } else if (s->kind == SLOT_PINNED && s->app) {
-                    s->app->launch();
                 }
                 prev_left = left; return;
             }
@@ -858,13 +573,7 @@ void desktop_handle_mouse(int dx, int dy, u8 buttons) {
         window_t *w = window_at(cx, cy);
         if (w) {
             window_focus(w);
-            hit_t h = hit_test(w, cx, cy);
-            if (h == HIT_BODY) {
-                g_files_click_x = g_term_click_x = g_editor_click_x = cx;
-                g_files_click_y = g_term_click_y = g_editor_click_y = cy;
-                g_files_click_pending = g_term_click_pending = g_editor_click_pending = true;
-            }
-            switch (h) {
+            switch (hit_test(w, cx, cy)) {
             case HIT_BTN_CLOSE: window_close_requested(w); break;
             case HIT_BTN_MIN:   window_minimize(w);        break;
             case HIT_BTN_MAX:   window_maximize(w);        break;
@@ -878,7 +587,7 @@ void desktop_handle_mouse(int dx, int dy, u8 buttons) {
             case HIT_RESIZE_L: case HIT_RESIZE_T: case HIT_RESIZE_BL:
             case HIT_RESIZE_TR: case HIT_RESIZE_TL:
                 if (!(w->flags & (WIN_NORES | WIN_MAX))) {
-                    dragging = w; drag_hit = h;
+                    dragging = w; drag_hit = (hit_t)hit_test(w, cx, cy);
                     drag_dx = cx; drag_dy = cy;
                     drag_ox = w->x; drag_oy = w->y;
                     drag_ow = w->w; drag_oh = w->h;
@@ -886,40 +595,8 @@ void desktop_handle_mouse(int dx, int dy, u8 buttons) {
                 break;
             default: break;
             }
-        } else if (cy >= BAR_H && cy < dock_y()) {
-            /* click on desktop area - check desktop icons */
-            int di = desktop_icon_at(cx, cy);
-            if (di >= 0) {
-                g_desktop_drag = di;
-                g_desktop_drag_ox = cx - g_desktop_icons[di].x;
-                g_desktop_drag_oy = cy - g_desktop_icons[di].y;
-                /* double-click detection: if icon was already "focused", open it */
-                static int last_icon_click = -1;
-                static u64 last_icon_time = 0;
-                u64 now = pit_ticks() * 10;
-                if (di == last_icon_click && now - last_icon_time < 500) {
-                    /* double click: open */
-                    desktop_icon_t *d = &g_desktop_icons[di];
-                    if (d->is_app && d->app) {
-                        d->app->launch();
-                    } else if (d->path[0]) {
-                        vnode_t *v = vfs_lookup(d->path);
-                        if (v && v->type == VN_DIR) {
-                            extern void open_files(const char *);
-                            open_files(d->path);
-                        } else {
-                            open_editor(d->path);
-                        }
-                    }
-                    last_icon_click = -1;
-                } else {
-                    last_icon_click = di;
-                    last_icon_time = now;
-                }
-            } else {
-                /* clicked empty desktop - nothing selected */
-            }
         }
+        /* click on empty desktop: nothing to do (no bundled apps) */
     }
 
     if (left && dragging) {
@@ -975,32 +652,6 @@ void desktop_handle_mouse(int dx, int dy, u8 buttons) {
         }
     }
 
-    /* desktop icon dragging */
-    if (left && g_desktop_drag >= 0) {
-        desktop_icon_t *d = &g_desktop_icons[g_desktop_drag];
-        d->x = cx - g_desktop_drag_ox;
-        d->y = cy - g_desktop_drag_oy;
-        if (d->y < BAR_H) d->y = BAR_H;
-    }
-
-    /* file drop from file manager onto desktop */
-    if (g_drop_drag.active && !g_drop_drag.from_drawer) {
-        /* currently dragging a file from files manager */
-        if (!left) {
-            /* dropped on desktop */
-            if (cy >= BAR_H && cy < dock_y()) {
-                window_t *w = window_at(cx, cy);
-                if (!w) {
-                    /* only drop if landed on bare desktop (not over another window) */
-                    desktop_icon_add(g_drop_drag.name, g_drop_drag.path,
-                                     g_drop_drag.icon, cx - 36, cy - 36, false, NULL);
-                    toast("Dropped %s on desktop", g_drop_drag.name);
-                }
-            }
-            g_drop_drag.active = false;
-        }
-    }
-
     if (!left && dragging) {
         window_t *w = dragging;
         if (drag_hit == HIT_TITLE) {
@@ -1022,12 +673,11 @@ void desktop_handle_mouse(int dx, int dy, u8 buttons) {
         dragging = 0;
     } else if (!left) {
         dragging = 0;
-        g_desktop_drag = -1;
     }
     prev_left = left;
 }
 
-void desktop_handle_key(int sc, char ch, u32 mods) {
+void desktop_handle_key(int sc, int ch, u32 mods) {
     g_dirty = true;
     session_input_activity();
 
@@ -1036,66 +686,24 @@ void desktop_handle_key(int sc, char ch, u32 mods) {
         if (login_overlay_handle_key(sc, ch, mods)) return;
     }
 
-    /* drawer: search */
+    /* drawer: Esc / Enter closes */
     if (drawer_open) {
-        if (sc == 0x01 || ch == 27) {
-            drawer_open = false;
-            drawer_query_len = 0; drawer_query[0] = 0;
-            return;
-        }
-        if (ch == '\b' || ch == 8) {
-            if (drawer_query_len) drawer_query[--drawer_query_len] = 0;
-            return;
-        }
-        if (ch == '\n') {
-            /* launch first match */
-            for (int i = 0; i < yart_app_catalog_count; i++) {
-                const yart_app_t *a = &yart_app_catalog[i];
-                if (drawer_query_len == 0) {
-                    drawer_open = false;
-                    drawer_query_len = 0; drawer_query[0] = 0;
-                    a->launch(); return;
-                }
-                /* substring match (case-insensitive) */
-                const char *hs = a->name;
-                bool match = false;
-                for (const char *h = hs; *h && !match; h++) {
-                    int k;
-                    for (k = 0; drawer_query[k]; k++) {
-                        char a_ = h[k], b_ = drawer_query[k];
-                        if (a_ >= 'A' && a_ <= 'Z') a_ += 32;
-                        if (b_ >= 'A' && b_ <= 'Z') b_ += 32;
-                        if (a_ != b_) break;
-                    }
-                    if (drawer_query[k] == 0) match = true;
-                }
-                if (match) {
-                    drawer_open = false;
-                    drawer_query_len = 0; drawer_query[0] = 0;
-                    a->launch(); return;
-                }
-            }
-            return;
-        }
-        if (ch >= ' ' && ch < 127 && drawer_query_len < (int)sizeof drawer_query - 1) {
-            drawer_query[drawer_query_len++] = ch;
-            drawer_query[drawer_query_len] = 0;
-        }
+        if (sc == 0x01 || ch == 27 || ch == '\n') drawer_open = false;
         return;
     }
 
     /* Ctrl+Alt+Left/Right => workspace switch */
     if ((mods & KEY_CTRL) && (mods & KEY_ALT)) {
-        if (sc == 0x4B) {            /* left */
+        if (sc == 0x4B) {
             current_ws = (current_ws + WORKSPACES - 1) % WORKSPACES;
             return;
         }
-        if (sc == 0x4D) {            /* right */
+        if (sc == 0x4D) {
             current_ws = (current_ws + 1) % WORKSPACES;
             return;
         }
     }
-    /* Super (F1) opens drawer */
+    /* F1 opens the drawer */
     if (sc == 0x3B) { drawer_open = true; return; }
     window_t *w = window_focused();
     if (w && w->on_key) w->on_key(w, sc, ch, mods);
@@ -1106,7 +714,6 @@ static void apply_night_light(void) {
     int s = g_config.display_night_light;
     if (s <= 0) return;
     if (s > 100) s = 100;
-    /* shift blue down, red up: per row, multiply blue by (100-s)/100. */
     int blue_keep = 100 - (s * 60) / 100;
     int red_add   = (s * 20) / 100;
     for (u32 y = 0; y < g_fb.height; y++) {
@@ -1123,27 +730,19 @@ static void apply_night_light(void) {
 }
 
 /* ---------- public lifecycle ---------- */
-static bool g_apps_opened = false;
-
 void desktop_init(void) {
     try_load_wallpaper();
     session_init();
     login_overlay_init();
     cursor_set_pos(g_fb.width / 2, g_fb.height / 2);
 
-    /* create default user directories */
+    /* create default user directories (future apps expect them) */
     vfs_mkdir_p("/home/yart/Desktop");
     vfs_mkdir_p("/home/yart/Documents");
     vfs_mkdir_p("/home/yart/Pictures");
     vfs_mkdir_p("/home/yart/Music");
     vfs_mkdir_p("/home/yart/Videos");
     vfs_mkdir_p("/home/yart/Downloads");
-
-    /* seed a few default desktop icons */
-    desktop_icon_add("Home", "/home/yart", ICON_HOME,
-                     40, BAR_H + 20, false, NULL);
-    desktop_icon_add("Files", "/home/yart", ICON_FILES,
-                     40, BAR_H + 100, false, NULL);
 }
 
 static bool any_animated(void) {
@@ -1159,7 +758,6 @@ static bool any_animated(void) {
 
 void desktop_render(void) {
     draw_wallpaper();
-    draw_desktop_icons();
     draw_statusbar();
     window_t *stack[32]; int n = 0;
     for (window_t *w = windows; w && n < 32; w = w->next) stack[n++] = w;
@@ -1182,17 +780,16 @@ void desktop_render(void) {
 }
 
 void desktop_tick(u64 ms) {
-    if (drawer_open_request) { drawer_open = true; drawer_open_request = false; g_dirty = true; }
     mouse_event_t me;
     while (mouse_poll(&me)) {
-        desktop_handle_mouse(me.dx, me.dy, me.buttons);
+        desktop_handle_mouse(me.dx, me.dy, me.buttons, me.wheel);
         g_dirty = true;
     }
     int ev;
     while ((ev = kbd_poll_event()) != 0) {
         if (ev & KEY_RELEASE) continue;
         u32 mods = ev & (KEY_SHIFT|KEY_CTRL|KEY_ALT);
-        desktop_handle_key((ev >> 8) & 0xFF, (char)(ev & 0xFF), mods);
+        desktop_handle_key((ev >> 8) & 0xFF, (u8)(ev & 0xFF), mods);
         g_dirty = true;
     }
     int interval = 1000 / (g_config.display_fps > 0 ? g_config.display_fps : 30);
@@ -1204,16 +801,4 @@ void desktop_tick(u64 ms) {
     desktop_render();
 
     login_overlay_tick();
-
-    /* open default apps on first successful login */
-    if (g_session.logged_in && !g_apps_opened) {
-        g_apps_opened = true;
-        const char *home = "/home/yart";
-        if (g_session.current_user >= 0 && g_session.users[g_session.current_user].home[0])
-            home = g_session.users[g_session.current_user].home;
-        open_files(home);
-        open_terminal();
-        toast("Welcome to Yart OS");
-        toast("F1 = drawer  Ctrl+Alt+arrows = workspace");
-    }
 }

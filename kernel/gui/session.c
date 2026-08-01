@@ -5,20 +5,39 @@
 #include <yart/hal.h>
 #include <yart/config.h>
 #include <yart/console.h>
+#include <yart/sha256.h>
 
 yart_session_t g_session;
 
-void session_hash_password(const char *password, char *out_hash, int out_len) {
-    unsigned long hash = 5381;
-    int c;
-    const char *p = password;
-    while ((c = *p++)) hash = ((hash << 5) + hash) + c;
-    static const char hex[] = "0123456789abcdef";
-    int max = (out_len - 1) < 16 ? (out_len - 1) : 16;
-    for (int i = 0; i < max; i++) {
-        out_hash[i] = hex[(hash >> (i * 4)) & 0xF];
+/* Password storage:  "$<16-hex-salt>$<64-hex-sha256(salt||password)>"
+ * djb2 is gone.  SHA-256 + a per-user random salt means the stored value is
+ * a cryptographic digest; two users with the same password store different
+ * digests, and precomputed tables (rainbow tables) do not apply. */
+#define SALT_HEX_LEN 16
+static u64 g_salt_counter;
+
+static void gen_salt(char out[SALT_HEX_LEN + 1]) {
+    u8 salt[8];
+    rtc_time_t t; rtc_read(&t);
+    u64 seed = pit_ticks() * 6364136223846793005ULL;
+    seed ^= ((u64)t.second << 32) ^ ((u64)t.minute << 16) ^ (u64)t.year;
+    seed += (g_salt_counter++ * 2654435761u);
+    for (int i = 0; i < 8; i++) { salt[i] = (u8)(seed >> (i * 8)); seed ^= seed >> 13; }
+    static const char hx[] = "0123456789abcdef";
+    for (int i = 0; i < 8; i++) {
+        out[i*2]   = hx[salt[i] >> 4];
+        out[i*2+1] = hx[salt[i] & 0xF];
     }
-    out_hash[max] = 0;
+    out[SALT_HEX_LEN] = 0;
+}
+
+void session_hash_password(const char *password, const char *salt,
+                           char *out_hash, int out_len) {
+    u8 digest[32];
+    sha256_strings(digest, salt, password, NULL);
+    char hex[65];
+    sha256_to_hex(digest, hex);
+    snprintf(out_hash, out_len, "$%s$%s", salt, hex);
 }
 
 void session_init(void) {
@@ -108,7 +127,9 @@ int session_create_user(const char *username, const char *password, bool admin) 
 
     yart_user_t *u = &g_session.users[g_session.user_count++];
     strncpy(u->username, username, USER_NAME_LEN - 1);
-    session_hash_password(password, u->password_hash, USER_PASS_LEN);
+    char salt[SALT_HEX_LEN + 1];
+    gen_salt(salt);
+    session_hash_password(password, salt, u->password_hash, USER_PASS_LEN);
 
     char home[USER_HOME_LEN];
     snprintf(home, sizeof home, "/home/%s", username);
@@ -122,14 +143,20 @@ int session_create_user(const char *username, const char *password, bool admin) 
 }
 
 bool session_auth(const char *username, const char *password) {
-    char hash[USER_PASS_LEN];
-    session_hash_password(password, hash, USER_PASS_LEN);
-
     for (int i = 0; i < g_session.user_count; i++) {
-        if (strcmp(g_session.users[i].username, username) == 0 &&
-            strcmp(g_session.users[i].password_hash, hash) == 0) {
-            return true;
-        }
+        yart_user_t *u = &g_session.users[i];
+        if (strcmp(u->username, username) != 0) continue;
+        /* stored format: $salt$hash - extract the salt, recompute, compare */
+        if (u->password_hash[0] != '$') return false;   /* corrupt/old      */
+        char salt[SALT_HEX_LEN + 1];
+        int j = 1;
+        while (u->password_hash[j] && u->password_hash[j] != '$' &&
+               j < SALT_HEX_LEN + 1) { salt[j - 1] = u->password_hash[j]; j++; }
+        salt[j - 1] = 0;
+        char hash[USER_PASS_LEN];
+        session_hash_password(password, salt, hash, USER_PASS_LEN);
+        if (strcmp(u->password_hash, hash) == 0) return true;
+        return false;
     }
     return false;
 }

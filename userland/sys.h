@@ -30,6 +30,24 @@ enum {
     SYS_YIELD    = 14,
     SYS_TRUNCATE = 15,
     SYS_KLOG     = 16,
+    SYS_FORK     = 17,
+    SYS_WAITPID  = 18,
+    SYS_DOAS     = 19,
+    SYS_CHMOD    = 20,
+    SYS_DROP     = 21,
+    SYS_KILL     = 22,
+    SYS_MMAP     = 23,
+    SYS_MUNMAP   = 24,
+    SYS_SETUID   = 25,
+    SYS_RENAME   = 26,
+    SYS_BRK      = 27,
+    SYS_SIGACTION = 28,
+    SYS_RAISE    = 29,
+    SYS_FSYNC    = 30,
+    SYS_SETGID   = 31,
+    SYS_UMASK    = 32,
+    SYS_ACL      = 33,
+    SYS_GETCPU   = 34,
 };
 
 #define O_RDONLY 0x0
@@ -59,7 +77,27 @@ static inline ssize_t read(int fd, void *buf, size_t n) {
 static inline int open(const char *p, int f) { return _sc(SYS_OPEN, (long)p, f, 0); }
 static inline int close(int fd) { return _sc(SYS_CLOSE, fd, 0, 0); }
 static inline int klog(const char *s) { return _sc(SYS_KLOG, (long)s, 0, 0); }
+static inline int unlink(const char *p) { return _sc(SYS_UNLINK, (long)p, 0, 0); }
 static inline int yield(void) { return _sc(SYS_YIELD, 0, 0, 0); }
+static inline long getpid(void) { return _sc(SYS_GETPID, 0, 0, 0); }
+static inline long fork(void) { return _sc(SYS_FORK, 0, 0, 0); }
+static inline long waitpid(long pid, int *status) { return _sc(SYS_WAITPID, pid, (long)status, 0); }
+static inline long doas(const char *password) { return _sc(SYS_DOAS, (long)password, 0, 0); }
+static inline long chmod(const char *path, long mode) { return _sc(SYS_CHMOD, (long)path, mode, 0); }
+static inline long drop_priv(void) { return _sc(SYS_DROP, 0, 0, 0); }
+static inline long kill(long pid) { return _sc(SYS_KILL, pid, 0, 0); }
+static inline long getcpu(void) { return _sc(SYS_GETCPU, 0, 0, 0); }
+static inline long mmap(long len) { return _sc(SYS_MMAP, len, 0, 0); }
+static inline long munmap(long addr) { return _sc(SYS_MUNMAP, addr, 0, 0); }
+static inline long setuid(long uid) { return _sc(SYS_SETUID, uid, 0, 0); }
+static inline long rename(const char *o, const char *n) { return _sc(SYS_RENAME, (long)o, (long)n, 0); }
+static inline long brk(long addr) { return _sc(SYS_BRK, addr, 0, 0); }
+static inline long sigaction(long sig, long handler) { return _sc(SYS_SIGACTION, sig, handler, 0); }
+static inline long raise(long pid, long sig) { return _sc(SYS_RAISE, pid, sig, 0); }
+static inline long fsync(long fd) { return _sc(SYS_FSYNC, fd, 0, 0); }
+static inline long setgid(long gid) { return _sc(SYS_SETGID, gid, 0, 0); }
+static inline long umask(long m) { return _sc(SYS_UMASK, m, 0, 0); }
+static inline long acl(const char *p, long uid, long mask) { return _sc(SYS_ACL, (long)p, uid, mask); }
 static inline void exit(int n) { _sc(SYS_EXIT, n, 0, 0); for(;;); }
 
 static inline size_t strlen(const char *s) { size_t n=0; while(s[n]) n++; return n; }

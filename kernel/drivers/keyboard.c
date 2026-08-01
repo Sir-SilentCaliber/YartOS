@@ -20,6 +20,7 @@ static volatile int evq[EV_QSZ];
 static volatile u32 ev_head, ev_tail;
 
 static bool shift, ctrl, alt, caps;
+static bool e0_pending;   /* saw the 0xE0 extended prefix */
 
 static const char map_lower[128] = {
     0,27,'1','2','3','4','5','6','7','8','9','0','-','=','\b',
@@ -47,9 +48,20 @@ bool kbd_ctrl_held(void)  { return ctrl; }
 bool kbd_shift_held(void) { return shift; }
 bool kbd_alt_held(void)   { return alt; }
 
+/* E0-prefixed set-1 scancodes -> YART virtual keycodes (see drivers.h).
+ * Cursor arrows, Home/End, PgUp/PgDn, Ins/Del all come through the 0xE0
+ * prefix; without this table they produced ascii 0 and did nothing. */
+static const u8 e0_vk[128] = {
+    [0x47] = YK_HOME, [0x48] = YK_UP,   [0x49] = YK_PGUP,
+    [0x4B] = YK_LEFT, [0x4D] = YK_RIGHT,
+    [0x4F] = YK_END,  [0x50] = YK_DOWN, [0x51] = YK_PGDN,
+    [0x52] = YK_INS,  [0x53] = YK_DEL,
+};
+
 static void kbd_irq(cpu_regs_t *r) {
     (void)r;
     u8 sc = inb(KBD_DATA);
+    if (sc == 0xE0) { e0_pending = true; return; }   /* extended prefix */
     bool released = sc & 0x80;
     u8 code = sc & 0x7F;
     /* update modifier state but ALSO push the event so apps that want
@@ -63,16 +75,20 @@ static void kbd_irq(cpu_regs_t *r) {
         break;
     }
     char ascii = 0;
-    if (code < 128) {
+    if (e0_pending) {
+        if (code < 128 && e0_vk[code]) ascii = (char)e0_vk[code];
+    } else if (code < 128) {
         bool up = shift ^ caps;
         ascii = up ? map_upper[code] : map_lower[code];
     }
     int ev = ((int)code << 8) | (u8)ascii;
-    if (released) ev |= (1 << 16);
-    if (shift)    ev |= (1 << 17);
-    if (ctrl)     ev |= (1 << 18);
-    if (alt)      ev |= (1 << 19);
+    if (released)   ev |= KEY_RELEASE;
+    if (e0_pending) ev |= KEY_EXT;
+    if (shift)      ev |= KEY_SHIFT;
+    if (ctrl)       ev |= KEY_CTRL;
+    if (alt)        ev |= KEY_ALT;
     enq(ev);
+    e0_pending = false;
 }
 
 void kbd_init(void) {

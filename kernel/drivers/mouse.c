@@ -1,4 +1,8 @@
-/* Yart OS - PS/2 AUX (mouse) driver, 3-byte packet format */
+/* Yart OS - PS/2 AUX (mouse) driver.
+ *
+ * Speaks the IntelliMouse 4-byte protocol (standard 3-byte packets plus a
+ * wheel byte).  The wheel is enabled by the 200/100/80 sample-rate trick.
+ */
 #include <yart/drivers.h>
 #include <yart/hal.h>
 #include <yart/io.h>
@@ -7,7 +11,9 @@
 #define KBD_STAT 0x64
 #define KBD_CMD  0x64
 
-static u8  pkt[3];
+#define PKT_SZ 4
+
+static u8  pkt[PKT_SZ];
 static u8  pkt_idx;
 static volatile mouse_event_t latest;
 static volatile bool          have;
@@ -29,7 +35,7 @@ static void mouse_irq(cpu_regs_t *r) {
     u8 b = inb(KBD_DATA);
     if (pkt_idx == 0 && !(b & 0x08)) return;   /* alignment bit */
     pkt[pkt_idx++] = b;
-    if (pkt_idx == 3) {
+    if (pkt_idx == PKT_SZ) {
         pkt_idx = 0;
         u8 flags = pkt[0];
         int dx = pkt[1], dy = pkt[2];
@@ -38,6 +44,7 @@ static void mouse_irq(cpu_regs_t *r) {
         latest.dx = dx;
         latest.dy = -dy;       /* invert: PS/2 Y goes up */
         latest.buttons = flags & 0x07;
+        latest.wheel   = (i8)pkt[3];   /* wheel byte, -1..+1 typically */
         latest.valid = true;
         have = true;
     }
@@ -56,6 +63,10 @@ void mouse_init(void) {
     /* defaults + enable streaming */
     mouse_write(0xF6); (void)mouse_read();
     mouse_write(0xF4); (void)mouse_read();
+    /* IntelliMouse wheel enable: 200 -> 100 -> 80 sample rate */
+    mouse_write(0xF3); (void)mouse_read(); mouse_write(200); (void)mouse_read();
+    mouse_write(0xF3); (void)mouse_read(); mouse_write(100); (void)mouse_read();
+    mouse_write(0xF3); (void)mouse_read(); mouse_write(80);  (void)mouse_read();
 
     irq_register(32 + 12, mouse_irq);
     pic_unmask(2);

@@ -75,7 +75,7 @@ static void limine_ap_entry(struct limine_smp_info *info) {
      * vectors.  ORDER MATTERS: switching the GDT reloads GS from a flat
      * descriptor (base 0), wiping any per-CPU GS base - so set GS.base
      * AFTER.  smp_ap_switch_gdt does NOT ltr (the BSP's TSS is busy); the
-     * AP's private TSS (selector 0x38) is installed right after. */
+     * AP's private TSS (selector 0x40) is installed right after. */
     smp_ap_switch_gdt(cpu);
     idt_reload();
     wrmsr64(MSR_GS_BASE, (u64)c);         /* this AP's per-CPU area */

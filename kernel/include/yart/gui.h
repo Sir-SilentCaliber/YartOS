@@ -88,6 +88,7 @@ struct yart_window {
 void desktop_init(void);
 void desktop_tick(u64 ms);
 void desktop_render(void);
+void desktop_reset(void);    /* watchdog supervisor recovery for the desktop */
 
 window_t *window_create(const char *title, icon_id_t icon,
                         int x, int y, int w, int h,

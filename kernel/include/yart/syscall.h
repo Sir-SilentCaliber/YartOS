@@ -40,6 +40,10 @@ enum {
     SYS_UMASK    = 32,    /* set file-creation mask, returns old                 */
     SYS_ACL      = 33,    /* set/clear an ACL entry on a file (owner/root)       */
     SYS_GETCPU   = 34,    /* which CPU am I running on (SMP)                     */
+    SYS_DMESG    = 35,    /* read the kernel audit/dmesg log (ring 3)            */
+    SYS_NET_INFO = 36,    /* read the assigned IP/gw/dns/mask (ring 3)            */
+    SYS_UDP_SEND = 37,    /* send a UDP datagram                                   */
+    SYS_UDP_RECV = 38,    /* poll a received UDP datagram                          */
     SYS_MAX
 };
 

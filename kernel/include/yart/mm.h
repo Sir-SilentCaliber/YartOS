@@ -22,6 +22,10 @@ u32     pmm_refcount(paddr_t p);
 size_t  pmm_total_pages(void);
 size_t  pmm_used_pages(void);
 bool    pmm_selftest(void);
+/* Debug hook for the OOM selftest: while forced, pmm_alloc_page takes the
+ * OOM-kill path even though free pages remain, so the reclaim logic can be
+ * verified deterministically without exhausting real RAM. */
+void    pmm_oom_test_force(bool on);
 
 /* VMM (4-level paging) */
 #define PTE_PRESENT  (1ULL << 0)
@@ -84,11 +88,16 @@ u64  *vmm_kernel_pml4(void);
 paddr_t vmm_translate_in(u64 *pml4, u64 va);
 void   vmm_map_in(u64 *pml4, u64 va, paddr_t p, u64 flags);
 
-/* Swap (RAM-backed pool until a disk exists) */
+/* Swap: a RAM pool always exists as the boot-time/fallback backend; when a
+ * virtio-blk disk is present vmm_swap_disk_init() arms a disk-backed tier so
+ * evicted pages go to the disk and genuinely free RAM. */
 void vmm_swap_init(void);
 int  vmm_swap_out(u64 va);           /* move one mapped page to the pool */
 int  vmm_swap_in(u64 va);            /* fault a swapped page back in     */
 int  vmm_evict_some(int max);        /* swap out up to max pages         */
+u64  vmm_swap_disk_reserve_sectors(void); /* trailing disk sectors swap owns */
+void vmm_swap_disk_init(void);       /* arm disk swap after blkfs is up  */
+bool vmm_swap_disk_armed(void);
 
 /* User-pointer validation for syscalls */
 bool vmm_user_range_ok(u64 va, u64 len);
@@ -96,9 +105,26 @@ bool vmm_user_str_ok(u64 s, u64 max);
 
 bool vmm_selftest(void);
 
-/* heap */
+/* heap - size-class (slab-style) allocator with O(1) fast paths, canary +
+ * double-free hardening, alignment >16, and allocation stats (heap.c). */
+#define HEAP_NUM_CLASSES  20   /* size classes in heap.c (16..16384) */
+#define HEAP_NUM_BUCKETS  (HEAP_NUM_CLASSES + 1)  /* + the "huge" bucket */
+typedef struct {
+    u64 total_alloc_bytes;
+    u64 total_free_bytes;
+    u64 cur_bytes;
+    u64 peak_bytes;
+    u64 alloc_count;
+    u64 free_count;
+    u64 grow_count;
+    u64 per_class_active[HEAP_NUM_BUCKETS];
+} heap_stats_t;
 void   heap_init(void);
 void  *kmalloc(size_t n);
 void  *kzalloc(size_t n);
 void   kfree(void *p);
+void  *kmalloc_aligned(size_t n, size_t align);  /* align power-of-two >16 */
+void   kfree_aligned(void *p);
+const heap_stats_t *heap_stats(void);
+void   heap_stats_snapshot(heap_stats_t *out);
 void   heap_selftest(void);

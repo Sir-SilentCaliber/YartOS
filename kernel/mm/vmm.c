@@ -18,6 +18,7 @@
 #include <yart/user.h>     /* USER_VBASE / USER_STACK_TOP */
 #include <yart/sched.h>    /* sched_current() for per-task regions */
 #include <yart/cpu.h>      /* rdmsr64/wrmsr64 for EFER.NXE */
+#include <yart/blk.h>      /* disk-backed swap tier (virtio-blk)      */
 
 u64 g_hhdm_offset = 0;
 
@@ -254,7 +255,7 @@ bool vmm_resolve_user_fault(u64 va, bool write) {
     bool present = pte && (*pte & PTE_PRESENT);
 
     if (pte && (*pte & PTE_SWAP)) {              /* swapped out -> in      */
-        vmm_swap_in(page);
+        if (vmm_swap_in(page) != 0) return false; /* OOM/I-O error -> SIGSEGV */
         return true;
     }
 
@@ -267,6 +268,10 @@ bool vmm_resolve_user_fault(u64 va, bool write) {
         }
         sched_charge_pages(1);
         paddr_t p = pmm_alloc_page();            /* zeroed on alloc        */
+        if (!p) {                                /* OOM killed the task    */
+            sched_charge_pages(-1);
+            return false;
+        }
         vmm_map(page, p, r->flags);
         kprintf("vmm: demand-fault 0x%lx -> %p mapped (region %p flags=%x)\n",
                 page, (void *)p, (void *)r->start, r->flags);
@@ -377,6 +382,14 @@ u64 *vmm_clone_pml4(void) {
     return newpml4;
 }
 
+/* Free a task's whole private address space.  Because a task whose PML4 we
+ * free here is guaranteed NOT running on any CPU (sched_kill/reap only call
+ * this when the task is not ap_current anywhere), every page in the user
+ * half is safe to drop: page tables, the PDPT, the PML4, AND every mapped
+ * user data page.  CoW pages shared with a live sibling have refcount > 1,
+ * so pmm_unref_page() leaves them in place.  (Fixing this to also free the
+ * data pages closes a real SIGKILL/OOM memory leak where only the page-table
+ * frames were reclaimed.) */
 void vmm_free_pml4(u64 *pml4) {
     if (!pml4 || pml4 == kernel_pml4) return;
     if (pml4[0] & PTE_PRESENT) {
@@ -384,22 +397,43 @@ void vmm_free_pml4(u64 *pml4) {
         for (int i3 = 0; i3 < 512; i3++) {
             if (!(pdpt[i3] & PTE_PRESENT)) continue;
             u64 *pd = phys_to_virt(pdpt[i3] & ~0xFFFULL & ~PTE_NX);
-            for (int i2 = 0; i2 < 512; i2++)
-                if (pd[i2] & PTE_PRESENT)
-                    pmm_unref_page(pd[i2] & ~0xFFFULL & ~PTE_NX);
-            pmm_unref_page(pdpt[i3] & ~0xFFFULL & ~PTE_NX);
+            for (int i2 = 0; i2 < 512; i2++) {
+                if (!(pd[i2] & PTE_PRESENT)) continue;
+                if (pd[i2] & PTE_HUGE) {          /* 2 MiB huge page          */
+                    pmm_unref_page(pd[i2] & ~0x1FFFFFULL & ~PTE_NX);
+                    continue;
+                }
+                u64 *pt = phys_to_virt(pd[i2] & ~0xFFFULL & ~PTE_NX);
+                for (int i1 = 0; i1 < 512; i1++)
+                    if (pt[i1] & PTE_PRESENT)     /* free the user data page  */
+                        pmm_unref_page(pt[i1] & ~0xFFFULL & ~PTE_NX);
+                pmm_unref_page(pd[i2] & ~0xFFFULL & ~PTE_NX);  /* the PT page  */
+            }
+            pmm_unref_page(pdpt[i3] & ~0xFFFULL & ~PTE_NX);    /* the PD page  */
         }
-        pmm_unref_page(pml4[0] & ~0xFFFULL & ~PTE_NX);
+        pmm_unref_page(pml4[0] & ~0xFFFULL & ~PTE_NX);         /* the PDPT page*/
     }
-    pmm_unref_page(virt_to_phys(pml4));
+    pmm_unref_page(virt_to_phys(pml4));                        /* the PML4 page*/
 }
 
-/* ---------------- swap (RAM-backed) ---------------- */
+/* ---------------- swap: RAM pool + optional disk-backed tier ------- */
 
 #define SWAP_SLOTS 1024
 #define SWAP_CPUS 1        /* one pool per CPU; SMP grows this to NR_CPUS */
+#define SWAP_DISK_SECTORS 2048  /* trailing disk sectors reserved for swap */
+#define SWAP_PAGE_SECTORS 8     /* 4 KiB page = 8 x 512 B sectors         */
+
 static u8  *swap_pool[SWAP_CPUS];
 static u64  swap_used[SWAP_CPUS][SWAP_SLOTS / 64];
+
+/* disk-backed tier: armed when a virtio-blk disk is present.  Evicted
+ * pages go to disk sectors (freeing the RAM frame for real) instead of the
+ * RAM pool; the RAM pool stays as the boot-time / no-disk fallback. */
+static bool swap_disk_armed;
+static u64  swap_disk_base_sector;
+static u64  swap_disk_npages;      /* SWAP_DISK_SECTORS / 8            */
+static u64 *swap_disk_used;        /* bitmap of disk slots             */
+static u64  swap_disk_out, swap_disk_in;   /* stats                    */
 
 static int swap_cpu(void) {
     /* per-CPU swap pools: each CPU evicts into its OWN pool so two CPUs
@@ -415,10 +449,57 @@ void vmm_swap_init(void) {
         swap_pool[c] = phys_to_virt(p);
         memset(swap_used[c], 0, sizeof swap_used[c]);
     }
-    kprintf("swap: %u KiB RAM-backed pool%s @%p\n",
+    swap_disk_armed = false;
+    swap_disk_out = swap_disk_in = 0;
+    kprintf("swap: %u KiB RAM-backed pool%s @%p (disk tier off until a disk)\n",
             SWAP_SLOTS * PAGE_SIZE / 1024,
             SWAP_CPUS > 1 ? "s" : "", swap_pool[0]);
 }
+
+/* The last SWAP_DISK_SECTORS of the disk are reserved for swap; blkfs sizes
+ * itself to disk_size - this, so it never touches the swap region. */
+u64 vmm_swap_disk_reserve_sectors(void) { return SWAP_DISK_SECTORS; }
+
+bool vmm_swap_disk_armed(void) { return swap_disk_armed; }
+
+/* Arm disk-backed swap.  Called once after blkfs_init() has mounted the disk.
+ * Region = [disk_size - SWAP_DISK_SECTORS, disk_size).  Then prove a page
+ * survives a disk round-trip (out + in) so we know the tier actually works. */
+void vmm_swap_disk_init(void) {
+    if (swap_disk_armed) return;
+    if (!blk_disk_present()) { kprintf("swap: no disk - RAM-only pool\n"); return; }
+    u64 disk = blk_disk_sectors();
+    if (disk <= SWAP_DISK_SECTORS) { kprintf("swap: disk too small for swap\n"); return; }
+    swap_disk_base_sector = disk - SWAP_DISK_SECTORS;
+    swap_disk_npages = SWAP_DISK_SECTORS / SWAP_PAGE_SECTORS;
+    swap_disk_used = kzalloc((swap_disk_npages / 64 + 1) * 8);
+    swap_disk_armed = true;
+    kprintf("swap: disk-backed tier armed: %u pages @ sector %llu (disk %llu, "
+            "%llu MiB)\n", (u32)swap_disk_npages,
+            (unsigned long long)swap_disk_base_sector,
+            (unsigned long long)disk, (unsigned long long)disk / 2048);
+
+    /* selftest: write a known pattern through the disk swap region and read
+     * it back, proving a real disk round-trip (out + in) works. */
+    u8 pg[PAGE_SIZE];
+    for (u32 i = 0; i < PAGE_SIZE; i++) pg[i] = (u8)(0xA0 + (i & 0x0F));
+    if (blk_write_sectors(swap_disk_base_sector, SWAP_PAGE_SECTORS, pg) == 0) {
+        u8 rd[PAGE_SIZE];
+        if (blk_read_sectors(swap_disk_base_sector, SWAP_PAGE_SECTORS, rd) == 0 &&
+            memcmp(pg, rd, PAGE_SIZE) == 0)
+            kprintf("swap: disk round-trip selftest PASS\n");
+        else
+            kprintf("swap: !! disk round-trip selftest FAIL\n");
+    } else {
+        kprintf("swap: !! disk write failed in selftest\n");
+    }
+}
+
+/* Slot space: the RAM pool occupies slots [0, SWAP_SLOTS); the disk tier (if
+ * armed) occupies [SWAP_SLOTS, SWAP_SLOTS + swap_disk_npages).  RAM slots are
+ * tried first (fast), disk is the extra capacity that genuinely frees RAM.
+ * This is strictly more swap than the old RAM-only pool, never less. */
+#define SWAP_DISK_SLOT_BASE SWAP_SLOTS
 
 static int swap_alloc_slot(void) {
     int c = swap_cpu();
@@ -427,11 +508,26 @@ static int swap_alloc_slot(void) {
             swap_used[c][i / 64] |= (1ULL << (i % 64));
             return i;
         }
-    return -1;
+    if (swap_disk_armed) {
+        for (u64 i = 0; i < swap_disk_npages; i++)
+            if (!(swap_disk_used[i / 64] & (1ULL << (i % 64)))) {
+                swap_disk_used[i / 64] |= (1ULL << (i % 64));
+                return (int)(SWAP_DISK_SLOT_BASE + i);
+            }
+    }
+    return -1;                 /* both tiers full: caller sees OOM */
 }
 static void swap_free_slot(int s) {
+    if (swap_disk_armed && s >= SWAP_DISK_SLOT_BASE) {
+        u64 i = (u64)(s - SWAP_DISK_SLOT_BASE);
+        swap_disk_used[i / 64] &= ~(1ULL << (i % 64));
+        return;
+    }
     int c = swap_cpu();
     swap_used[c][s / 64] &= ~(1ULL << (s % 64));
+}
+static bool slot_is_disk(int s) {
+    return swap_disk_armed && s >= SWAP_DISK_SLOT_BASE;
 }
 
 int vmm_swap_out(u64 va) {
@@ -441,9 +537,20 @@ int vmm_swap_out(u64 va) {
     int slot = swap_alloc_slot();
     if (slot < 0) return -1;
     paddr_t phys = *pte & ~0xFFFULL & ~PTE_NX;
-    memcpy(swap_pool[swap_cpu()] + (u64)slot * PAGE_SIZE, phys_to_virt(phys), PAGE_SIZE);
-    pmm_unref_page(phys);
-    *pte = ((u64)slot << 12) | PTE_SWAP;         /* not-present + marker   */
+    if (slot_is_disk(slot)) {
+        u64 sec = swap_disk_base_sector +
+                  (u64)(slot - SWAP_DISK_SLOT_BASE) * SWAP_PAGE_SECTORS;
+        if (blk_write_sectors(sec, SWAP_PAGE_SECTORS, phys_to_virt(phys)) != 0) {
+            swap_free_slot(slot);
+            return -1;
+        }
+        swap_disk_out++;
+    } else {
+        memcpy(swap_pool[swap_cpu()] + (u64)slot * PAGE_SIZE,
+               phys_to_virt(phys), PAGE_SIZE);
+    }
+    pmm_unref_page(phys);               /* the RAM frame is freed - real room */
+    *pte = ((u64)slot << 12) | PTE_SWAP;/* not-present + marker   */
     invlpg(page);
     return slot;
 }
@@ -455,7 +562,20 @@ int vmm_swap_in(u64 va) {
     int slot = (*pte >> 12) & 0xFFFFF;
     user_region_t *r = find_region(page);
     paddr_t p = pmm_alloc_page();
-    memcpy(phys_to_virt(p), swap_pool[swap_cpu()] + (u64)slot * PAGE_SIZE, PAGE_SIZE);
+    if (!p) return -1;                    /* OOM: caller treats as a kill */
+    if (slot_is_disk(slot)) {
+        u64 sec = swap_disk_base_sector +
+                  (u64)(slot - SWAP_DISK_SLOT_BASE) * SWAP_PAGE_SECTORS;
+        if (blk_read_sectors(sec, SWAP_PAGE_SECTORS, phys_to_virt(p)) != 0) {
+            pmm_unref_page(p);
+            swap_free_slot(slot);
+            return -1;
+        }
+        swap_disk_in++;
+    } else {
+        memcpy(phys_to_virt(p), swap_pool[swap_cpu()] + (u64)slot * PAGE_SIZE,
+               PAGE_SIZE);
+    }
     swap_free_slot(slot);
     vmm_map(page, p, r ? r->flags : (PTE_RW | PTE_US));
     return 0;
@@ -471,6 +591,10 @@ int vmm_evict_some(int max) {
             u64 *pte = walk(cur_pml4(), a, false, 0);
             if (!pte || !(*pte & PTE_PRESENT) || (*pte & PTE_SWAP)) continue;
             if (*pte & PTE_COW) continue;        /* shared: don't evict    */
+            if (!(*pte & PTE_NX)) continue;      /* executable (code): don't
+                                                    evict - a task must be
+                                                    able to keep running while
+                                                    we reclaim its data/stack */
             if (vmm_swap_out(a) >= 0) done++;
         }
     }

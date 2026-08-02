@@ -97,6 +97,14 @@ void kbd_init(void) {
     while (inb(KBD_STAT) & 1) (void)inb(KBD_DATA);
 }
 
+/* USB-HID keyboard input hook (row 18): translate a HID keycode + modifiers
+ * into the same event the PS/2 driver pushes, so the desktop's
+ * kbd_poll_event() drain works unchanged. */
+int kbd_enqueue(u8 scancode, u8 ascii, u32 flags) {
+    enq((int)(scancode << 8) | ascii | (int)flags);
+    return 0;
+}
+
 int kbd_poll_event(void) {
     if (ev_head == ev_tail) return 0;
     int ev = evq[ev_tail];

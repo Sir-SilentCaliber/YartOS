@@ -6,6 +6,8 @@ void kbd_init(void);
 /* returns 0 if no key. Lower 8 bits = ASCII or YK_* virtual keycode,
  * bits 8..15 = scancode, bit 16 = release flag, bit 20 = extended (E0) key */
 int  kbd_poll_event(void);
+/* USB-HID keyboard hook: push a key event into the shared queue. */
+int  kbd_enqueue(u8 scancode, u8 ascii, u32 flags);
 bool kbd_ctrl_held(void);
 bool kbd_shift_held(void);
 bool kbd_alt_held(void);

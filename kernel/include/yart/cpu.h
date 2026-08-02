@@ -125,7 +125,30 @@ typedef struct cpu_local_s {
     void (*ap_kwork_fn)(void *);
     void  *ap_kwork_arg;
     u64 *pml4_current;        /* the page tables CR3 points at on THIS CPU */
+    u64  ap_krsp0;            /* current task's kernel stack top (RSP0).
+                                 Kept in sync with tss.rsp[0] by
+                                 tss_set_rsp0(); the fast syscall/sysret
+                                 entry loads it here (the syscall
+                                 instruction does not switch stacks). */
+    u64  ap_syscall_rsp;      /* scratch: user RSP captured at fast-syscall
+                                 entry.  The syscall instruction does not
+                                 push the user stack pointer, and every GPR
+                                 belongs to the caller, so the entry stashes
+                                 RSP here (memory, no register clobbered)
+                                 before switching to the kernel stack. */
 } cpu_local_t;
+
+/* The fast syscall/sysret assembly entry must touch two per-CPU slots by
+ * fixed offsets ("gs:[...]"): the current kernel RSP0 and a scratch slot
+ * for the user RSP.  We pin both here so the asm can use constants; if the
+ * struct is ever reshuffled the build fails loudly instead of silently
+ * reading the wrong field. */
+#define CPU_LOCAL_RSP0_OFF    152   /* offsetof(cpu_local_t, ap_krsp0)      */
+#define CPU_LOCAL_SCRATCH_OFF 160   /* offsetof(cpu_local_t, ap_syscall_rsp)*/
+_Static_assert(offsetof(cpu_local_t, ap_krsp0) == CPU_LOCAL_RSP0_OFF,
+               "cpu_local_t::ap_krsp0 moved; update CPU_LOCAL_RSP0_OFF");
+_Static_assert(offsetof(cpu_local_t, ap_syscall_rsp) == CPU_LOCAL_SCRATCH_OFF,
+               "cpu_local_t::ap_syscall_rsp moved; update CPU_LOCAL_SCRATCH_OFF");
 
 /* Kernel-mode only.  Requires GS.base == per-cpu area, which the swapgs
  * dance in isr.asm / user_run_elf guarantees for every path except NMI. */

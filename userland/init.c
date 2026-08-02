@@ -230,6 +230,116 @@ void _start(void) {
     }
 
     /* ---- dynamic memory: mmap/munmap (real userland allocation) ---- */
+    /* ---- dmesg: read the kernel audit log (row 19) ---- */
+    klog("dmesg: reading the kernel audit log...\n");
+    {
+        /* query the total, then scan the whole available log for an earlier
+         * security event (the doas elevation "elevated to root via doas") */
+        long total = dmesg(0, DMESG_TOTAL, 0);
+        char msg[64]; int i = 0;
+        const char *a = "dmesg: total "; const char *c = " lines in kernel log\n";
+        char num1[16]; my_itoa((int)total, num1);
+        while (*a) msg[i++] = *a++;
+        for (char *p = num1; *p;) msg[i++] = *p++;
+        while (*c) msg[i++] = *c++;
+        msg[i] = 0;
+        klog(msg);
+
+        int found = 0, read_total = 0;
+        /* flat buffer; each line is up to KLOG_LINE_MAX+1 (257) bytes */
+        char chunk[20 * 257];
+        for (long start = 0; start < total && !found; start += 20) {
+            long n = dmesg(chunk, start, 20);
+            if (n <= 0) break;
+            read_total += (int)n;
+            for (long j = 0; j < n; j++) {
+                char *ln = &chunk[j * 257];
+                for (char *p = ln; *p; p++) {
+                    /* "elevated to root via doas" - the doas security event */
+                    if (p[0]=='e'&&p[1]=='l'&&p[2]=='e'&&p[3]=='v'&&
+                        p[4]=='a'&&p[5]=='t'&&p[6]=='e'&&p[7]=='d'&&
+                        p[8]==' '&&p[9]=='t'&&p[10]=='o'&&p[11]==' '&&
+                        p[12]=='r'&&p[13]=='o'&&p[14]=='o'&&p[15]=='t') { found = 1; break; }
+                }
+                if (found) break;
+            }
+        }
+        if (found) klog("dmesg: found the 'elevated to root' security event in the audit log\n");
+        else {
+            klog("dmesg: WARNING security event not found; sample lines:\n");
+            char dbg[20 * 257];
+            long nd = dmesg(dbg, total > 30 ? total - 30 : 0, 20);
+            for (long j = 0; j < nd && j < 20; j++) {
+                char *ln = &dbg[j * 257];
+                klog(ln[0] ? ln : "(empty)"); klog("\n");
+            }
+        }
+    }
+
+    /* ---- networking: DHCP + UDP echo round-trip (row 16) ---- */
+    {
+        unsigned int info[5];
+        net_info(info);
+        if (!info[4]) {
+            klog("net: no NIC present - skipping network test\n");
+        } else {
+            klog("net: waiting for DHCP to assign an address...\n");
+            long ip = 0;
+            int tries = 0;
+            /* Bounded wait (the e1000's RX is gated by QEMU's 1s flush timer
+             * after RCTL is written, so allow a few seconds). */
+            while (tries < 300 && !ip) {
+                net_info(info);
+                ip = info[0];
+                if (!ip) { for (volatile long d = 0; d < 200000L; d++) __asm__ volatile("pause"); }
+                tries++;
+            }
+            if (!ip) {
+                klog("net: DHCP timed out - no address\n");
+            } else {
+                unsigned char b0 = info[0] >> 24, b1 = info[0] >> 16,
+                              b2 = info[0] >> 8, b3 = info[0];
+                char m1[48]; int i = 0; char p0[8], p1[8], p2[8], p3[8];
+                my_itoa(b0, p0); my_itoa(b1, p1); my_itoa(b2, p2); my_itoa(b3, p3);
+                const char *d1 = "net: ip=";
+                while (*d1) m1[i++] = *d1++;
+                for (char *p = p0; *p;) m1[i++] = *p++;
+                m1[i++] = '.'; for (char *p = p1; *p;) m1[i++] = *p++;
+                m1[i++] = '.'; for (char *p = p2; *p;) m1[i++] = *p++;
+                m1[i++] = '.'; for (char *p = p3; *p;) m1[i++] = *p++;
+                m1[i++] = '\n'; m1[i] = 0;
+                klog(m1);
+
+                /* UDP echo: send a probe to the gateway on the host's echo port.
+                 * The host runs a UDP echo server on 127.0.0.1:7000 (reachable
+                 * via slirp as <gw>:7000) which replies; we verify the round-trip. */
+                unsigned int gw = info[2];
+                const char *probe = "YARTNET-PROBE";
+                klog("net: sending UDP probe to gateway...\n");
+                int sent = 0;
+                for (int attempt = 0; attempt < 3 && !sent; attempt++) {
+                    if (udp_send(gw, 7000, probe, 13) == 0) sent = 1;
+                    else { for (volatile long d = 0; d < 1000000L; d++) __asm__ volatile("pause"); }
+                }
+                if (!sent) {
+                    klog("net: UDP send FAILED\n");
+                } else {
+                    char rbuf[64]; long n = 0;
+                    for (int wait = 0; wait < 60 && n == 0; wait++) {
+                        n = udp_recv(rbuf, 64);
+                        if (!n) { for (volatile long d = 0; d < 1000000L; d++) __asm__ volatile("pause"); }
+                    }
+                    if (n == 13 && rbuf[0]=='Y' && rbuf[1]=='A' && rbuf[2]=='R' && rbuf[3]=='T') {
+                        klog("net: UDP round-trip OK - host echoed our probe back!\n");
+                    } else if (n > 0) {
+                        klog("net: received UDP reply but payload mismatch\n");
+                    } else {
+                        klog("net: no UDP reply received (host echo server not running?)\n");
+                    }
+                }
+            }
+        }
+    }
     klog("mmap: testing dynamic memory allocation...\n");
     {
         /* 1 MiB - demand-paged, faults in as we touch it */

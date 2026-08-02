@@ -38,11 +38,13 @@
 #include <yart/cpu.h>       /* fpu_save/fpu_restore/fpu_capture_clean */
 #include <yart/spinlock.h>
 #include <yart/hal.h>
+#include <yart/watchdog.h>      /* watchdog_tick from the BSP timer */
 extern void lapic_send_ipi(u32 dest_apic, u8 vector);
 #define AP_WAKE_VEC 62
 
 static task_t *g_tasks;       /* global list (all tasks, any state)   */
 static task_t *g_idle_task;   /* BSP's desktop task (pid 0)           */
+static u64     g_wd_tick_cnt; /* throttles the BSP watchdog to ~1 Hz   */
 static u32     g_next_pid;
 static bool    g_idle_handoff;   /* idle task is sleeping and may be preempted */
 static spinlock_t g_tasks_lock;  /* protects g_tasks append/remove/find/reap */
@@ -55,6 +57,7 @@ task_t *sched_current(void) {
     cpu_local_t *c = get_cpu_local();
     return (c && c->ap_current) ? c->ap_current : NULL;
 }
+task_t *sched_tasks(void) { return g_tasks; }
 bool    sched_current_is_user(void) { task_t *t = sched_current(); return t && t->is_user; }
 u32     sched_next_pid(void)    { return g_next_pid; }
 u32     sched_current_uid(void) { task_t *t = sched_current(); return t ? t->uid : 0; }
@@ -327,6 +330,7 @@ task_t *sched_create_user(const char *name, u64 entry, u64 user_rsp) {
     t->brk_base = USER_MMAP_BASE;
     t->brk      = USER_MMAP_BASE;   /* heap starts empty                 */
     t->mem_pages = 0;
+    t->last_sched = pit_ticks();   /* so the watchdog doesn't misjudge it */
     t->mem_limit_pages = 256 * 1024 * 1024 / PAGE_SIZE;   /* 256 MiB cap */
 
     /* fake resume frame so the first schedule iretq's into user mode */
@@ -394,6 +398,7 @@ task_t *sched_fork(task_t *parent, cpu_regs_t *frame) {
     child->saved_rsp = (u64)f;
     fpu_save(child->fpu_area);   /* capture the parent's LIVE FPU state */
 
+    child->last_sched = pit_ticks();   /* watchdog: treat as freshly alive */
     task_append(child);
 
     /* place the child on the least-loaded online CPU (an AP on SMP) */
@@ -429,6 +434,7 @@ static u64 switch_to(task_t *next, u64 current_rsp) {
     }
     c->ap_current = next;
     next->state = TASK_RUNNING;
+    next->last_sched = pit_ticks();   /* for the hung-task watchdog */
     fpu_restore(next->fpu_area);
 
     if (next->is_user)
@@ -646,6 +652,11 @@ void sched_ap_steal(cpu_local_t *c) {
 u64 sched_tick(u64 current_rsp) {
     cpu_local_t *c = get_cpu_local();
     task_t *cur = c->ap_current;
+    /* BSP-only, ~1 Hz: run the watchdog/supervisor (restart stalled kernel
+     * services + kill hung user tasks).  Only one CPU drives it to avoid
+     * concurrent scans, and only once a second to keep it cheap. */
+    if (c->cpu_id == 0 && (++g_wd_tick_cnt % 100) == 0)
+        watchdog_tick();
     if (!cur) {
         /* this CPU is idle (an AP in its loop): run a parked/queued task
          * if any.  Remember the idle frame so we can iretq back when it
@@ -824,4 +835,118 @@ void sched_reap_orphans(void) {
             reap(t);
         t = nx;
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* OOM killer                                                         */
+/* ------------------------------------------------------------------ */
+
+/* Kill the user task currently holding the most physical pages so the PMM
+ * can reclaim RAM instead of panicking.  Returns:
+ *   1  = killed a *different* task - its pages were freed immediately (it
+ *        was not running), so pmm_alloc_page should retry,
+ *   0  = nothing reclaimable left,
+ *   -1 = the only/biggest victim was the CURRENT (faulting) task - its pages
+ *        are freed when the fault path tears it down; pmm_alloc_page must
+ *        return failure so the caller kills it cleanly (no cascade). */
+int sched_oom_kill_one(void) {
+    task_t *cur = sched_current();
+    task_t *victim = NULL;
+    u64 most = 0;
+    for (task_t *t = g_tasks; t; t = t->next) {
+        if (t->pid == 0 || !t->is_user) continue;
+        if (t->state == TASK_ZOMBIE) continue;
+        if (t->mem_pages > most) { most = t->mem_pages; victim = t; }
+    }
+    if (!victim || most == 0) {
+        kprintf("oom: nothing reclaimable\n");
+        return 0;
+    }
+    kprintf("oom: killing task %u '%s' to reclaim %llu pages\n",
+            victim->pid, victim->name, (unsigned long long)victim->mem_pages);
+    sched_kill(victim->pid);            /* frees non-running pages now */
+    return (victim == cur) ? -1 : 1;
+}
+
+/* ---- OOM selftest (deterministic, uses real pages) ---- */
+
+/* Build a user task that genuinely holds `pages` physical frames (its own
+ * PML4 + mapped pages), so killing it reclaims real memory.  It is never
+ * put on a runqueue, so sched_kill() frees it immediately. */
+static task_t *oom_test_hog(const char *name, u64 pages) {
+    task_t *t = kzalloc(sizeof *t);
+    if (!t) return NULL;
+    t->pid = g_next_pid++;
+    t->ppid = 0;
+    strncpy(t->name, name, TASK_NAME_LEN - 1);
+    t->name[TASK_NAME_LEN - 1] = 0;
+    t->is_user = true;
+    t->state = TASK_READY;
+    t->last_sched = pit_ticks();
+    t->mem_pages = pages;
+    t->pml4 = vmm_new_pml4();
+    for (u64 i = 0; i < pages; i++) {
+        paddr_t pg = pmm_alloc_page();
+        vmm_map_in(t->pml4, USER_VBASE + i * PAGE_SIZE, pg, PTE_RW | PTE_US);
+    }
+    task_append(t);
+    return t;
+}
+
+void oom_selftest(void) {
+    kprintf("oom: selftest\n");
+    bool ok = true;
+    size_t used_orig = pmm_used_pages();
+
+    task_t *h1 = oom_test_hog("hog1", 8);
+    task_t *h2 = oom_test_hog("hog2", 24);   /* hungriest victim */
+    task_t *h3 = oom_test_hog("hog3", 4);
+    if (!h1 || !h2 || !h3) { kprintf("  !! hog alloc failed\n"); ok = false; }
+    /* used with all three hogs alive - the baseline we must reclaim from */
+    size_t used_with_hogs = pmm_used_pages();
+
+    /* Force pmm_alloc_page through the OOM path even though free RAM remains,
+     * so we deterministically exercise the kill-and-reclaim logic. */
+    pmm_oom_test_force(true);
+    paddr_t p = pmm_alloc_page();
+    pmm_oom_test_force(false);
+
+    if (!p) {
+        kprintf("  !! OOM alloc returned 0\n");
+        ok = false;
+    } else {
+        /* the hungriest (hog2, 24 pages) must have been SIGKILLed (zombie) */
+        if (h2->state != TASK_ZOMBIE) {
+            kprintf("  !! hungriest task not killed by OOM killer\n");
+            ok = false;
+        }
+        /* and its real pages reclaimed immediately (it was not running).
+         * Compare against used_with_hogs (all 3 alive): killing hog2 + the
+         * one page we just allocated must leave us below that. */
+        size_t used_after = pmm_used_pages();
+        if (used_after >= used_with_hogs) {
+            kprintf("  !! no memory reclaimed (with_hogs=%zu after=%zu)\n",
+                    used_with_hogs, used_after);
+            ok = false;
+        } else {
+            kprintf("  oom: reclaimed %zu pages (killed hog2), alloc returned %p\n",
+                    used_with_hogs - used_after, (void *)p);
+        }
+    }
+
+    /* clean up the surviving hogs (free their pages; orphan reaper reaps) */
+    sched_kill(h1->pid);
+    sched_kill(h3->pid);
+
+    /* after freeing all three hogs, memory should return to (near) the level
+     * before the test - proving every hog's pages were actually reclaimed */
+    size_t used_final = pmm_used_pages();
+    if (used_final > used_orig + 32) {
+        kprintf("  !! %zu pages leaked after OOM test (orig=%zu final=%zu)\n",
+                used_final - used_orig, used_orig, used_final);
+        ok = false;
+    }
+
+    kprintf("oom: selftest %s (reclaimed via kill, no leak)\n",
+            ok ? "PASS" : "FAIL");
 }

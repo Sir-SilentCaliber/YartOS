@@ -36,6 +36,15 @@ static u32  g_data_bitmap_sectors;
 static char g_deleted[64][160];
 static int  g_deleted_count;
 
+/* The top of the disk is reserved for the swap tier (vmm_swap_disk_init), so
+ * the filesystem sizes itself to everything below that region.  Both format
+ * and mount must agree on this or the journal/swap regions would overlap. */
+static u32 blkfs_disk_total(void) {
+    u64 s = blk_disk_sectors();
+    u64 swap = vmm_swap_disk_reserve_sectors();
+    return (u32)(s > swap ? s - swap : 0);
+}
+
 static void io_read(u64 sector, u32 count, void *buf) {
     blk_read_sectors(sector, count, buf);
 }
@@ -399,7 +408,7 @@ static void format(void) {
     g_super.inode_count = BLKFS_MAX_INODES;
     g_super.inode_start_sector = 2;          /* super + inode bitmap       */
 
-    u32 total = (u32)blk_disk_sectors();
+    u32 total = blkfs_disk_total();
     u32 inode_table = BLKFS_MAX_INODES;      /* 1 inode per sector         */
     u32 after_inodes = g_super.inode_start_sector + inode_table;
     u32 data_sectors = total - after_inodes - BLKFS_JRN_SECTORS;  /* journal */
@@ -503,7 +512,7 @@ int blkfs_init(void) {
     if (!blk_disk_present()) { g_active = false; return -1; }
 
     g_inodes = kzalloc((size_t)BLKFS_MAX_INODES * sizeof(blkfs_inode_t));
-    g_data_bitmap = kzalloc((size_t)blk_disk_sectors() / 8 + 16);
+    g_data_bitmap = kzalloc((size_t)blkfs_disk_total() / 8 + 16);
 
     u8 sb[BLK_SECTOR_SIZE];
     io_read(0, 1, sb);
@@ -537,7 +546,7 @@ int blkfs_init(void) {
     g_active = true;
     kprintf("blkfs: mounted - %u files/dirs loaded from disk (%u sectors)\n",
             loaded, g_super.data_sectors);
-    jrn_start = (u32)blk_disk_sectors() - BLKFS_JRN_SECTORS;
+    jrn_start = blkfs_disk_total() - BLKFS_JRN_SECTORS;
     jrn_seq = 0;
     jrn_replay();
     if (g_jrn_replays) kprintf("blkfs: %llu journal transaction(s) replayed\n",

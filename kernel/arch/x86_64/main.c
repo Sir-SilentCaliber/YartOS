@@ -31,8 +31,17 @@
 #include <yart/blk.h>
 #include <yart/session.h>
 #include <yart/cpu.h>    /* fpu_enable() */
+#include <yart/watchdog.h>   /* service supervisor + watchdog selftest */
+#include <yart/net.h>        /* e1000 + IP stack + DHCP                 */
+#include <yart/audio.h>      /* Intel HDA audio (row 17)                */
+#include <yart/usb.h>        /* xHCI USB HID (row 18)                   */
 int smp_start_aps(void);   /* smp.c */
 void smp_ap_kwork_demo(void); /* smp.c */
+
+/* The desktop loop is a supervised kernel service: it kicks its heartbeat
+ * every iteration, so the watchdog (driven from the APIC timer) can detect
+ * and restart it if it ever stops making progress. */
+static int g_desktop_wd;
 
 LIMINE_BASE_REVISION(2);
 LIMINE_REQUESTS_START_MARKER;
@@ -124,6 +133,7 @@ void kmain(void) {
     vfs_init(initrd, initrd_size);
     blk_init();          /* find + bring up the virtio-blk disk (if any) */
     blkfs_init();        /* format on first boot, otherwise mount disk   */
+    vmm_swap_disk_init();/* arm the disk-backed swap tier (if a disk)    */
     config_load("/etc/yart.conf");   /* disk copy wins over initrd copy  */
 
     /* ACPI */
@@ -157,6 +167,20 @@ void kmain(void) {
 
     /* preemptive scheduler: the desktop loop becomes the idle task (pid 0) */
     sched_init();
+    /* OOM killer: prove that when RAM is exhausted we kill the hungriest
+     * user task and keep going instead of panicking. */
+    oom_selftest();
+
+    /* Networking: bring up the e1000 + IP stack.  This MUST run after the
+     * APIC/IOAPIC + APs + scheduler are up: touching the NIC's PCI config /
+     * MMIO (and its interrupt line) before apic_init/smp_start_aps leaves
+     * interrupt routing in a bad state that later starves an AP's scheduling
+     * (observed as a fork-child on CPU 1 never being preempted).  DHCP is
+     * driven from the main loop's net_service(). */
+    nic_init();
+    net_init();
+    audio_init();                       /* Intel HDA: codec + playback     */
+    usb_init();                         /* xHCI USB HID (row 18)           */
 
     /* A root-owned secret file used by the permission/doas boot test. */
     {
@@ -207,6 +231,11 @@ void kmain(void) {
         kprintf("yart: /bin/init not found, skipping ring-3 launch\n");
     }
 
+    /* Watchdog / service supervisor: verify it detects + restarts a stalled
+     * service, then register the desktop loop as a supervised service. */
+    watchdog_selftest();
+    g_desktop_wd = watchdog_register_service("desktop", desktop_reset);
+
     kprintf("yart: kernel up; entering desktop loop (idle task pid 0).\n");
     sti();
     smp_ap_kwork_demo();   /* queue kernel work to every AP (wake-IPI proof) */
@@ -217,6 +246,10 @@ void kmain(void) {
        the least-loaded core (see the 'smp:' lines for each child's CPU). */
     u64 last_sync = 0;
     for (;;) {
+        watchdog_kick(g_desktop_wd);      /* heartbeat: "desktop is alive" */
+        net_service();                    /* NIC RX/TX + DHCP + UDP        */
+        audio_poll();                     /* accumulate HDA playback pos   */
+        usb_hid_poll();                   /* poll the USB keyboard         */
         desktop_tick(pit_ticks() * 10);   /* PIT/APIC @100Hz -> ms */
         sched_reap_orphans();
         /* persist dirty files about once a second (disk-backed) */

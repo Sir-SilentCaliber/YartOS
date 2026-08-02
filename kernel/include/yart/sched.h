@@ -42,6 +42,8 @@ typedef struct task {
     u64            saved_rsp;      /* cpu_regs_t frame on the kstack     */
     u8             fpu_area[512] __attribute__((aligned(16)));  /* FXSAVE */
     u64            mmap_next;   /* next free VA for mmap() (per process)   */
+    u64            last_sched;  /* pit_ticks() when last switched to (watchdog
+                                   uses this to spot a READY-but-starved task) */
     u64            brk;         /* program break (top of the data segment)     */
     u64            brk_base;    /* bottom of the heap region                   */
     u64            sig_handlers[8]; /* per-signal handler VAs (0 = default)    */
@@ -66,7 +68,12 @@ typedef struct task {
 } task_t;
 
 void    sched_init(void);
+task_t *sched_tasks(void);          /* head of the global all-tasks list   */
 task_t *sched_current(void);
+/* OOM killer (called from pmm_alloc_page when RAM is exhausted): kill the
+ * user task holding the most physical pages so the OS survives. */
+int     sched_oom_kill_one(void);
+void    oom_selftest(void);
 bool    sched_current_is_user(void);
 u32     sched_current_uid(void);    /* 0 when no task (boot/root) */
 u32     sched_current_euid(void);

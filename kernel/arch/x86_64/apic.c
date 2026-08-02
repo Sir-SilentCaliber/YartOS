@@ -216,6 +216,7 @@ static void route_irq(u8 irq, u8 vector, bool masked) {
     kprintf("apic: ioapic IRQ%u -> gsi%u vec%u %s\n",
             irq, gsi, vector, masked ? "masked" : "live");
 }
+void apic_route_irq(u8 irq, u8 vector, bool masked) { route_irq(irq, vector, masked); }
 
 static bool ioapic_init(u32 phys_addr, u32 gsi_base) {
     if (!phys_addr) return false;

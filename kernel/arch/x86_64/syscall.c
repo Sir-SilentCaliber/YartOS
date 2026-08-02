@@ -20,6 +20,7 @@
 #include <yart/mm.h>
 #include <yart/sched.h>
 #include <yart/session.h>
+#include <yart/net.h>    /* net_get_addrs / net_udp_send / net_udp_recv */
 #include <yart/cpu.h>   /* stac/clac for SMAP */   /* session_auth() for doas */
 
 static char g_klog_line[256];
@@ -537,6 +538,54 @@ static i64 sys_munmap(u64 addr) {
     return -1;
 }
 
+/* net info: write {ip, mask, gw, dns} (host order) + link flag to user. */
+static i64 sys_net_info(u32 *out) {
+    if (!uptr((u64)out, 5 * sizeof(u32))) return -1;
+    u32 v[5]; net_get_addrs(&v[0], &v[2], &v[3], &v[1]);  /* ip, mask, gw, dns */
+    v[4] = nic_present() ? 1 : 0;
+    stac();
+    for (int i = 0; i < 5; i++) out[i] = v[i];
+    clac();
+    return 0;
+}
+static i64 sys_udp_send(u32 dst, u16 dport, const u8 *buf, u16 len) {
+    if (len > 1400) return -1;
+    if (!uptr((u64)buf, len)) return -1;
+    u8 k[1400]; stac(); memcpy(k, buf, len); clac();
+    return (i64)net_udp_send(dst, dport, k, len);
+}
+static i64 sys_udp_recv(u8 *buf, u16 cap) {
+    if (!uptr((u64)buf, cap)) return -1;
+    u8 k[1400]; u16 n = (u16)net_udp_recv(k, cap < 1400 ? cap : 1400);
+    if (n > 0) { stac(); memcpy(buf, k, n); clac(); }
+    return (i64)n;
+}
+
+/* dmesg: read the kernel audit log ring.  a0 = user buffer, a1 = start line,
+ * a2 = max lines.  Writes each requested line as a NUL-terminated string and
+ * returns the number of lines copied (0 if start >= total). */
+#define KLOG_LINE_MAX 256
+static i64 sys_dmesg(char *ubuf, u32 start, u32 max_lines) {
+    /* Query mode: dmesg(NULL, DMESG_TOTAL, 0) returns the total line count. */
+    if (start == 0x7FFFFFFFu && max_lines == 0)
+        return (i64)klog_lines_total();
+    if (max_lines > 128) max_lines = 128;
+    if (!uptr((u64)ubuf, (u64)max_lines * (KLOG_LINE_MAX + 1))) return -1;
+    if (max_lines == 0) return 0;
+    /* klog_read fills a kernel scratch buffer; then copy to user SMAP-safe */
+    static char scratch[128][KLOG_LINE_MAX + 1];
+    int n = klog_read(&scratch[0][0], (int)start, (int)max_lines);
+    if (n <= 0) return 0;
+    for (int i = 0; i < n; i++) {
+        int len = (int)strlen(&scratch[i][0]);
+        stac();
+        for (int j = 0; j <= len; j++) ubuf[i * (KLOG_LINE_MAX + 1) + j] =
+            scratch[i][j];                 /* incl. the NUL */
+        clac();
+    }
+    return n;
+}
+
 /* doas: elevate the effective uid to root, but ONLY if this task belongs to
  * an admin account AND the caller supplies that account's correct password.
  * Root (euid 0) never needs it.  This is the "sudo" analogue - named after
@@ -639,13 +688,62 @@ static void syscall_handler(cpu_regs_t *r) {
     case SYS_UMASK:    r->rax = (u64)sys_umask((u16)a0); break;
     case SYS_ACL:      r->rax = (u64)sys_acl((const char *)a0, (u32)a1, (u16)a2); break;
     case SYS_GETCPU:   r->rax = (u64)sys_getcpu(); break;
+    case SYS_DMESG:    r->rax = (u64)sys_dmesg((char *)a0, (u32)a1, (u32)a2); break;
+    case SYS_NET_INFO: r->rax = (u64)sys_net_info((u32 *)a0); break;
+    case SYS_UDP_SEND: r->rax = (u64)sys_udp_send((u32)a0, (u16)a1, (const u8 *)a2, (u16)r->r10); break;
+    case SYS_UDP_RECV: r->rax = (u64)sys_udp_recv((u8 *)a0, (u16)a1); break;
     default:
         kprintf("syscall: bad #%lu\n", r->rax);
         r->rax = (u64)-1;
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* fast syscall/sysret path                                           */
+/* ------------------------------------------------------------------ */
+extern void syscall_entry(void);     /* syscall_entry.asm (LSTAR)      */
+
+#define MSR_EFER    0xC0000080UL
+#define MSR_STAR    0xC0000081UL
+#define MSR_LSTAR   0xC0000082UL
+#define MSR_SFMASK  0xC0000084UL
+
+static u64 g_fast_calls;
+static bool g_fast_reported;
+
+/* Called by syscall_entry.asm after it has built the cpu_regs_t frame on
+ * the task's kernel stack.  Runs the normal dispatcher, then lets the
+ * scheduler decide whether to preempt/switch (exactly like the int 0x80
+ * path does inside isr_dispatch).  Returns the frame to sysret to. */
+u64 syscall_fast_dispatch(cpu_regs_t *r) {
+    g_fast_calls++;
+    if (!g_fast_reported) {
+        g_fast_reported = true;
+        kprintf("syscall: fast path via syscall/sysret (first call #%llu)\n",
+                (unsigned long long)g_fast_calls);
+    }
+    syscall_handler(r);
+    return sched_after_isr((u64)r);
+}
+
 void syscall_install(void) {
-    irq_register(0x80, syscall_handler);
-    kprintf("syscall: dispatcher up, %d slots\n", SYS_MAX);
+    irq_register(0x80, syscall_handler);   /* keep the int 0x80 fallback */
+
+    /* Fast path: SYSCALL/SYSRET.  STAR[47:32] = kernel CS (0x08) so SYSCALL
+     * lands in the kernel code segment and STAR[63:48] = 0x18 so SYSRET
+     * returns to CS=0x2B (slot 5, user code) / SS=0x23 (slot 4, user data).
+     * LSTAR = our entry stub.  SFMASK masks TF/IF/DF/AC on entry so the
+     * kernel runs with a clean RFLAGS until we sysret the user's R11 back. */
+    if (!(rdmsr64(MSR_EFER) & 1)) {
+        wrmsr64(MSR_EFER, rdmsr64(MSR_EFER) | 1);   /* EFER.SCE */
+    }
+    wrmsr64(MSR_STAR,   ((u64)0x18ULL << 48) | ((u64)0x08ULL << 32));
+    wrmsr64(MSR_LSTAR,  (u64)syscall_entry);
+    wrmsr64(MSR_SFMASK, (1u << 8) | (1u << 9) | (1u << 10) |
+                        (1u << 14) | (1u << 18));   /* TF IF DF NT AC */
+
+    kprintf("syscall: dispatcher up, %d slots; fast syscall/sysret armed "
+            "(STAR=0x%016lx SCE=%d)\n", SYS_MAX,
+            ((u64)0x18ULL << 48) | ((u64)0x08ULL << 32),
+            (int)((rdmsr64(MSR_EFER) >> 0) & 1));
 }

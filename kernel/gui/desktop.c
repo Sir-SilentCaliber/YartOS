@@ -43,6 +43,15 @@ static bool g_dirty = true;
 static u64  g_last_frame_ms;
 void wm_dirty(void) { g_dirty = true; }
 
+/* Called by the watchdog supervisor to recover a stalled compositor: force
+ * a full re-render on the next desktop_tick.  If the desktop loop is truly
+ * wedged this is a soft-reset signal; the supervisor ensures it is invoked
+ * from the timer context. */
+void desktop_reset(void) {
+    g_dirty = true;
+    kprintf("desktop: compositor reset by watchdog (full re-render queued)\n");
+}
+
 /* ---------- workspaces ---------- */
 static int current_ws = 0;
 #define MAX_TRACK 64

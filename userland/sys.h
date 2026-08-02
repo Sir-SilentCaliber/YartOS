@@ -48,6 +48,10 @@ enum {
     SYS_UMASK    = 32,
     SYS_ACL      = 33,
     SYS_GETCPU   = 34,
+    SYS_DMESG    = 35,
+    SYS_NET_INFO = 36,
+    SYS_UDP_SEND = 37,
+    SYS_UDP_RECV = 38,
 };
 
 #define O_RDONLY 0x0
@@ -58,9 +62,27 @@ enum {
 
 static inline long _sc(long n, long a, long b, long c) {
     long r;
-    register long r10 __asm__("r10") = 0;
+    /* Fast syscall/sysret path (kernel sets EFER.SCE + STAR + LSTAR).
+     * ABI: number in rax, args in rdi/rsi/rdx; result in rax; rcx/r11
+     * are clobbered by the CPU (return RIP / saved RFLAGS) so the compiler
+     * must treat them as dead.  `int $0x80` remains as the kernel fallback
+     * but userland takes the fast path. */
     __asm__ volatile (
-        "int $0x80"
+        "syscall"
+        : "=a"(r)
+        : "a"(n), "D"(a), "S"(b), "d"(c)
+        : "memory", "rcx", "r11"
+    );
+    return r;
+}
+/* 4-arg variant: the 4th argument goes in r10 (Linux/SysV convention), which
+ * the fast-path entry preserves (it stashes the user RSP in a per-CPU slot,
+ * not a register). */
+static inline long _sc4(long n, long a, long b, long c, long d) {
+    long r;
+    register long r10 __asm__("r10") = d;
+    __asm__ volatile (
+        "syscall"
         : "=a"(r)
         : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10)
         : "memory", "rcx", "r11"
@@ -87,6 +109,15 @@ static inline long chmod(const char *path, long mode) { return _sc(SYS_CHMOD, (l
 static inline long drop_priv(void) { return _sc(SYS_DROP, 0, 0, 0); }
 static inline long kill(long pid) { return _sc(SYS_KILL, pid, 0, 0); }
 static inline long getcpu(void) { return _sc(SYS_GETCPU, 0, 0, 0); }
+/* read the kernel audit log: dmesg(buf, start_line, max_lines) -> lines copied */
+static inline long dmesg(char *buf, long start, long max) { return _sc(SYS_DMESG, (long)buf, start, max); }
+/* dmesg(NULL, 0x7FFFFFFF, 0) returns the total number of log lines */
+#define DMESG_TOTAL 0x7FFFFFFF
+/* networking */
+static inline long net_info(unsigned int *out) { return _sc(SYS_NET_INFO, (long)out, 0, 0); }
+static inline long udp_send(unsigned int ip, unsigned short port, const char *buf, long len)
+    { return _sc4(SYS_UDP_SEND, (long)ip, port, (long)buf, len); }
+static inline long udp_recv(char *buf, long cap) { return _sc(SYS_UDP_RECV, (long)buf, cap, 0); }
 static inline long mmap(long len) { return _sc(SYS_MMAP, len, 0, 0); }
 static inline long munmap(long addr) { return _sc(SYS_MUNMAP, addr, 0, 0); }
 static inline long setuid(long uid) { return _sc(SYS_SETUID, uid, 0, 0); }

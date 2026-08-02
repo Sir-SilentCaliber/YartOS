@@ -24,6 +24,7 @@ typedef void (*irq_handler_t)(cpu_regs_t *r);
 void idt_init(void);
 void idt_reload(void);   /* re-load IDT on this CPU */
 void irq_register(u8 irq, irq_handler_t h);
+void apic_route_irq(u8 irq, u8 vector, bool masked);  /* IOAPIC INTx route */
 /* Called from asm; returns the RSP the ISR stub must resume from (a task
  * switch returns a different task's cpu_regs_t frame). */
 u64 isr_dispatch(cpu_regs_t *r);

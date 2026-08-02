@@ -103,27 +103,54 @@ static paddr_t alloc_idx(size_t i) {
     return p;
 }
 
+/* ---- OOM killer ---- */
+extern int sched_oom_kill_one(void);   /* sched.c: kill the hungriest user task
+                                          (1 = killed another task, 0 = nothing,
+                                          -1 = killed the current faulting task) */
+#define OOM_MAX_KILLS 16
+static bool g_oom_force;               /* OOM selftest debug hook           */
+
+void pmm_oom_test_force(bool on) { g_oom_force = on; }
+
+static paddr_t find_free_locked(void) {
+    for (size_t step = 0; step < 2; step++) {
+        size_t start = step == 0 ? last_idx : 0;
+        size_t end   = step == 0 ? total_pages : last_idx;
+        for (size_t i = start; i < end; i++)
+            if (!BIT_TST(i))
+                return alloc_idx(i);
+    }
+    return 0;
+}
+
 paddr_t pmm_alloc_page(void) {
     /* two attempts; between them, swap out user pages to relieve pressure.
      * The eviction runs WITHOUT the lock: it calls back into pmm_unref_page
      * (refcounts) and a spinlock is not re-entrant. */
-    for (int attempt = 0; attempt < 2; attempt++) {
+    for (int attempt = 0; attempt < 2 && !g_oom_force; attempt++) {
         spin_lock(&pmm_lock);
-        for (size_t step = 0; step < 2; step++) {
-            size_t start = step == 0 ? last_idx : 0;
-            size_t end   = step == 0 ? total_pages : last_idx;
-            for (size_t i = start; i < end; i++)
-                if (!BIT_TST(i)) {
-                    paddr_t p = alloc_idx(i);
-                    spin_unlock(&pmm_lock);
-                    return p;
-                }
-        }
+        paddr_t p = find_free_locked();
         spin_unlock(&pmm_lock);
+        if (p) return p;
         if (attempt == 0)
             vmm_evict_some(16);       /* make room by swapping user pages */
     }
-    kpanic("pmm: out of memory");
+
+    /* OOM: instead of panicking, kill user tasks (hungriest first) and retry,
+     * so one memory-hogging app cannot take down the whole OS.  Killing a
+     * task frees its physical pages via sched_kill/vmm_free_pml4. */
+    for (int attempt = 0; attempt < OOM_MAX_KILLS; attempt++) {
+        int r = sched_oom_kill_one();
+        if (r == 0) break;                    /* nothing left to reclaim */
+        if (r < 0) return 0;                  /* killed the faulting task; let
+                                                 the fault path kill it cleanly */
+        spin_lock(&pmm_lock);
+        paddr_t p = find_free_locked();
+        spin_unlock(&pmm_lock);
+        if (p) return p;                      /* reclaimed enough */
+    }
+    g_oom_force = false;
+    kpanic("pmm: out of memory (no reclaimable user task)");
 }
 
 paddr_t pmm_alloc_pages(size_t n) {

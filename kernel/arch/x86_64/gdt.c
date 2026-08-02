@@ -1,9 +1,14 @@
 /* Yart OS - per-CPU GDT + TSS (flat 64-bit, kernel + user code/data).
  *
  * Every CPU gets its OWN GDT + TSS + IST stacks:
- *   - slot 0..4 : identical null/kernel-code/kernel-data/user-code/user-data
- *   - BSP  (cpu 0): TSS at slots 5-6, selector 0x28, IST stacks [0]
- *   - AP   (cpu N): TSS at slots 7-8, selector 0x38, IST stacks [N]
+ *   - slot 0..5 : null/kernel-code/kernel-data/user-code/user-data/user-code
+ *     (slot 5 is a second user-code selector for the fast syscall/sysret
+ *      path: sysret hardcodes CS = STAR[63:48]+16 and SS = STAR[63:48]+8,
+ *      so with STAR[63:48]=0x18 it returns CS=0x2B -> this slot and
+ *      SS=0x23 -> slot 4.  The int 0x80 / iretq path keeps using USER_CS
+ *      0x1B at slot 3.)
+ *   - BSP  (cpu 0): TSS at slots 6-7, selector 0x30, IST stacks [0]
+ *   - AP   (cpu N): TSS at slots 8-9, selector 0x40, IST stacks [N]
  * A shared TSS would be a correctness bug on SMP: two APs running user
  * tasks would clobber each other's RSP0, and a shared IST stack would
  * corrupt if two CPUs faulted simultaneously.  Per-CPU everything.
@@ -60,13 +65,14 @@ typedef struct PACKED {
 
 #define KERNEL_CS 0x08
 #define KERNEL_DS 0x10
-#define USER_CS   0x1B
-#define USER_DS   0x23
-#define TSS_SEL   0x28      /* BSP TSS   */
-#define AP_TSS_SEL 0x38     /* AP TSS    */
+#define USER_CS   0x1B      /* slot 3: user code, used by iretq / int 0x80 */
+#define USER_DS   0x23      /* slot 4: user data (also sysret's SS)         */
+#define SYS_USER_CS 0x2B    /* slot 5: user code used by sysret (STAR user) */
+#define TSS_SEL   0x30      /* BSP TSS (slots 6-7)  */
+#define AP_TSS_SEL 0x40     /* AP TSS  (slots 8-9)  */
 #define MAX_CPUS  8
 
-static gdt_entry_t gdt[MAX_CPUS][9];
+static gdt_entry_t gdt[MAX_CPUS][10];
 static tss_t       tss[MAX_CPUS];
 static gdtr_t      gdtr[MAX_CPUS];
 
@@ -97,6 +103,7 @@ void tss_set_rsp0(u64 rsp0) {
     cpu_local_t *c = get_cpu_local();
     u32 idx = (c && c->cpu_id < MAX_CPUS) ? c->cpu_id : 0;
     tss[idx].rsp[0] = rsp0;
+    if (c) c->ap_krsp0 = rsp0;   /* mirror for the fast syscall/sysret path */
 }
 u64  tss_get_rsp0(void) {
     cpu_local_t *c = get_cpu_local();
@@ -109,14 +116,14 @@ u64  tss_get_rsp0(void) {
 static void gdt_selftest(void) {
     bool ok = true;
     kprintf("gdt: selftest\n");
-    for (int i = 1; i <= 4; i++) {
+    for (int i = 1; i <= 5; i++) {
         gdt_entry_t *e = &gdt[0][i];
         u8 acc = e->access;
         int dpl = (acc >> 5) & 3;
         bool present = (acc & 0x80) != 0;
         bool code    = (acc & 0x08) != 0;
         bool longmode = (e->flags_limit_hi & 0x20) != 0;
-        bool exp_code = (i == 1 || i == 3);
+        bool exp_code = (i == 1 || i == 3 || i == 5);
         int  exp_dpl  = (i >= 3) ? 3 : 0;
         kprintf("  gdt[%d] sel=0x%02x acc=0x%02x dpl=%d %s %s L=%d\n",
                 i, i * 8, acc, dpl, present ? "P" : "-",
@@ -129,11 +136,12 @@ static void gdt_selftest(void) {
     }
     if (KERNEL_CS != 1 * 8 || KERNEL_DS != 2 * 8 ||
         USER_CS   != 3 * 8 + 3 || USER_DS != 4 * 8 + 3 ||
-        TSS_SEL   != 5 * 8 || AP_TSS_SEL != 7 * 8) {
+        SYS_USER_CS != 5 * 8 + 3 ||
+        TSS_SEL   != 6 * 8 || AP_TSS_SEL != 8 * 8) {
         kprintf("  !! selector arithmetic broken\n");
         ok = false;
     }
-    tss_desc_t *td = (tss_desc_t *)&gdt[0][5];
+    tss_desc_t *td = (tss_desc_t *)&gdt[0][6];
     if (td->type != 0x89 && td->type != 0x8B) {   /* 0x8B = busy after ltr */
         kprintf("  !! TSS type=0x%02x expected 0x89/0x8b\n", td->type);
         ok = false;
@@ -193,7 +201,7 @@ void smp_ap_switch_gdt(u32 cpu_index) {
         :: "m"(gdtr[cpu_index]) : "rax", "memory");
 }
 
-/* Install an AP's private TSS (GDT slots 7-8, selector 0x38): per-CPU
+/* Install an AP's private TSS (GDT slots 8-9, selector 0x40): per-CPU
  * RSP0 + per-CPU IST1/IST2 stacks, then reload that AP's GDT + TR.
  * gdt_flush reloads GS from a flat descriptor (base 0), so capture the
  * per-CPU pointer BEFORE the flush (via MSR, not GS:0 which is dead at
@@ -205,7 +213,7 @@ void ap_install_tss(u32 cpu_index, u64 rsp0) {
     tss[cpu_index].ist[1]    = (u64)(ist2_stack[cpu_index] + sizeof ist2_stack[cpu_index]);
     tss[cpu_index].iopb_offset = sizeof tss[cpu_index];
 
-    tss_desc_t *td = (tss_desc_t *)&gdt[cpu_index][7];
+    tss_desc_t *td = (tss_desc_t *)&gdt[cpu_index][8];
     u64 base = (u64)&tss[cpu_index];
     td->length    = sizeof tss[cpu_index] - 1;
     td->base_lo   = base & 0xFFFF;
@@ -230,21 +238,21 @@ void gdt_init(void) {
      * AP can switch to its own GDT before ap_install_tss() runs */
     for (int c = 0; c < MAX_CPUS; c++) {
         set_gate(&gdt[c][0], 0x00, 0x00);   /* null */
-        set_gate(&gdt[c][1], 0x9A, 0xA0);   /* kernel code  L=1 */
-        set_gate(&gdt[c][2], 0x92, 0xA0);   /* kernel data */
-        set_gate(&gdt[c][3], 0xFA, 0xA0);   /* user code  (DPL=3, before data
-                                               so STAR's user base works) */
-        set_gate(&gdt[c][4], 0xF2, 0xA0);   /* user data  */
+        set_gate(&gdt[c][1], 0x9A, 0xA0);   /* kernel code  L=1 (SYSCALL CS) */
+        set_gate(&gdt[c][2], 0x92, 0xA0);   /* kernel data (SYSCALL SS) */
+        set_gate(&gdt[c][3], 0xFA, 0xA0);   /* user code  (0x1B, int 0x80) */
+        set_gate(&gdt[c][4], 0xF2, 0xA0);   /* user data  (0x23, SYSRET SS) */
+        set_gate(&gdt[c][5], 0xFA, 0xA0);   /* user code  (0x2B, SYSRET CS) */
     }
 
-    /* BSP TSS at slots 5-6 (selector 0x28) */
+    /* BSP TSS at slots 6-7 (selector 0x30) */
     memset(&tss[0], 0, sizeof tss[0]);
     tss[0].rsp[0] = (u64)(user_kstack + sizeof user_kstack);
     tss[0].ist[0] = (u64)(ist1_stack[0] + sizeof ist1_stack[0]);
     tss[0].ist[1] = (u64)(ist2_stack[0] + sizeof ist2_stack[0]);
     tss[0].iopb_offset = sizeof tss[0];
 
-    tss_desc_t *td = (tss_desc_t *)&gdt[0][5];
+    tss_desc_t *td = (tss_desc_t *)&gdt[0][6];
     u64 base = (u64)&tss[0];
     td->length    = sizeof tss[0] - 1;
     td->base_lo   = base & 0xFFFF;

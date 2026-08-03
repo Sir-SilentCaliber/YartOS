@@ -24,6 +24,53 @@
 #include <yart/gui.h>
 #include <yart/drivers.h>
 #include <yart/watchdog.h>
+#include <yart/sha256.h>
+
+/* ---------- doas user database (salted SHA-256) ----------
+ * The password check used to accept ANY non-empty string ("ring-3 auth
+ * lands later") while kernel/lib/sha256.c sat unused - the audit claimed
+ * salted hashing that the code did not perform.  Now every admin account
+ * stores salt + SHA-256(salt || password); the comparison is constant-time
+ * and repeated failures trigger a temporary lockout.  Single iteration
+ * (no PBKDF2/Argon2) remains the honest, documented limitation. */
+#define DOAS_MAX_USERS     8
+#define DOAS_MAX_FAILS     5
+#define DOAS_LOCKOUT_TICKS 100          /* 1 s per failed attempt window */
+typedef struct {
+    char account[32];
+    char salt[16];
+    u8   hash[32];
+    u32  fails;
+    u64  fail_t0;
+} doas_user_t;
+
+static doas_user_t g_doas_users[DOAS_MAX_USERS];
+static int         g_doas_nusers;
+
+void doas_init(void) {
+    g_doas_nusers = 0;
+    /* Default demo account.  Change the password here (it is hashed into
+     * RAM at boot; there is no persistent user DB yet). */
+    const char *account  = "demo";
+    const char *salt     = "yart-salt-1";
+    const char *password = "yart";
+    doas_user_t *u = &g_doas_users[g_doas_nusers++];
+    strncpy(u->account, account, sizeof u->account - 1);
+    strncpy(u->salt, salt, sizeof u->salt - 1);
+    sha256_ctx_t c;
+    sha256_init(&c);
+    sha256_update(&c, u->salt, strlen(u->salt));
+    sha256_update(&c, password, strlen(password));
+    sha256_final(&c, u->hash);
+    kprintf("doas: %d user(s) (demo password hashed; default is 'yart')\n",
+            g_doas_nusers);
+}
+
+static int ct_neq(const u8 *a, const u8 *b, int n) {
+    u8 d = 0;
+    for (int i = 0; i < n; i++) d |= a[i] ^ b[i];
+    return d;
+}
 
 static char g_klog_line[256];
 static bool g_sys_from_user;   /* set per syscall from the frame CS */
@@ -276,8 +323,9 @@ static i64 sys_unlink(const char *path) {
 static i64 sys_sigaction(u32 sig, u64 handler) {
     if (!g_sys_from_user) return -1;
     task_t *t = cur();
-    if (!t || sig == 0 || sig >= 8) return -1;
-    if (sig == 9) return -1;                 /* SIGKILL can't be caught  */
+    if (!t) return -1;
+    if (sig == 0 || sig >= 32) return -1;    /* POSIX range: 1..31       */
+    if (sig == 9 || sig == 19) return -1;    /* SIGKILL/SIGSTOP uncatchable */
     t->sig_handlers[sig] = handler;
     kprintf("syscall: task %d sigaction(%u, %p)\n", t->pid, sig,
             (void *)handler);
@@ -563,6 +611,93 @@ static i64 sys_udp_recv(u8 *buf, u16 cap) {
     return (i64)n;
 }
 
+/* exec: replace this task's address space with `path`, passing `argv` and
+ * `envp` (both NULL-terminated arrays of user strings).  All strings are
+ * copied into KERNEL memory first, because user_exec destroys the old
+ * address space.  On success the frame is rewritten and the syscall
+ * returns 0 from inside the NEW program. */
+#define EXEC_MAX_ARGS  32
+#define EXEC_MAX_ENV   16
+#define EXEC_ARG_MAX   128
+
+/* ring-3 compositor role tracking (defined later in this file; tentative
+ * definitions merge, so declaring them here is safe) */
+static task_t *g_wm_task;
+static void   *g_wm_uaddr;
+
+static i64 sys_exec(const char *path, char *const *argv, char *const *envp,
+                    cpu_regs_t *r) {
+    if (!g_sys_from_user) return -1;
+    task_t *t = cur();
+    if (!t) return -1;
+
+    char kpath[VFS_MAX_PATH];
+    if (!copy_user_str((u64)path, kpath, sizeof kpath)) return -1;
+    vnode_t *v = vfs_lookup_at(t->cwd, kpath);
+    if (!v || v->type != VN_FILE) return -1;
+    if (!perm_ok(v, PERM_R | PERM_X)) return -1;   /* need read+exec */
+
+    /* copy the argv pointer array + every string into kernel memory */
+    char *kargv[EXEC_MAX_ARGS];
+    char *kenvp[EXEC_MAX_ENV];
+    char (*abuf)[EXEC_ARG_MAX] = kmalloc((size_t)EXEC_MAX_ARGS * EXEC_ARG_MAX);
+    char (*ebuf)[EXEC_ARG_MAX] = kmalloc((size_t)EXEC_MAX_ENV * EXEC_ARG_MAX);
+    if (!abuf || !ebuf) {
+        if (abuf) kfree(abuf);
+        if (ebuf) kfree(ebuf);
+        return -1;
+    }
+    int argc = 0, envc = 0;
+    bool ok = true;
+
+    if (argv) {
+        /* validate the whole array region, then read the pointers SMAP-safe */
+        if (!uptr((u64)argv, (u64)(EXEC_MAX_ARGS + 1) * 8)) ok = false;
+        for (int i = 0; ok && i < EXEC_MAX_ARGS; i++) {
+            u64 p;
+            stac();
+            p = (u64)((u64 *)argv)[i];
+            clac();
+            if (p == 0) break;
+            if (!copy_user_str(p, abuf[argc], EXEC_ARG_MAX)) { ok = false; break; }
+            kargv[argc] = abuf[argc];
+            argc++;
+        }
+    }
+    if (ok && envp) {
+        if (!uptr((u64)envp, (u64)(EXEC_MAX_ENV + 1) * 8)) ok = false;
+        for (int i = 0; ok && i < EXEC_MAX_ENV; i++) {
+            u64 p;
+            stac();
+            p = (u64)((u64 *)envp)[i];
+            clac();
+            if (p == 0) break;
+            if (!copy_user_str(p, ebuf[envc], EXEC_ARG_MAX)) { ok = false; break; }
+            kenvp[envc] = ebuf[envc];
+            envc++;
+        }
+    }
+
+    if (!ok) {
+        kfree(abuf);
+        kfree(ebuf);
+        return -1;
+    }
+    if (!user_exec(v, kargv, argc, kenvp, envc, r)) {
+        kfree(abuf);
+        kfree(ebuf);
+        return -1;
+    }
+    /* the old address space is gone; free the kernel copies */
+    kfree(abuf);
+    kfree(ebuf);
+
+    /* if the compositor just exec'd itself, its fb mapping died with the
+     * old address space - force FB_INFO to rebuild it on next claim */
+    if (g_wm_task == t) g_wm_uaddr = NULL;
+    return 0;
+}
+
 /* dmesg: read the kernel audit log ring.  a0 = user buffer, a1 = start line,
  * a2 = max lines.  Writes each requested line as a NUL-terminated string and
  * returns the number of lines copied (0 if start >= total). */
@@ -589,7 +724,8 @@ static i64 sys_dmesg(char *ubuf, u32 start, u32 max_lines) {
 }
 
 /* doas: elevate the effective uid to root, but ONLY if this task belongs to
- * an admin account AND the caller supplies that account's correct password.
+ * an admin account AND the caller supplies that account's correct password
+ * (verified as SHA-256(salt || password) with a constant-time compare).
  * Root (euid 0) never needs it.  This is the "sudo" analogue - named after
  * OpenBSD's doas. */
 static i64 sys_doas(const char *password) {
@@ -599,9 +735,39 @@ static i64 sys_doas(const char *password) {
     if (!t || !g_sys_from_user) return -1;
     if (t->euid == 0) return 0;                    /* already root         */
     if (!t->elev_allowed) return -1;               /* not an admin account */
-    /* Simple password check: "yart" (ring-3 auth lands later). */
-    if (kpw[0] == 0) return -1;
-    /* Accept any non-empty password for admin accounts for now. */
+
+    doas_user_t *u = NULL;
+    for (int i = 0; i < g_doas_nusers; i++)
+        if (strcmp(g_doas_users[i].account, t->account) == 0) {
+            u = &g_doas_users[i];
+            break;
+        }
+    if (!u) {
+        kprintf("doas: no account '%s' for task %d\n", t->account, t->pid);
+        return -1;
+    }
+    if (u->fails >= DOAS_MAX_FAILS &&
+        pit_ticks() - u->fail_t0 < DOAS_LOCKOUT_TICKS) {
+        kprintf("doas: account '%s' temporarily locked (too many failures)\n",
+                u->account);
+        return -1;
+    }
+    if (u->fails >= DOAS_MAX_FAILS) u->fails = 0;   /* lockout expired */
+
+    u8 h[32];
+    sha256_ctx_t c;
+    sha256_init(&c);
+    sha256_update(&c, u->salt, strlen(u->salt));
+    sha256_update(&c, kpw, strlen(kpw));
+    sha256_final(&c, h);
+    if (ct_neq(h, u->hash, 32)) {
+        u->fails++;
+        u->fail_t0 = pit_ticks();
+        kprintf("doas: auth FAILED for '%s' (%u/%u)\n",
+                u->account, u->fails, DOAS_MAX_FAILS);
+        return -1;
+    }
+    u->fails = 0;
     t->euid = 0;
     kprintf("syscall: task %d '%s' elevated to root via doas\n",
             t->pid, t->name);
@@ -638,8 +804,12 @@ static bool g_user_seg_checked;
 static void check_user_segments(cpu_regs_t *r) {
     if (g_user_seg_checked) return;
     g_user_seg_checked = true;
+    /* The frame's CS is always the int 0x80 selector (USER_CS, pushed by
+     * the stubs); on the fast path the RETURN selector is SYS_USER_CS.
+     * Accept both user selectors, verify RPL == 3 on both. */
     if ((r->cs & 3) == 3 && (r->ss & 3) == 3 &&
-        r->cs == USER_CS && r->ss == USER_DS) {
+        (r->cs == USER_CS || r->cs == SYS_USER_CS) &&
+        r->ss == USER_DS) {
         kprintf("gdt: user segment check OK (cs=%lx ss=%lx)\n", r->cs, r->ss);
     } else {
         kprintf("gdt: !! user segment check FAILED (cs=%lx ss=%lx)\n",
@@ -707,6 +877,13 @@ static void syscall_handler(cpu_regs_t *r) {
     case SYS_POLL_KEY:  r->rax = sys_poll_key(); break;
     case SYS_POLL_MOUSE: r->rax = sys_poll_mouse((mouse_ev_t *)a0); break;
     case SYS_TIME_MS:   r->rax = sys_time_ms(); break;
+    case SYS_SLEEP:
+        if (g_sys_from_user) sched_sleep_ms((u32)a0);
+        r->rax = 0;
+        break;
+    case SYS_EXEC:      r->rax = (u64)sys_exec((const char *)a0,
+                                               (char *const *)a1,
+                                               (char *const *)a2, r); break;
     default:
         kprintf("syscall: bad #%lu\n", r->rax);
         r->rax = (u64)-1;

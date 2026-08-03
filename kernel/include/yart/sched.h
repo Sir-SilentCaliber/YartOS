@@ -86,7 +86,8 @@ u64     sched_mem_used(void);
 u64     sched_mem_limit(void);
 void    sched_charge_pages(i64 delta);   /* +reserve -release  */
 
-task_t *sched_create_user(const char *name, u64 entry, u64 user_rsp);
+task_t *sched_create_user(const char *name, u64 entry, u64 user_rsp,
+                          u64 *pml4, user_region_t *regions, int nregions);
 task_t *sched_fork(task_t *parent, cpu_regs_t *frame);   /* NULL on error */
 
 u64     sched_tick(u64 current_rsp);      /* timer IRQ: maybe preempt     */
@@ -116,3 +117,4 @@ task_t *sched_find(u32 pid);
 /* Called by the VMM: claim the boot-time reserved user regions for a task
  * (they were reserved before the task existed). */
 void    vmm_take_boot_regions(task_t *t);
+void    sched_sleep_ms(u32 ms);        /* block the current task for ms   */

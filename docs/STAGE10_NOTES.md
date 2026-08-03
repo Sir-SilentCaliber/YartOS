@@ -1,5 +1,15 @@
 # Stage 10 - implementation notes & honest scope
 
+> **STATUS BANNER (2026-08-03):** this document predates stages 11+.
+> Since it was written the kernel gained SMP (per-CPU scheduler), a
+> preemptive scheduler with CoW fork, demand paging + swap, a private
+> PML4 per task, exec(2) with argv/envp, blocking waitpid/sleep, fast
+> syscall/sysret, a real virtio-blk disk + journaled/CRC'd filesystem,
+> e1000 networking (ARP/IPv4/ICMP/UDP/DHCP) and HDA audio, and the GUI
+> moved to ring 3 entirely.  Section 9 below ("networking = vapor")
+> is specifically outdated: see `kernel/net/` + `kernel/drivers/e1000.c`.
+> See `BRUTAL_AUDIT.md` for the current state.
+
 ## What shipped
 
 1. **Pinning / unpinning** — done.

@@ -55,6 +55,7 @@ paddr_t vmm_translate(vaddr_t v);
 void   vmm_invlpg(vaddr_t v);
 /* Re-set the flags of an already-mapped page (keeps the physical frame). */
 void   vmm_set_flags(vaddr_t v, u64 flags);
+void   vmm_set_flags_in(u64 *pml4, vaddr_t v, u64 flags);
 
 /* Demand paging: a virtual region can be *reserved* without allocating any
  * physical page; the page-fault handler materializes pages on first touch.
@@ -68,6 +69,9 @@ typedef struct {
 } user_region_t;
 
 int  vmm_user_reserve(u64 va, u64 npages, u64 flags, u32 opts);
+/* Generalised reserve: track + map inside an explicit pml4 (exec path). */
+int  vmm_reserve_in(u64 *pml4, user_region_t *rs, int *count,
+                    u64 va, u64 npages, u64 flags, u32 opts);
 int  vmm_user_release(u64 va);
 void vmm_user_teardown_all(void);             /* free every user region   */
 u64  vmm_user_region_count(void);
@@ -85,11 +89,6 @@ u64 *vmm_clone_pml4(void);
 u64 *vmm_new_pml4(void);   /* fresh user space (kernel half shared) */
 void  vmm_free_pml4(u64 *pml4);
 void  vmm_switch_pml4(u64 *pml4);
-/* Give `t` its own address space: clone the current (kernel) tables, share
- * the prepared user pages copy-on-write, then release the kernel's own
- * copies.  Called when a task is created so it no longer shares the kernel
- * PML4. */
-void  vmm_give_current_regions_to(task_t *t);
 u64  *vmm_current_pml4(void);
 u64  *vmm_kernel_pml4(void);
 paddr_t vmm_translate_in(u64 *pml4, u64 va);

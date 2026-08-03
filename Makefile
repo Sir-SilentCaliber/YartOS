@@ -122,6 +122,9 @@ $(KERNEL): $(OBJS) kernel/linker.ld
 	$(LD) $(LDFLAGS) $(OBJS) -o $@
 
 # ---- Userland ----
+build/start.o: userland/start.c userland/sys.h
+	@mkdir -p build
+	$(CC) $(UCFLAGS) -c userland/start.c -o build/start.o
 build/init.o: userland/init.c userland/sys.h userland/wm.c userland/gfx.h $(KORA_H)
 	@mkdir -p build
 	$(CC) $(UCFLAGS) -c userland/init.c -o build/init.o
@@ -138,12 +141,24 @@ build/wallpaper.o: $(WP_BIN)
 	@mkdir -p build
 	cd build && $(LD) -r -b binary -o wallpaper.o wallpaper.bin
 
-$(USER_ELF): build/init.o build/wm.o build/gfx.o build/assets.o build/wallpaper.o userland/init.ld
-	$(LD) $(ULDFLAGS) build/init.o build/wm.o build/gfx.o build/assets.o build/wallpaper.o -o $@
+$(USER_ELF): build/start.o build/init.o build/wm.o build/gfx.o build/assets.o build/wallpaper.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/init.o build/wm.o build/gfx.o build/assets.o build/wallpaper.o -o $@
+
+# ---- /bin/hello: the exec() demo binary ----
+build/hello.o: userland/hello.c userland/sys.h
+	@mkdir -p build
+	$(CC) $(UCFLAGS) -c userland/hello.c -o build/hello.o
+build/hello.elf: build/start.o build/hello.o userland/init.ld
+	@mkdir -p build
+	$(LD) $(ULDFLAGS) build/start.o build/hello.o -o $@
 
 initrd_root/bin/init: $(USER_ELF)
 	@mkdir -p initrd_root/bin
 	cp $(USER_ELF) initrd_root/bin/init
+
+initrd_root/bin/hello: build/hello.elf
+	@mkdir -p initrd_root/bin
+	cp build/hello.elf initrd_root/bin/hello
 
 initrd_root/etc/motd:
 	@mkdir -p initrd_root/etc
@@ -159,7 +174,7 @@ $(LIMINE):
 	bash ./scripts/get-limine.sh
 
 # ---- Initrd ----
-build/initrd.tar: initrd_root/etc/motd initrd_root/etc/yart.conf $(BMP_WALL) initrd_root/bin/init
+build/initrd.tar: initrd_root/etc/motd initrd_root/etc/yart.conf $(BMP_WALL) initrd_root/bin/init initrd_root/bin/hello
 	@mkdir -p build
 	cd initrd_root && tar --format=ustar -cf ../build/initrd.tar .
 
@@ -196,8 +211,8 @@ run-bios: $(ISO)
 	    -cdrom $(ISO) -boot d -serial stdio
 
 clean:
-	rm -rf build $(ISO_ROOT) $(ISO) initrd_root/bin/init $(BMP_WALL) \
-	           initrd_root/etc/motd initrd_root/etc/yart.conf \
+	rm -rf build $(ISO_ROOT) $(ISO) initrd_root/bin/init initrd_root/bin/hello \
+	           $(BMP_WALL) initrd_root/etc/motd initrd_root/etc/yart.conf \
 	           initrd_root/YartOS
 distclean: clean
 	rm -rf $(LIMINE)

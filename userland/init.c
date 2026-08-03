@@ -80,7 +80,7 @@ static void fault_isolation_demo(void) {
     } else if (pid > 0) {
         int status = 0;
         long r;
-        while ((r = waitpid(pid, &status)) == 0) yield();
+        while ((r = waitpid(pid, &status)) == 0);
         if (r == pid && status != 0) {
             char num[16]; my_itoa(status, num);
             char msg[80]; int i = 0;
@@ -104,13 +104,14 @@ static void kill_demo(void) {
         volatile long spin = 0;
         for (;;) spin++;                /* never yields, never exits     */
     } else if (pid > 0) {
-        /* give the child a moment to run, then kill it */
-        for (volatile long i = 0; i < 200; i++) yield();
+        /* give the child a moment to run (blocking sleep - the kernel
+         * parks us, no busy loop), then kill it */
+        sleep(200);
         if (kill(pid) == 0) klog("sig: parent killed the busy child (SIGKILL)\n");
         else                klog("sig: kill() failed\n");
         int status = 0;
         long r;
-        while ((r = waitpid(pid, &status)) == 0) yield();
+        while ((r = waitpid(pid, &status)) == 0);
         if (r == pid) klog("sig: parent reaped the killed child\n");
     }
 }
@@ -183,8 +184,14 @@ static void smp_demo(void) {
     }
 }
 
-void _start(void) {
+/* Entry: real crt0 in start.c calls main_entry(argc, argv, envp) with the
+ * SysV process image the kernel placed on our stack. */
+int main_entry(int argc, char **argv, char **envp) {
+    (void)envp;
     klog("init: hello from ring 3\n");
+    if (argc > 0 && argv[0])
+        klog(argv[0]);
+    klog("\n");
     puts("init(1) booted in user mode.");
     boot_counter();
 
@@ -215,7 +222,7 @@ void _start(void) {
         if (fd < 0) klog("perm: root-only file DENIED to normal user (correct)\n");
         else { klog("perm: BUG - should have been denied!\n"); close(fd); }
 
-        long r = doas("demo");
+        long r = doas("yart");
         if (r == 0) klog("perm: doas OK - elevated to root\n");
         else        klog("perm: doas FAILED\n");
 
@@ -419,7 +426,7 @@ void _start(void) {
     /* ---- setuid: root can drop to another user ---- */
     klog("fs: testing setuid...\n");
     {
-        long before = doas("demo");
+        long before = doas("yart");
         if (before == 0) {
             if (setuid(2000) == 0) {
                 klog("fs: setuid(2000) OK - dropped from root\n");
@@ -486,7 +493,7 @@ void _start(void) {
     /* ---- ACL: grant a specific uid access to a root-only file ---- */
     klog("perm2: testing ACL (grant uid 3000 read on a 0600-root file)...\n");
     {
-        long r = doas("demo");                    /* back to root */
+        long r = doas("yart");                    /* back to root */
         if (r == 0) {
             if (acl("/etc/secret.txt", 3000, 4) == 0)
                 klog("perm2: ACL entry set (uid 3000 -> r)\n");
@@ -542,6 +549,32 @@ void _start(void) {
     /* ---- SMP: 6 children load-balanced onto the cores ---- */
     smp_demo();
 
+    /* ---- exec: fork, then the child replaces itself with /bin/hello ---- */
+    klog("exec: forking a child that will exec /bin/hello...\n");
+    {
+        long epid = fork();
+        if (epid == 0) {
+            char *argv[] = { "/bin/hello", "alpha", "beta", 0 };
+            char *envp[] = { "PATH=/bin", "HOME=/home/yart", 0 };
+            long r = exec("/bin/hello", argv, envp);
+            /* only reached if exec FAILED */
+            klog(r == 0 ? "exec: BUG - returned from successful exec\n"
+                        : "exec: FAILED (-1)\n");
+            exit(1);
+        } else if (epid > 0) {
+            int status = 0;
+            long r;
+            while ((r = waitpid(epid, &status)) == 0);
+            if (r == epid) {
+                klog(status == 7
+                     ? "exec: child exited with status 7 - exec+argv+envp WORK\n"
+                     : "exec: child exited but with a wrong status\n");
+            } else {
+                klog("exec: waitpid failed\n");
+            }
+        }
+    }
+
     /* ---- classic fork demo (still works) ---- */
     klog("init: forking a child process...\n");
     long pid = fork();
@@ -557,7 +590,7 @@ void _start(void) {
         klog("parent: forked a child, waiting for it...\n");
         int status = 0;
         long r;
-        while ((r = waitpid(pid, &status)) == 0) yield();
+        while ((r = waitpid(pid, &status)) == 0);
         if (r == pid)
             klog("parent: reaped the child\n");
         else
@@ -581,4 +614,5 @@ void _start(void) {
 
     klog("wm: compositor exited (shouldn't happen)\n");
     exit(0);
+    return 0;
 }

@@ -262,21 +262,69 @@ static blkfs_inode_t *inode_alloc(const char *path) {
         }
     return NULL;
 }
+/* Resolve (or, when `alloc`, create) the on-disk data sector for block `b`
+ * of inode `in`.  Blocks [0, BLKFS_MAX_DIRECT) are direct; the rest go
+ * through up to BLKFS_MAX_INDIRECT singly-indirect tables of 128 entries.
+ * Returns the data sector or 0xFFFFFFFF on failure. */
+static u32 inode_data_block(blkfs_inode_t *in, u32 b, bool alloc) {
+    if (b < BLKFS_MAX_DIRECT) {
+        u32 db = in->direct[b];
+        if (db == 0 && alloc) {
+            db = data_alloc();
+            if (db != 0xFFFFFFFFu) in->direct[b] = db;
+        }
+        return db;
+    }
+    u32 i = b - BLKFS_MAX_DIRECT;
+    u32 ti = i / BLKFS_INDIRECT_PER;
+    u32 te = i % BLKFS_INDIRECT_PER;
+    if (ti >= BLKFS_MAX_INDIRECT) return 0xFFFFFFFFu;
+    u32 tbl = in->indirect[ti];
+    if (tbl == 0) {
+        if (!alloc) return 0xFFFFFFFFu;
+        tbl = data_alloc();
+        if (tbl == 0xFFFFFFFFu) return 0xFFFFFFFFu;
+        u8 z[BLK_SECTOR_SIZE];
+        memset(z, 0, sizeof z);
+        io_write(g_super.data_start_sector + tbl, 1, z);
+        in->indirect[ti] = tbl;
+    }
+    u8 buf[BLK_SECTOR_SIZE];
+    io_read(g_super.data_start_sector + tbl, 1, buf);
+    u32 *ents = (u32 *)buf;
+    u32 db = ents[te];
+    if (db == 0 && alloc) {
+        db = data_alloc();
+        if (db != 0xFFFFFFFFu) {
+            ents[te] = db;
+            io_write(g_super.data_start_sector + tbl, 1, buf);
+        }
+    }
+    return db;
+}
+
+static void discard_block(u32 db) {
+    if (db >= g_super.data_sectors) return;
+    /* discard: zero the sector so deleted data + its CRC are wiped
+     * (privacy + matches the freed-bitmap) */
+    u8 z[BLK_SECTOR_SIZE];
+    memset(z, 0, sizeof z);
+    io_write(g_super.data_start_sector + db, 1, z);
+    crc_store(g_super.data_start_sector + db, 0);
+    data_set(db, false);
+}
+
 static void inode_free(blkfs_inode_t *in) {
     for (u32 i = 0; i < BLKFS_MAX_INODES; i++)
         if (&g_inodes[i] == in) {
             for (u32 b = 0; b < in->blocks; b++) {
-                u32 db = in->direct[b];
-                if (db < g_super.data_sectors) {
-                    /* discard: zero the sector so deleted data + its CRC
-                     * are wiped (privacy + matches the freed-bitmap) */
-                    u8 z[BLK_SECTOR_SIZE];
-                    memset(z, 0, sizeof z);
-                    io_write(g_super.data_start_sector + db, 1, z);
-                    crc_store(g_super.data_start_sector + db, 0);
-                    data_set(db, false);
-                }
+                u32 db = inode_data_block(in, b, false);
+                if (db != 0xFFFFFFFFu) discard_block(db);
             }
+            /* free the indirect tables themselves */
+            for (u32 t = 0; t < BLKFS_MAX_INDIRECT; t++)
+                if (in->indirect[t] < g_super.data_sectors)
+                    data_set(in->indirect[t], false);
             inode_set(i, false);
             memset(&g_inodes[i], 0, sizeof(blkfs_inode_t));
             inode_write(i);
@@ -294,24 +342,27 @@ static int persist_node(vnode_t *v) {
     if (!in) in = inode_alloc(path);
     if (!in) return -1;
 
+    bool truncated = false;
     u32 nblocks = (size + BLK_SECTOR_SIZE - 1) / BLK_SECTOR_SIZE;
-    if (nblocks > BLKFS_MAX_DIRECT) {
-        kprintf("blkfs: %s too big (%u B) - truncating to %u B on disk\n",
+    if (nblocks > BLKFS_MAX_BLOCKS) {
+        kprintf("blkfs: WARNING %s too big (%u B) - only %u B stored on disk\n",
                 path, size, BLKFS_MAX_FILE);
-        nblocks = BLKFS_MAX_DIRECT;
+        nblocks = BLKFS_MAX_BLOCKS;
         size = BLKFS_MAX_FILE;
+        truncated = true;                      /* caller keeps it dirty and
+                                                  re-logs on every sync -
+                                                  the overflow is NEVER
+                                                  silently dropped */
     }
     /* INCREMENTAL: keep the blocks we already own; only write the blocks
      * that are actually dirty (per-block bitmap from vfs_write).  A file
-     * that changed 1 of 4 blocks writes 1 block, not the whole file. */
+     * that changed 1 of 4 blocks writes 1 block, not the whole file.
+     * Blocks beyond the 32 direct pointers go through indirect tables
+     * (inode_data_block allocates the chain on demand). */
     for (u32 b = 0; b < nblocks; b++) {
-        u32 db = in->direct[b];
-        if (db == 0 || db >= g_super.data_sectors) {
-            db = data_alloc();
-            if (db == 0xFFFFFFFFu) { kprintf("blkfs: out of disk space\n"); return -1; }
-            in->direct[b] = db;
-        }
-        bool dirty = (v->dirty_blocks & (1u << b)) != 0;
+        u32 db = inode_data_block(in, b, true);
+        if (db == 0xFFFFFFFFu) { kprintf("blkfs: out of disk space\n"); return -1; }
+        bool dirty = (b >= v->dirty_b0 && b < v->dirty_b1);
         if (!dirty) continue;                  /* unchanged: skip the write */
         u8 buf[BLK_SECTOR_SIZE];
         memset(buf, 0, sizeof buf);
@@ -322,19 +373,37 @@ static int persist_node(vnode_t *v) {
         crc_store(g_super.data_start_sector + db, crc32_bytes(buf, BLK_SECTOR_SIZE));
     }
     /* free blocks beyond the new size (file shrank) */
-    for (u32 b = nblocks; b < in->blocks; b++)
-        if (in->direct[b] < g_super.data_sectors)
-            data_set(in->direct[b], false);
+    for (u32 b = nblocks; b < in->blocks; b++) {
+        u32 db = inode_data_block(in, b, false);
+        if (db != 0xFFFFFFFFu) discard_block(db);
+    }
+    /* zero every stale direct pointer so a later grow reallocates instead
+     * of reusing a freed (discarded) sector */
+    for (u32 b = nblocks; b < BLKFS_MAX_DIRECT; b++)
+        in->direct[b] = 0;
+    /* prune indirect tables that are now entirely unused */
+    u32 need_tables = nblocks > BLKFS_MAX_DIRECT
+                          ? (nblocks - BLKFS_MAX_DIRECT + BLKFS_INDIRECT_PER - 1)
+                                / BLKFS_INDIRECT_PER
+                          : 0;
+    for (u32 t = need_tables; t < BLKFS_MAX_INDIRECT; t++) {
+        if (in->indirect[t] < g_super.data_sectors) {
+            data_set(in->indirect[t], false);
+            in->indirect[t] = 0;
+        }
+    }
     in->type   = type;
     in->size   = size;
     in->blocks = nblocks;
     in->mtime  = 0;
     in->uid    = v->uid;
     in->mode   = v->mode;
-    for (u32 b = nblocks; b < BLKFS_MAX_DIRECT; b++) in->direct[b] = 0;
     inode_write((u32)(in - g_inodes));
-    v->dirty_blocks = 0;                       /* all changes persisted */
-    return 0;
+    if (!truncated) {
+        v->dirty_b0 = 0;                       /* all changes persisted */
+        v->dirty_b1 = 0;
+    }
+    return truncated ? -1 : 0;                 /* -1: caller keeps dirty */
 }
 
 /* ---------------- sync ---------------- */
@@ -363,10 +432,13 @@ static void sync_node(vnode_t *v) {
             /* write-ahead: journal first, apply; the log is compacted
              * once at the end of the sync (multi-record redo log) */
             jrn_write(path, t, v->data, (v->type == VN_FILE) ? (u32)v->size : 0);
-            if (persist_node(v) == 0)
+            if (persist_node(v) == 0) {
                 g_synced_files++;
+                v->dirty = false;
+            }
+            /* else: node stays dirty - retried next sync, and the
+             * journal record remains for crash recovery */
         }
-        v->dirty = false;
     }
     for (vnode_t *c = v->child; c; c = c->sibling)
         sync_node(c);
@@ -401,31 +473,92 @@ void blkfs_note_delete(const char *path) {
 }
 
 /* ---------------- format / mount ---------------- */
-static void format(void) {
-    memset(&g_super, 0, sizeof g_super);
-    g_super.magic = BLKFS_MAGIC;
-    g_super.version = 1;
-    g_super.inode_count = BLKFS_MAX_INODES;
-    g_super.inode_start_sector = 2;          /* super + inode bitmap       */
-
+/* Compute the on-disk geometry with STRICT non-overlap of every region.
+ * Order from the front: super, inode bitmap, inode table, data bitmap,
+ * data area, CRC table; the journal is pinned at the END of the FS area
+ * (the swap tier lives above it).  The old v1 layout computed
+ * crc_start_sector BEFORE subtracting the CRC sectors, which made the CRC
+ * table cover the entire journal (and spill into swap) - the CRC stores
+ * corrupted journal records and the journal's end-of-sync clear wiped the
+ * CRC table every second, silently disabling bit-rot detection.  v2 also
+ * persists journal_start_sector so mount can validate everything. */
+static bool compute_geometry(void) {
     u32 total = blkfs_disk_total();
     u32 inode_table = BLKFS_MAX_INODES;      /* 1 inode per sector         */
     u32 after_inodes = g_super.inode_start_sector + inode_table;
-    u32 data_sectors = total - after_inodes - BLKFS_JRN_SECTORS;  /* journal */
+
+    g_super.journal_start_sector = total - BLKFS_JRN_SECTORS;
+    if (g_super.journal_start_sector <= after_inodes) {
+        kprintf("blkfs: !! disk too small for inode table + journal (%u sectors)\n",
+                total);
+        return false;
+    }
+
+    u32 data_sectors = g_super.journal_start_sector - after_inodes;
     u32 bitmap_bytes = (data_sectors + 7) / 8;
     g_data_bitmap_sectors = (bitmap_bytes + BLK_SECTOR_SIZE - 1) / BLK_SECTOR_SIZE;
+    data_sectors -= g_data_bitmap_sectors;
+
+    /* reserve the CRC table space FIRST, then its start is data_end. */
+    u32 crc_sectors = (data_sectors + 127) / 128;   /* 1 u32 per sector */
+    data_sectors  -= crc_sectors;
+
     g_super.data_start_sector = after_inodes + g_data_bitmap_sectors;
-    g_super.data_sectors = data_sectors - g_data_bitmap_sectors;
-    /* checksum table: 1 u32 (4B) per data sector -> 128 CRCs per sector */
-    g_super.crc_sectors = (g_super.data_sectors + 127) / 128;
-    g_super.crc_start_sector = g_super.data_start_sector + g_super.data_sectors;
-    g_super.data_sectors -= g_super.crc_sectors;
+    g_super.data_sectors      = data_sectors;
+    g_super.crc_sectors       = crc_sectors;
+    g_super.crc_start_sector  = g_super.data_start_sector + data_sectors;
+
+    /* invariant: regions tile the area exactly, nothing overlaps */
+    if (g_super.crc_start_sector + g_super.crc_sectors !=
+        g_super.journal_start_sector) {
+        kprintf("blkfs: !! geometry error: crc_end=%u journal=%u\n",
+                g_super.crc_start_sector + g_super.crc_sectors,
+                g_super.journal_start_sector);
+        return false;
+    }
+    return true;
+}
+
+/* Validate a superblock read from disk.  Returns true when the geometry is
+ * sane and every region is inside the disk and non-overlapping. */
+static bool geometry_ok(const blkfs_super_t *s) {
+    if (s->version != BLKFS_VERSION) {
+        kprintf("blkfs: disk is format v%u, kernel wants v%u\n",
+                s->version, BLKFS_VERSION);
+        return false;
+    }
+    if (s->inode_count != BLKFS_MAX_INODES || s->inode_start_sector != 2)
+        return false;
+    u32 total = blkfs_disk_total();
+    u32 inode_end = s->inode_start_sector + s->inode_count;
+    if (inode_end > s->data_start_sector) return false;
+    if (s->data_start_sector + s->data_sectors != s->crc_start_sector)
+        return false;
+    if (s->crc_start_sector + s->crc_sectors != s->journal_start_sector)
+        return false;
+    if (s->journal_start_sector + BLKFS_JRN_SECTORS != total)
+        return false;
+    return true;
+}
+
+static void format(void) {
+    memset(&g_super, 0, sizeof g_super);
+    g_super.magic = BLKFS_MAGIC;
+    g_super.version = BLKFS_VERSION;
+    g_super.inode_count = BLKFS_MAX_INODES;
+    g_super.inode_start_sector = 2;          /* super + inode bitmap       */
+
+    if (!compute_geometry()) {
+        g_active = false;
+        kprintf("blkfs: formatting impossible - filesystem disabled\n");
+        return;
+    }
 
     memset(g_inode_used, 0, sizeof g_inode_used);
     memset(g_inodes, 0, (size_t)BLKFS_MAX_INODES * sizeof(blkfs_inode_t));
     memset(g_data_bitmap, 0, (size_t)g_super.data_sectors / 8 + 1);
 
-    jrn_start = total - BLKFS_JRN_SECTORS;
+    jrn_start = g_super.journal_start_sector;
     jrn_seq = 0;
     jrn_clear_range();
     {
@@ -439,8 +572,11 @@ static void format(void) {
     memcpy(sb, &g_super, sizeof g_super);
     io_write(0, 1, sb);
     flush_bitmaps();
-    kprintf("blkfs: formatted %u sectors (%u data sectors, %u crc sectors, %u inodes, journal %u slots @%u)\n",
-            total, g_super.data_sectors, g_super.crc_sectors, g_super.inode_count, JRN_RECORDS, jrn_start);
+    kprintf("blkfs: formatted %u sectors (data %u @%u, crc %u @%u, "
+            "journal 128 @%u, inodes %u)\n",
+            (u32)blkfs_disk_total(), g_super.data_sectors, g_super.data_start_sector,
+            g_super.crc_sectors, g_super.crc_start_sector,
+            g_super.journal_start_sector, g_super.inode_count);
 }
 
 static void load_inode_into_tree(blkfs_inode_t *in) {
@@ -490,11 +626,17 @@ static void load_inode_into_tree(blkfs_inode_t *in) {
         v->cap  = in->size;
         u32 off = 0;
         for (u32 b = 0; b < in->blocks && off < in->size; b++) {
+            u32 db = inode_data_block(in, b, false);
+            if (db == 0xFFFFFFFFu) {
+                kprintf("blkfs: !! %s block %u unreachable (corrupt inode)\n",
+                        in->path, b);
+                break;
+            }
             u8 buf[BLK_SECTOR_SIZE];
-            io_read(g_super.data_start_sector + in->direct[b], 1, buf);
+            io_read(g_super.data_start_sector + db, 1, buf);
             /* verify the block checksum (bit-rot detection) */
             {
-                u32 expect = crc_of(g_super.data_start_sector + in->direct[b]);
+                u32 expect = crc_of(g_super.data_start_sector + db);
                 u32 actual = crc32_bytes(buf, BLK_SECTOR_SIZE);
                 if (expect && expect != actual)
                     kprintf("blkfs: !! CRC MISMATCH on %s block %u (bit-rot?)\n",
@@ -521,8 +663,14 @@ int blkfs_init(void) {
     if (g_super.magic != BLKFS_MAGIC) {
         kprintf("blkfs: no filesystem on disk - formatting\n");
         format();
-        g_active = true;
-        return 0;
+        return g_active ? 0 : -1;    /* format() can fail on tiny disks */
+    }
+
+    if (!geometry_ok(&g_super)) {
+        kprintf("blkfs: on-disk geometry invalid or old format - "
+                "reformatting (old data discarded)\n");
+        format();
+        return g_active ? 0 : -1;
     }
 
     /* load bitmaps + inode table */
@@ -546,7 +694,7 @@ int blkfs_init(void) {
     g_active = true;
     kprintf("blkfs: mounted - %u files/dirs loaded from disk (%u sectors)\n",
             loaded, g_super.data_sectors);
-    jrn_start = blkfs_disk_total() - BLKFS_JRN_SECTORS;
+    jrn_start = g_super.journal_start_sector;
     jrn_seq = 0;
     jrn_replay();
     if (g_jrn_replays) kprintf("blkfs: %llu journal transaction(s) replayed\n",

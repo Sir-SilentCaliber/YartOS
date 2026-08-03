@@ -129,7 +129,8 @@ vnode_t *vfs_create(vnode_t *parent, const char *name, vnode_type_t t) {
     if (find_child(parent, name)) return NULL;
     vnode_t *n = mknode(name, t);
     n->dirty = true;                       /* needs persisting to disk     */
-    n->dirty_blocks = 0xFFFFFFFFu;
+    n->dirty_b0 = 0;
+    n->dirty_b1 = 0xFFFFFFFFu;             /* new file: every block dirty  */
     attach(parent, n);
     return n;
 }
@@ -266,11 +267,14 @@ int vfs_write(vnode_t *v, const void *buf, size_t off, size_t n) {
     if (off + n > v->size) v->size = off + n;
     v->mtime = now_epoch();
     v->dirty = true;
-    /* mark the affected 512-byte blocks dirty (incremental disk sync) */
+    /* mark the affected 512-byte blocks dirty (incremental disk sync).
+     * A RANGE, not a 32-bit bitmap: files can be much larger than 16 KiB
+     * now (indirect blocks), so a bitmap would silently miss block 33+. */
     {
         u32 b0 = (u32)(off / BLK_SECTOR_SIZE);
         u32 b1 = (u32)((off + n + BLK_SECTOR_SIZE - 1) / BLK_SECTOR_SIZE);
-        for (u32 b = b0; b < b1 && b < 32; b++) v->dirty_blocks |= (1u << b);
+        if (b0 < v->dirty_b0) v->dirty_b0 = b0;
+        if (b1 > v->dirty_b1) v->dirty_b1 = b1;
     }
     return (int)n;
 }
@@ -284,7 +288,8 @@ int vfs_truncate(vnode_t *v, size_t n) {
     v->size = n;
     v->mtime = now_epoch();
     v->dirty = true;
-    v->dirty_blocks = 0xFFFFFFFFu;   /* truncate: rewrite every block */
+    v->dirty_b0 = 0;
+    v->dirty_b1 = 0xFFFFFFFFu;   /* truncate: rewrite every block */
     return 0;
 }
 

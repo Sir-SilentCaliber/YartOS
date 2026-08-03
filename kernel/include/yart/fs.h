@@ -33,7 +33,8 @@ typedef struct vnode {
     vfs_acl_entry_t acl[VFS_ACL_MAX]; /* explicit per-user grants          */
     u8           acl_count;
     bool         dirty;       /* needs persisting to disk by blkfs_sync()  */
-    u32          dirty_blocks; /* per-512B-block dirty bitmap (bit i = block i)  */
+    u32          dirty_b0;    /* first dirty 512B block (half-open range,  */
+    u32          dirty_b1;    /* supports files > 32 blocks via indirect) */
     struct vnode *parent;
     struct vnode *child;       /* first child if dir                       */
     struct vnode *sibling;     /* next sibling                             */

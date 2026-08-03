@@ -27,6 +27,7 @@
 #include <yart/string.h>
 #include <yart/cpu.h>
 #include <yart/console.h>
+#include <yart/user.h>     /* USER_CS/USER_DS/SYS_USER_CS shared defines */
 
 typedef struct PACKED {
     u16 limit_lo;
@@ -65,9 +66,8 @@ typedef struct PACKED {
 
 #define KERNEL_CS 0x08
 #define KERNEL_DS 0x10
-#define USER_CS   0x1B      /* slot 3: user code, used by iretq / int 0x80 */
-#define USER_DS   0x23      /* slot 4: user data (also sysret's SS)         */
-#define SYS_USER_CS 0x2B    /* slot 5: user code used by sysret (STAR user) */
+/* USER_CS/USER_DS/SYS_USER_CS come from yart/user.h (shared with the
+ * syscall layer and syscall_entry.asm) */
 #define TSS_SEL   0x30      /* BSP TSS (slots 6-7)  */
 #define AP_TSS_SEL 0x40     /* AP TSS  (slots 8-9)  */
 #define MAX_CPUS  8

@@ -1,5 +1,15 @@
 # Yart OS - Architecture Notes
 
+> **STATUS BANNER (2026-08-03):** this document was written during the
+> early stages and is PARTIALLY OUT OF DATE.  The current kernel is SMP
+> (per-CPU scheduler, 4-8 cores), preemptive, has a private PML4 per
+> process, CoW fork, demand paging + swap, exec() with argv/envp, real
+> syscall/sysret, a ring-3 compositor (`/bin/init` owns the screen), a
+> virtio-blk disk with a journaled/CRC'd filesystem (v2 layout), e1000
+> networking (ARP/IPv4/ICMP/UDP/DHCP) and HDA audio.  The GUI/compositor
+> sections below describe the OLD in-kernel desktop, which was deleted in
+> stage 9.  For the current problem list see `BRUTAL_AUDIT.md`.
+
 This document is the "why" behind every file under `kernel/`.  It is written
 for someone who knows C and has read about Linux's overall layout once
 (the `arch/`, `mm/`, `fs/`, `drivers/` split is the same on purpose) but
@@ -48,7 +58,7 @@ Compared to Linux:
 | `init/main.c`       | `kernel/arch/x86_64/main.c` | `kmain` |
 | `drivers/video/fbdev/` + `drivers/gpu/drm/` | `kernel/gui/` | fb.c, font_data.c, cursor.c, desktop.c, apps.c |
 
-Yart is *much* simpler (single-threaded, no preemption yet, no SMP), but
+Yart is much smaller and simpler than Linux, but
 the **module layout is intentionally familiar**.
 
 ## 1.  Boot chain
@@ -171,7 +181,7 @@ Window focus/drag/close logic lives in `desktop_handle_mouse` in
 `desktop.c`.  Keyboard is routed only to the focused window if it is the
 terminal (a deliberate KISS decision until there's a real input system).
 
-## 5.  Why YartFS = USTAR
+## 5.  Why YartFS = USTAR (the INITRD is a USTAR ramdisk)
 
 USTAR (the format used by classic `tar`) is:
 
@@ -182,19 +192,18 @@ USTAR (the format used by classic `tar`) is:
 * Round-trip compatible with any host's `tar` so you can mount the
   initrd on Linux for inspection.
 
-Once a real disk driver lands, YartFS-on-disk will use the same vnode
-shape but a block-backed cache.  The `vfs_*` API does not change.
+Note: the persistent on-disk filesystem (blkfs, on virtio-blk) is a
+different thing - see `kernel/fs/blkfs.c` (v2 layout: super, inode bitmap,
+inode table, data bitmap, data area, per-sector CRC32 table, write-ahead
+journal - all non-overlapping regions, validated at mount).
 
-## 6.  Future work (mapped to source)
+## 6.  Status of the old "future work" table
 
-| Feature | Where it goes | Note |
-|---------|---------------|------|
-| SMP                  | `kernel/arch/x86_64/apic.c` + new smp.c | LAPIC stub already exists |
-| Scheduler            | new `kernel/sched/` | one-task event loop today |
-| Ring-3 process       | extend `arch/x86_64/main.c` after `elf_load` | TSS/IST already set |
-| Disk driver (AHCI)   | `kernel/drivers/ahci.c` | PCI enum needed first |
-| Real on-disk YartFS  | `kernel/fs/yartfs.c` | block-backed inode cache |
-| Network              | `kernel/drivers/e1000.c` + `kernel/net/` | huge undertaking |
-| GPU acceleration     | `kernel/drivers/virtio_gpu.c` | desktop already uses backbuffer |
+Done since this table was written: SMP (per-CPU scheduler + work stealing),
+preemptive scheduling, ring-3 processes (exec + argv/envp), the on-disk
+filesystem (blkfs + journal + CRCs + swap tier), networking
+(e1000 + ARP/IPv4/ICMP/UDP/DHCP).
 
-The point is that none of these require restructuring; they slot in.
+Still open: AHCI/SATA/NVMe drivers, TCP + DNS, virtio-gpu acceleration,
+and the ring-3 app model (per-window surfaces, IPC, real apps) - see
+`BRUTAL_AUDIT.md` rows 24-47.

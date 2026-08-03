@@ -50,8 +50,14 @@ enum {
     SYS_POLL_KEY = 41,    /* dequeue one keyboard event (0 = none)                 */
     SYS_POLL_MOUSE = 42,  /* dequeue one mouse event (dx,dy,buttons,wheel)         */
     SYS_TIME_MS  = 43,    /* monotonic millisecond uptime (for compositor fps)     */
+    SYS_SLEEP    = 44,    /* block the calling task for ms (timer wakeup)          */
+    SYS_EXEC     = 45,    /* replace the address space: exec(path, argv, envp)     */
     SYS_MAX
 };
+
+void syscall_install(void);
+void syscall_install_percpu(void);
+void doas_init(void);          /* seed the salted-SHA-256 user database */
 
 /* open() flags */
 #define O_RDONLY  0x0

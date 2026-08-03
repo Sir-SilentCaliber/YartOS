@@ -49,6 +49,59 @@ static u32     g_next_pid;
 static bool    g_idle_handoff;   /* idle task is sleeping and may be preempted */
 static spinlock_t g_tasks_lock;  /* protects g_tasks append/remove/find/reap */
 
+/* ---------------- sleep queue (blocking sched_sleep_ms) ----------------
+ * A sleeping task is registered here (slot + wake tick) and parked as
+ * TASK_BLOCKED.  The BSP's timer tick wakes due sleepers once a second
+ * boundary is crossed.  The waker pushes the task onto a runqueue BEFORE
+ * flipping state to READY (release store); the sleeper's own switch path
+ * reads rq_cpu with acquire, so it can never also queue itself. */
+static void rq_push(cpu_local_t *c, task_t *t);   /* defined below       */
+#define SLEEP_MAX 64
+static spinlock_t g_sleep_lock;
+static task_t    *g_sleepers[SLEEP_MAX];
+static u64        g_sleeper_wake[SLEEP_MAX];
+
+void sched_sleep_ms(u32 ms) {
+    task_t *cur = sched_current();
+    if (!cur) return;
+    u64 wake = pit_ticks() + ((u64)ms + 9) / 10;   /* 100 Hz system tick */
+    u64 fl = irq_save();
+    spin_lock(&g_sleep_lock);
+    int slot = -1;
+    for (int i = 0; i < SLEEP_MAX; i++)
+        if (!g_sleepers[i]) { slot = i; break; }
+    if (slot >= 0) {
+        g_sleepers[slot] = cur;
+        g_sleeper_wake[slot] = wake;
+        cur->state = TASK_BLOCKED;      /* sched_after_isr switches away */
+    }
+    spin_unlock(&g_sleep_lock);
+    irq_restore(fl);
+    if (slot < 0)
+        kprintf("sched: sleep queue full - task %u slept 0 ms\n", cur->pid);
+}
+
+/* Wake every sleeper whose deadline has passed.  Called from the BSP's
+ * timer tick (sched_tick). */
+static void sched_wake_sleepers(u64 now) {
+    u64 fl = irq_save();
+    spin_lock(&g_sleep_lock);
+    for (int i = 0; i < SLEEP_MAX; i++) {
+        task_t *t = g_sleepers[i];
+        if (!t) continue;
+        if (g_sleeper_wake[i] > now) continue;
+        g_sleepers[i] = NULL;
+        if (t->state != TASK_BLOCKED) continue;  /* killed while asleep */
+        cpu_local_t *target = smp_least_loaded();
+        if (!target) target = get_cpu_local();
+        rq_push(target, t);                    /* queue FIRST...         */
+        __atomic_store_n(&t->state, TASK_READY, __ATOMIC_RELEASE);
+        lapic_send_ipi(target->ap_lapic_id, AP_WAKE_VEC);
+    }
+    spin_unlock(&g_sleep_lock);
+    irq_restore(fl);
+}
+
 /* ------------------------------------------------------------------ */
 /* per-CPU current task                                               */
 /* ------------------------------------------------------------------ */
@@ -308,7 +361,8 @@ void sched_init(void) {
 /* creating tasks                                                     */
 /* ------------------------------------------------------------------ */
 
-task_t *sched_create_user(const char *name, u64 entry, u64 user_rsp) {
+task_t *sched_create_user(const char *name, u64 entry, u64 user_rsp,
+                          u64 *pml4, user_region_t *regions, int nregions) {
     task_t *t = kzalloc(sizeof *t);
     if (!t) return NULL;
     t->pid = g_next_pid++;
@@ -343,9 +397,15 @@ task_t *sched_create_user(const char *name, u64 entry, u64 user_rsp) {
     f->rip = entry;
     t->saved_rsp = (u64)f;
 
-    /* Per-process address space: clone the (kernel) page tables, CoW-share
-     * the prepared user pages, and hand the task its own PML4 + regions. */
-    vmm_give_current_regions_to(t);
+    /* Per-process address space: adopt the PREPARED private PML4 + regions
+     * (user_prepare_elf built them in a fresh table - no clone needed). */
+    t->pml4 = pml4;
+    if (regions && nregions > 0) {
+        memcpy(t->regions, regions, (size_t)nregions * sizeof regions[0]);
+        t->region_count = nregions;
+        for (int i = 0; i < nregions; i++)
+            t->mem_pages += regions[i].npages;
+    }
     task_append(t);
     rq_push(get_cpu_local(), t);       /* run on the creating CPU (BSP)  */
     kprintf("sched: created user task [%u] '%s' entry=%p ustack=%p%s\n",
@@ -520,15 +580,24 @@ static u64 sched_preempt(task_t *cur, u64 current_rsp) {
 /* cur is not runnable (blocked/zombie) or yielded: switch to whoever is
  * next, or to the CPU's idle fallback.  A yielded task is pushed to the
  * queue; if nothing else was waiting it is parked in ap_next instead of
- * being left queued (no duplicates). */
+ * being left queued (no duplicates).
+ *
+ * A woken task (sleep/waitpid wake) is ALREADY on some CPU's runqueue: the
+ * waker queues it before flipping state to READY (release store), so the
+ * acquire read of rq_cpu below can never see NULL once we observe READY -
+ * without this guard a task woken while it was about to sleep would be
+ * pushed onto a queue a second time and run on two CPUs. */
 static u64 sched_switch_after(task_t *cur, u64 current_rsp) {
     cpu_local_t *c = get_cpu_local();
     if (cur && cur->state == TASK_READY) {          /* yielded */
-        task_t *next = rq_push_pop(c, cur);
-        if (next && next != cur) return switch_to(next, current_rsp);
-        if (next == cur) rq_remove(c, cur);  /* it is still queued: take it
-                                                back off before parking */
-        if (!c->ap_next) c->ap_next = cur;
+        if (__atomic_load_n(&cur->rq_cpu, __ATOMIC_ACQUIRE) == NULL) {
+            task_t *next = rq_push_pop(c, cur);
+            if (next && next != cur) return switch_to(next, current_rsp);
+            if (next == cur) rq_remove(c, cur);  /* still queued: take it
+                                                    back off before parking */
+            if (!c->ap_next) c->ap_next = cur;
+        }
+        /* else: already queued by a waker - just hand the CPU away */
     }
     if (c->cpu_id == 0) {
         if (g_idle_task && g_idle_task != cur) return switch_to(g_idle_task, current_rsp);
@@ -655,8 +724,11 @@ u64 sched_tick(u64 current_rsp) {
     /* BSP-only, ~1 Hz: run the watchdog/supervisor (restart stalled kernel
      * services + kill hung user tasks).  Only one CPU drives it to avoid
      * concurrent scans, and only once a second to keep it cheap. */
-    if (c->cpu_id == 0 && (++g_wd_tick_cnt % 100) == 0)
-        watchdog_tick();
+    if (c->cpu_id == 0) {
+        sched_wake_sleepers(pit_ticks());        /* wake due sleepers */
+        if ((++g_wd_tick_cnt % 100) == 0)
+            watchdog_tick();
+    }
     if (!cur) {
         /* this CPU is idle (an AP in its loop): run a parked/queued task
          * if any.  Remember the idle frame so we can iretq back when it
@@ -733,18 +805,39 @@ void sched_yield(void) {
     lapic_send_ipi(my_id, 62);   /* vector 62 = AP_WAKE_VEC (reschedule) */
 }
 
+/* Wake a parent that is blocked in waitpid() for this child.  Must be
+ * called with g_tasks_lock held: the parent sets waiting+BLOCKED inside
+ * the same lock, so if we see waiting=true here the parent is guaranteed
+ * to be asleep (not running) and safe to requeue. */
+static void wake_waiting_parent(task_t *child) {
+    if (child->ppid == 0) return;
+    task_t *p = sched_find(child->ppid);
+    if (p && p->waiting && p->state == TASK_BLOCKED) {
+        p->waiting = false;
+        cpu_local_t *target = smp_least_loaded();
+        if (!target) target = get_cpu_local();
+        rq_push(target, p);                    /* queue FIRST...          */
+        __atomic_store_n(&p->state, TASK_READY, __ATOMIC_RELEASE);
+        lapic_send_ipi(target->ap_lapic_id, AP_WAKE_VEC);
+    }
+}
+
 void sched_exit(int status) {
     task_t *cur = sched_current();
     if (!cur || !cur->is_user) return;
+    u64 fl = irq_save();
+    /* zombie flag + parent wake are atomic w.r.t. the parent's waitpid
+     * block decision (both hold g_tasks_lock).  The memory teardown runs
+     * AFTER releasing the lock: it takes the PMM lock, and the OOM path
+     * holds the PMM lock while calling sched_kill (tasks lock) - nesting
+     * tasks->pmm would deadlock against that order. */
     cur->exit_status = status;
     cur->state = TASK_ZOMBIE;
+    spin_lock(&g_tasks_lock);
+    wake_waiting_parent(cur);          /* blocked parent: wake + requeue */
+    spin_unlock(&g_tasks_lock);
     vmm_user_teardown_all();           /* free this task's user memory */
-    task_t *p = sched_find(cur->ppid);
-    if (p && p->waiting) {             /* blocked parent: wake + requeue */
-        p->waiting = false;
-        p->state = TASK_READY;
-        rq_push(get_cpu_local(), p);
-    }
+    irq_restore(fl);
     kprintf("sched: task [%u] '%s' exited status %d\n",
             cur->pid, cur->name, status);
 }
@@ -785,8 +878,9 @@ static void reap(task_t *t) {
 int sched_signal(u32 pid, u32 sig) {
     task_t *t = sched_find(pid);
     if (!t || t->pid == 0 || t->state == TASK_ZOMBIE) return -1;
-    if (sig == SIG_KILL) return sched_kill(pid);
     if (sig == 0) return 0;                 /* existence probe */
+    if (sig >= 32) return -1;               /* POSIX signal range      */
+    if (sig == SIG_KILL) return sched_kill(pid);
     if (t->sig_blocked & (1ULL << sig)) return 0;
     t->sig_pending |= (1ULL << sig);
     kprintf("sched: signal %u pending for pid %u\n", sig, t->pid);
@@ -806,6 +900,15 @@ int sched_kill(u32 pid) {
     }
     t->exit_status = -9;                          /* -SIGKILL               */
     t->state = TASK_ZOMBIE;
+    /* wake a parent blocked in waitpid() for this child (same lock
+     * discipline as sched_exit) */
+    {
+        u64 fl = irq_save();
+        spin_lock(&g_tasks_lock);
+        wake_waiting_parent(t);
+        spin_unlock(&g_tasks_lock);
+        irq_restore(fl);
+    }
     /* free its address space NOW if it is not running on some CPU (a
      * running task's CR3 still points at its PML4 - can't free that) */
     bool running = false;
@@ -832,14 +935,42 @@ int sched_kill(u32 pid) {
     return 0;
 }
 
+/* Blocking waitpid: if the child is still alive this task is parked
+ * (TASK_BLOCKED + waiting) and woken by sched_exit/sched_kill when the
+ * child dies - no more spin+yield polling.  Returns:
+ *   pid   = reaped this child (status filled)
+ *   0     = child alive; the caller (syscall) will resume us on wake
+ *   -1    = ECHILD
+ * The zombie-flag read and the waiting flag are set under g_tasks_lock,
+ * the same lock sched_exit/sched_kill use to wake us, so there is no
+ * lost-wakeup race. */
 int sched_waitpid(u32 pid, int *status_out) {
     task_t *cur = sched_current();
     if (!cur) return -1;
+
     task_t *c = NULL;
+    u64 fl = irq_save();
+    spin_lock(&g_tasks_lock);
     for (task_t *t = g_tasks; t; t = t->next)
         if (t->ppid == cur->pid && (pid == 0 || t->pid == pid)) { c = t; break; }
-    if (!c) return -1;                    /* ECHILD */
-    if (c->state != TASK_ZOMBIE) return 0; /* still running */
+    if (!c) {
+        spin_unlock(&g_tasks_lock);
+        irq_restore(fl);
+        return -1;                        /* ECHILD */
+    }
+    if (c->state != TASK_ZOMBIE) {
+        /* child alive: register as waiting and block */
+        cur->waiting = true;
+        cur->wait_pid = pid;
+        cur->state = TASK_BLOCKED;        /* sched_after_isr switches away */
+        spin_unlock(&g_tasks_lock);
+        irq_restore(fl);
+        return 0;
+    }
+    cur->waiting = false;
+    spin_unlock(&g_tasks_lock);
+    irq_restore(fl);
+
     if (task_running_anywhere(c)) return 0;/* zombie still switching away:
                                               don't free its stack/tables yet */
     if (status_out) *status_out = c->exit_status;

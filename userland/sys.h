@@ -68,6 +68,8 @@ enum {
     SYS_POLL_KEY = 41,
     SYS_POLL_MOUSE = 42,
     SYS_TIME_MS  = 43,
+    SYS_SLEEP    = 44,
+    SYS_EXEC     = 45,
 };
 
 #define O_RDONLY 0x0
@@ -76,10 +78,16 @@ enum {
 #define O_CREAT  0x40
 #define O_TRUNC  0x200
 
+/* Fast path: the `syscall` instruction (EFER.SCE + STAR/LSTAR/SFMASK,
+ * GDT slot-5 user code 0x2B).  The kernel keeps int 0x80 as a fallback,
+ * but userland uses the native instruction - this is the path the kernel's
+ * syscall_entry.asm was built for.  SysV-ish register ABI: rdi/rsi/rdx/r10
+ * carry args, rax the number, result back in rax; rcx/r11 are clobbered
+ * by the hardware. */
 static inline long _sc(long n, long a, long b, long c) {
     long r;
     __asm__ volatile (
-        "int $0x80"
+        "syscall"
         : "=a"(r)
         : "a"(n), "D"(a), "S"(b), "d"(c)
         : "memory", "rcx", "r11"
@@ -90,7 +98,7 @@ static inline long _sc4(long n, long a, long b, long c, long d) {
     long r;
     register long r10 __asm__("r10") = d;
     __asm__ volatile (
-        "int $0x80"
+        "syscall"
         : "=a"(r)
         : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10)
         : "memory", "rcx", "r11"
@@ -157,5 +165,12 @@ static inline int  poll_mouse(mouse_ev_t *m) { return (int)_sc(SYS_POLL_MOUSE, (
 static inline long time_ms(void)    { return _sc(SYS_TIME_MS, 0, 0, 0); }
 /* SYS_TIME returns packed YYYYMMDDhhmmss as one i64 (RTC) */
 static inline long wall_time(void)  { return _sc(SYS_TIME, 0, 0, 0); }
+/* SYS_SLEEP: block the calling task (no busy loop) for ms milliseconds */
+static inline long sleep(long ms)   { return _sc(SYS_SLEEP, ms, 0, 0); }
+/* SYS_EXEC: replace this process with `path`; argv/envp are NULL-terminated
+ * arrays of strings.  Returns 0 inside the NEW program on success. */
+static inline long exec(const char *path, char *const argv[], char *const envp[]) {
+    return _sc(SYS_EXEC, (long)path, (long)argv, (long)envp);
+}
 
 #endif

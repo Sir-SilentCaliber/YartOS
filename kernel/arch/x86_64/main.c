@@ -13,7 +13,6 @@
 #include <yart/drivers.h>
 #include <yart/acpi.h>
 #include <yart/syscall.h>
-#include <yart/config.h>
 #include <yart/pci.h>
 #include <yart/user.h>
 #include <yart/sched.h>
@@ -115,13 +114,13 @@ void kmain(void) {
     blk_init();
     blkfs_init();
     vmm_swap_disk_init();
-    config_load("/etc/yart.conf");
 
     if (rsdp_request.response) acpi_init(rsdp_request.response->address);
     else kprintf("acpi: no RSDP from bootloader\n");
 
     pci_init();
     syscall_install();
+    doas_init();
 
     vnode_t *motd = vfs_lookup("/etc/motd");
     if (motd) {
@@ -166,9 +165,12 @@ void kmain(void) {
     vnode_t *initbin = vfs_lookup("/bin/init");
     if (initbin) {
         u64 entry = 0, rsp = 0;
+        u64 *pml4 = NULL;
+        user_region_t regions[MAX_USER_REGIONS];
+        int nregions = 0;
         kprintf("yart: loading ring-3 compositor (/bin/init)...\n");
-        if (user_prepare_elf(initbin, &entry, &rsp)) {
-            task_t *it = sched_create_user("wm", entry, rsp);
+        if (user_prepare_elf(initbin, &entry, &rsp, &pml4, regions, &nregions)) {
+            task_t *it = sched_create_user("wm", entry, rsp, pml4, regions, nregions);
             if (it) {
                 it->uid = it->euid = it->gid = 1000;
                 it->elev_allowed = true;

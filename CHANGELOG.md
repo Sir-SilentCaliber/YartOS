@@ -1,5 +1,81 @@
 # Changelog
 
+## 0.6.0-auditfix  (2026-08-03 - brutal-audit fix pass)
+
+This release fixes the concrete defects found by the external audit of the
+committed tree.  Every item below was a real, verified defect in the code,
+not a doc change.
+
+### Critical fixes
+- **blkfs on-disk layout bug (data-loss class).**  `format()` computed
+  `crc_start_sector` BEFORE subtracting the CRC sectors from the data
+  area, so the per-block CRC32 table overlapped the ENTIRE write-ahead
+  journal (and spilled into the swap tier on the default 32 MiB disk).
+  Consequences: `crc_store()`'s read-modify-writes corrupted journal
+  records, and `jrn_clear_range()` (run after every sync) zeroed the CRC
+  table every ~1 s, silently disabling bit-rot detection.  The layout is
+  now computed with strict non-overlap (verified to tile exactly on
+  16/32/64/128 MiB disks), the journal start is persisted in the
+  superblock, and mount validates the whole geometry (reformats with a
+  loud warning if the on-disk format is old or invalid).  Format version
+  bumped to 2.
+- **Silent 16 KiB file truncation on disk is gone.**  Files were capped at
+  32 direct blocks (16 KiB) and silently truncated on sync with no error
+  to the caller.  Inodes now have 32 indirect tables (128 entries each),
+  so files up to ~2 MiB persist correctly; the dirty-tracking bitmap
+  became a dirty RANGE (`dirty_b0..b1`) because a 32-bit bitmap silently
+  missed block 33+ under the new layout.  Files still too large now stay
+  dirty and re-log the warning on every sync instead of silently losing
+  data.  Also fixed: stale direct-block pointers were not cleared on
+  shrink, so a shrink-then-grow could have reused a freed sector.
+- **doas accepted ANY non-empty password.**  `sys_doas` checked
+  `kpw[0] != 0` while `kernel/lib/sha256.c` sat completely unused.  Now
+  every admin account stores salt + SHA-256(salt || password), the
+  comparison is constant-time, failures are counted with a temporary
+  lockout, and the default `demo` password (`yart`) is hashed at boot.
+- **The fast syscall/sysret path is now actually used.**  The kernel's
+  LSTAR entry (EFER.SCE + STAR/LSTAR/SFMASK, slot-5 user CS 0x2B) was
+  armed but `userland/sys.h` still emitted `int $0x80` - userland now
+  emits `syscall` (verified: 249 `syscall` sites, 0 `int $0x80` in the
+  built binaries).  The kernel's segment check accepts CS=0x2B.
+
+### Real process-model additions
+- **exec(2): SYS_EXEC (45).**  `sys_exec` copies argv/envp into kernel
+  memory, `user_exec` builds a fresh private address space (ASLR code +
+  stack), writes a real SysV process image (argc/argv[]/envp[]/strings)
+  onto the stack, frees the old address space and returns straight into
+  the new program.  `userland/start.c` is a proper crt0 that calls
+  `main_entry(argc, argv, envp)`; `/bin/hello` (a new second binary)
+  proves exec + argv + envp + exit-status end-to-end from init.
+- **Blocking waitpid.**  `sched_waitpid` parks the parent
+  (TASK_BLOCKED + waiting) instead of returning 0 for a busy userland
+  loop; `sched_exit`/`sched_kill` wake it.  The zombie check and the
+  waiting flag are atomic under `g_tasks_lock` (no lost wakeup), and a
+  woken task is queued BEFORE its state flips to READY (release store)
+  so it can never be queued twice - this also fixes a latent SMP bug in
+  the old wake path that could double-queue a RUNNING parent.
+- **sleep(ms): SYS_SLEEP (44).**  A timer-driven sleep queue parks the
+  task; the BSP tick wakes due sleepers.  `kill_demo` in init uses it.
+
+### Hardening
+- **Kernel heap/data NX.**  The whole HHDM direct map (heap, kernel
+  stacks, framebuffer, initrd, DMA bounce buffers) is marked NX at boot;
+  the kernel image mapping is untouched.  Closes audit row 6's "kernel
+  heap/data NX" gap.
+- `sys_sigaction` accepted only signals < 8 (dead `sig == 9` check);
+  now the full POSIX range 1..31 with SIGKILL/SIGSTOP excluded.
+- Watchdog's hung-task scan only flags READY-but-starved tasks;
+  BLOCKED (sleeping/waiting) tasks are no longer falsely reported.
+
+### Cleanup
+- Removed dead code: `kernel/fs/config.c` (config was parsed at boot and
+  read by nobody after the GUI moved to ring 3), `kernel/fs/elf.c`
+  (superseded by `arch/x86_64/user.c`), `userland/init.asm`
+  (superseded by start.c), `patch_settings.py` (patched a deleted file).
+- `docs/BRUTAL_AUDIT.md` rows 9 and 11 updated to match the fixed tree;
+  ARCHITECTURE.md gained a status banner (it described a pre-SMP,
+  in-kernel-GUI kernel for ~10 stages).
+
 ## 0.4.0-quartz  (Stage 9 - real assets, real fonts, real fps)
 
 The "polish + bugfix" release.  Three concrete bugs from the previous

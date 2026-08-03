@@ -1,8 +1,12 @@
 # Yart OS
 
 A calm, minimal x86_64 operating system written from scratch — SMP scheduler,
-ring-3 software compositor with the full Kora icon theme, RTC wall clock,
-tweened dock with frosted glass, smooth 60fps software rendering.
+ring-3 software compositor with the Kora icon theme, RTC wall clock,
+tweened dock with frosted glass, smooth 60fps software rendering.  Also:
+per-process page tables, CoW fork, demand paging + disk-backed swap,
+exec(2) with argv/envp, blocking waitpid/sleep, fast syscall/sysret, a
+journaled + CRC32'd persistent filesystem on virtio-blk, e1000 networking
+(ARP/IPv4/ICMP/UDP/DHCP) and Intel HDA audio.
 
 ## Quick start
 
@@ -35,7 +39,8 @@ userland/              Ring-3 compositor/wm + freestanding libc
   sys.h                Syscalls + freestanding libc helpers
   init.c               Entry point
 kora/                  All visual assets
-  icons/kora/          Full Kora icon theme (scalable/ + symbolic/ SVGs, ~7000 icons)
+  icons/kora/          Vendored Kora icon theme SVGs (the build renders the
+                       ~115 icons the compositor uses into an embedded atlas)
   wallpapers/          default.png (+ more when added)
   cursors/             (reserved for cursor themes)
 scripts/               Asset generators, Limine bootstrap, QEMU runner
@@ -59,9 +64,12 @@ yart.iso               (generated) bootable hybrid ISO
 |------------------------|---------------------|
 | Kernel                 | `/boot/yart.elf`    |
 | Compositor + assets    | `/bin/init`         |
+| exec() demo binary     | `/bin/hello`        |
 | Fallback wallpaper BMP | `/etc/wallpaper.bmp`|
-| Config                 | `/etc/yart.conf`    |
 | Home                   | `/home/yart/`       |
+
+(`/etc/yart.conf` is still shipped on the initrd for future use; the kernel
+no longer parses it since the GUI moved to ring 3.)
 
 Icons and the main wallpaper are statically linked into `/bin/init` for instant
 boot (no disk I/O). `/etc/wallpaper.bmp` exists for a future live-switcher.

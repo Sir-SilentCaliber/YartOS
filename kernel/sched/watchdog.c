@@ -96,7 +96,10 @@ static void check_hung_tasks(u64 now) {
     task_t *t = sched_tasks();
     while (t) {
         task_t *nx = t->next;
-        if (t->is_user && t->pid != 0 && t->state != TASK_ZOMBIE &&
+        /* READY-but-starved only: RUNNING, BLOCKED (sleep/waitpid) and
+         * ZOMBIE tasks are all legitimately not being scheduled */
+        if (t->is_user && t->pid != 0 &&
+            t->state == TASK_READY &&
             (now - t->last_sched) > HUNG_TASK_TIMEOUT_TICKS) {
             kprintf("watchdog: task %u '%s' appears starved (un-scheduled "
                     "for %llu ticks) - reported, not killed\n",

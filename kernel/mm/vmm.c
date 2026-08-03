@@ -78,7 +78,11 @@ void vmm_map(vaddr_t v, paddr_t p, u64 flags) {
 }
 
 void vmm_set_flags(vaddr_t v, u64 flags) {
-    u64 *pte = walk(cur_pml4(), v, false, 0);
+    vmm_set_flags_in(cur_pml4(), v, flags);
+}
+
+void vmm_set_flags_in(u64 *pml4, vaddr_t v, u64 flags) {
+    u64 *pte = walk(pml4, v, false, 0);
     if (!pte || !(*pte & PTE_PRESENT)) return;
     paddr_t phys = *pte & ~0xFFFULL & ~PTE_NX;
     *pte = (phys & ~0xFFFULL) | flags | PTE_PRESENT;
@@ -174,36 +178,33 @@ void vmm_take_boot_regions(task_t *t) {
     g_boot_region_count = 0;
 }
 
-/* Split the boot-prepared user address space off into its own page tables:
- * clone the current (kernel) tables, CoW-share the prepared user pages,
- * drop the kernel's own copies, and hand regions + PML4 to the task. */
-void vmm_give_current_regions_to(task_t *t) {
-    int n = g_boot_region_count;
-    if (n <= 0) return;
-    u64 *clone = vmm_clone_pml4();
-    if (!clone) {
-        kprintf("vmm: clone failed - task shares kernel tables\n");
-        return;
+/* Generalised reserve: track + (optionally) map `npages` at `va` inside
+ * `pml4`, recording the region in `rs`/`*count`.  Used by the exec path
+ * (building a fresh address space) and by vmm_user_reserve (current
+ * address space).  Does NOT charge memory - callers decide. */
+int vmm_reserve_in(u64 *pml4, user_region_t *rs, int *count,
+                   u64 va, u64 npages, u64 flags, u32 opts) {
+    if (npages == 0) return -1;
+    u64 start = PAGE_ALIGN_DOWN(va);
+    u64 end   = start + npages * PAGE_SIZE;
+    if (end < start) return -1;
+    if (start < USER_VBASE || end > USER_STACK_TOP) return -1;
+    for (int i = 0; i < *count; i++) {
+        u64 r_end = rs[i].start + rs[i].npages * PAGE_SIZE;
+        if (start < r_end && end > rs[i].start) return -1;   /* overlap */
     }
-    vmm_cow_fork(clone);                 /* share user pages RO (CoW)    */
-    /* release the kernel's own copies of those pages (unref each)        */
-    for (int i = 0; i < n; i++) {
-        user_region_t r = g_boot_regions[i];
-        for (u64 a = r.start; a < r.start + r.npages * PAGE_SIZE;
-             a += PAGE_SIZE) {
-            u64 *pte = walk(kernel_pml4, a, false, 0);
-            if (pte && (*pte & PTE_PRESENT)) {
-                paddr_t phys = *pte & ~0xFFFULL & ~PTE_NX;
-                *pte = 0;
-                invlpg(a);
-                pmm_unref_page(phys);
-            }
+    if (*count >= MAX_USER_REGIONS) return -1;
+    rs[*count].start  = start;
+    rs[*count].npages = npages;
+    rs[*count].flags  = flags | PTE_US;
+    (*count)++;
+    if (!(opts & VMM_USER_LAZY)) {
+        for (u64 a = start; a < end; a += PAGE_SIZE) {
+            paddr_t p = pmm_alloc_page();
+            vmm_map_in(pml4, a, p, flags | PTE_US);
         }
     }
-    vmm_take_boot_regions(t);
-    t->pml4 = clone;
-    kprintf("vmm: task [%u] now has private page tables (CR3 switched on schedule)\n",
-            t->pid);
+    return 0;
 }
 
 int vmm_user_reserve(u64 va, u64 npages, u64 flags, u32 opts) {
@@ -626,20 +627,31 @@ int vmm_evict_some(int max) {
 
 /* ---------------- user-pointer validation ---------------- */
 
+/* A page is readable by the kernel (stac) iff it is present + PTE_US.
+ * Reserved-but-unmapped (lazy) pages are MATERIALIZED first: a kernel
+ * read of a lazy page would otherwise take a kernel-mode page fault and
+ * panic - validating with resolve first makes every uptr()/copy_user_str()
+ * caller crash-proof against lazily-reserved regions. */
+static bool page_readable_for_kernel(u64 a) {
+    u64 *pte = walk(cur_pml4(), a, false, 0);
+    if (pte && (*pte & PTE_PRESENT))
+        return (*pte & PTE_US) != 0;
+    if (!find_region(a))
+        return false;                          /* not even reserved */
+    if (!vmm_resolve_user_fault(a, false))
+        return false;                          /* demand-fault failed */
+    pte = walk(cur_pml4(), a, false, 0);
+    return pte && (*pte & PTE_PRESENT) && (*pte & PTE_US);
+}
+
 bool vmm_user_range_ok(u64 va, u64 len) {
     if (len == 0) return true;
     if (va + len < va) return false;
     if (va < USER_VBASE || va + len > USER_STACK_TOP) return false;
     u64 first = PAGE_ALIGN_DOWN(va);
     u64 last  = PAGE_ALIGN_UP(va + len);
-    for (u64 a = first; a < last; a += PAGE_SIZE) {
-        u64 *pte = walk(cur_pml4(), a, false, 0);
-        if (pte && (*pte & PTE_PRESENT)) {
-            if (!(*pte & PTE_US)) return false;
-            continue;
-        }
-        if (!find_region(a)) return false;       /* unmapped, not reserved */
-    }
+    for (u64 a = first; a < last; a += PAGE_SIZE)
+        if (!page_readable_for_kernel(a)) return false;
     return true;
 }
 
@@ -656,12 +668,7 @@ bool vmm_user_str_ok(u64 s, u64 max) {
         if (pg != cur_page) {
             cur_page = pg;
             if (a < USER_VBASE || a >= USER_STACK_TOP) return false;
-            u64 *pte = walk(cur_pml4(), a, false, 0);
-            if (pte && (*pte & PTE_PRESENT)) {
-                if (!(*pte & PTE_US)) return false;
-            } else if (!find_region(a)) {
-                return false;
-            }
+            if (!page_readable_for_kernel(a)) return false;
         }
         char c;
         stac();
@@ -675,6 +682,45 @@ bool vmm_user_str_ok(u64 s, u64 max) {
 /* ---------------- init + selftest ---------------- */
 
 #define SCRATCH 0x50000000UL
+
+/* Set the NX bit on the ENTIRE HHDM direct map (PML4 index 256, base
+ * 0xffff800000000000): kernel heap, kernel stacks, framebuffer, initrd
+ * and driver DMA bounce buffers live there and none of it is ever
+ * executed - this is the "kernel heap/data NX" hardening.  The kernel
+ * image itself is mapped at 0xffffffff80000000 (PML4 index 511) by the
+ * bootloader and stays executable.  Per-CPU page tables copy the kernel
+ * half verbatim, so one pass on the boot PML4 covers every address space. */
+static void nx_direct_map(void) {
+    u64 *pml4 = kernel_pml4;
+    if (!(pml4[256] & PTE_PRESENT)) return;
+    if (pml4[256] & PTE_HUGE) {                 /* 512 GiB huge page      */
+        pml4[256] |= PTE_NX;
+        goto done;
+    }
+    u64 *pdpt = (u64 *)phys_to_virt(pml4[256] & ~0xFFFULL & ~PTE_NX);
+    for (int i = 0; i < 512; i++) {
+        if (!(pdpt[i] & PTE_PRESENT)) continue;
+        if (pdpt[i] & PTE_HUGE) {               /* 1 GiB page             */
+            pdpt[i] |= PTE_NX;
+            continue;
+        }
+        u64 *pd = (u64 *)phys_to_virt(pdpt[i] & ~0xFFFULL & ~PTE_NX);
+        for (int j = 0; j < 512; j++) {
+            if (!(pd[j] & PTE_PRESENT)) continue;
+            if (pd[j] & PTE_HUGE) {             /* 2 MiB page             */
+                pd[j] |= PTE_NX;
+                continue;
+            }
+            u64 *pt = (u64 *)phys_to_virt(pd[j] & ~0xFFFULL & ~PTE_NX);
+            for (int k = 0; k < 512; k++)
+                if (pt[k] & PTE_PRESENT) pt[k] |= PTE_NX;
+        }
+    }
+done:
+    /* full TLB flush so the new NX bits take effect everywhere */
+    write_cr3(read_cr3());
+    kprintf("vmm: HHDM direct map marked NX (heap/stacks/fb cannot execute)\n");
+}
 
 void vmm_init(void) {
     paddr_t cr3 = read_cr3() & ~0xFFFULL;
@@ -692,6 +738,7 @@ void vmm_init(void) {
     u32 sm = smep_smap_enable();
     kprintf("vmm: SMEP=%s SMAP=%s (kernel cannot exec/access user pages)\n",
             (sm & 1) ? "on" : "n/a", (sm & 2) ? "on" : "n/a");
+    nx_direct_map();
     kprintf("vmm: PML4 @ phys %p (virt %p), HHDM offset %p\n",
             (void *)cr3, kernel_pml4, (void *)g_hhdm_offset);
     vmm_swap_init();

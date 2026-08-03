@@ -13,10 +13,12 @@
 
 #define PKT_SZ 4
 
+/* Completed packets are fanned out to per-task queues (wm + focused app)
+ * by the syscall layer - see sys_input_mouse(). */
+extern void sys_input_mouse(const mouse_event_t *me);
+
 static u8  pkt[PKT_SZ];
 static u8  pkt_idx;
-static volatile mouse_event_t latest;
-static volatile bool          have;
 
 static void wait_in(void)  { for (int i = 0; i < 100000; i++) if (!(inb(KBD_STAT) & 2)) return; }
 static void wait_out(void) { for (int i = 0; i < 100000; i++) if   (inb(KBD_STAT) & 1)  return; }
@@ -38,15 +40,16 @@ static void mouse_irq(cpu_regs_t *r) {
     if (pkt_idx == PKT_SZ) {
         pkt_idx = 0;
         u8 flags = pkt[0];
-        int dx = pkt[1], dy = pkt[2];
-        if (flags & 0x10) dx -= 256;
-        if (flags & 0x20) dy -= 256;
-        latest.dx = dx;
-        latest.dy = -dy;       /* invert: PS/2 Y goes up */
-        latest.buttons = flags & 0x07;
-        latest.wheel   = (i8)pkt[3];   /* wheel byte, -1..+1 typically */
-        latest.valid = true;
-        have = true;
+        mouse_event_t me;
+        me.dx = pkt[1];
+        me.dy = pkt[2];
+        if (flags & 0x10) me.dx -= 256;
+        if (flags & 0x20) me.dy -= 256;
+        me.dy = -me.dy;        /* invert: PS/2 Y goes up */
+        me.buttons = flags & 0x07;
+        me.wheel   = (i8)pkt[3];   /* wheel byte, -1..+1 typically */
+        me.valid = true;
+        sys_input_mouse(&me);
     }
 }
 
@@ -71,11 +74,4 @@ void mouse_init(void) {
     irq_register(32 + 12, mouse_irq);
     pic_unmask(2);
     pic_unmask(12);
-}
-
-bool mouse_poll(mouse_event_t *out) {
-    if (!have) return false;
-    *out = latest;
-    have = false;
-    return true;
 }

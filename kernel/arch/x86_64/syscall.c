@@ -25,6 +25,7 @@
 #include <yart/drivers.h>
 #include <yart/watchdog.h>
 #include <yart/sha256.h>
+#include <yart/spinlock.h>
 
 /* ---------- doas user database (salted SHA-256) ----------
  * The password check used to accept ANY non-empty string ("ring-3 auth
@@ -624,6 +625,7 @@ static i64 sys_udp_recv(u8 *buf, u16 cap) {
  * definitions merge, so declaring them here is safe) */
 static task_t *g_wm_task;
 static void   *g_wm_uaddr;
+static u32     g_focus_pid;     /* task receiving keyboard (0 = wm)     */
 
 static i64 sys_exec(const char *path, char *const *argv, char *const *envp,
                     cpu_regs_t *r) {
@@ -823,6 +825,11 @@ static u64 sys_fb_flip(void *addr);
 static u64 sys_poll_key(void);
 static u64 sys_poll_mouse(mouse_ev_t *out);
 static u64 sys_time_ms(void);
+static i64 sys_wm_create(u32 w, u32 h, wm_surf_info_t *out);
+static i64 sys_wm_flip(u32 id);
+static i64 sys_wm_scan(wm_surf_info_t *out, u32 max);
+static i64 sys_wm_focus(u32 pid);
+static i64 sys_wm_destroy(u32 id);
 
 static void syscall_handler(cpu_regs_t *r) {
     check_user_segments(r);
@@ -884,6 +891,13 @@ static void syscall_handler(cpu_regs_t *r) {
     case SYS_EXEC:      r->rax = (u64)sys_exec((const char *)a0,
                                                (char *const *)a1,
                                                (char *const *)a2, r); break;
+    case SYS_WM_CREATE: r->rax = (u64)sys_wm_create((u32)a0, (u32)a1,
+                                                    (wm_surf_info_t *)a2); break;
+    case SYS_WM_FLIP:   r->rax = (u64)sys_wm_flip((u32)a0); break;
+    case SYS_WM_SCAN:   r->rax = (u64)sys_wm_scan((wm_surf_info_t *)a0,
+                                                  (u32)a1); break;
+    case SYS_WM_FOCUS:  r->rax = (u64)sys_wm_focus((u32)a0); break;
+    case SYS_WM_DESTROY: r->rax = (u64)sys_wm_destroy((u32)a0); break;
     default:
         kprintf("syscall: bad #%lu\n", r->rax);
         r->rax = (u64)-1;
@@ -1014,18 +1028,89 @@ static u64 sys_fb_flip(void *addr) {
     return 0;
 }
 
-/* SYS_POLL_KEY -> 0 or ((scancode<<8)|ascii|flags).  Same encoding as
- * kbd_poll_event. */
+/* ---------------- input fanout (per-task queues) ----------------
+ * Keyboard events go to the focused task (or the wm when nothing is
+ * focused); mouse events are COPIED to the wm (it moves the cursor) AND
+ * the focused task (the app's UI).  Each task drains its own queue via
+ * POLL_KEY / POLL_MOUSE, so no event is ever consumed twice. */
+
+static void input_push_kbd(task_t *t, int ev) {
+    if (!t) return;
+    u32 next = (t->kbd_qh + 1) % TASK_KBDQ;
+    if (next == t->kbd_qt) return;             /* queue full: drop */
+    t->kbd_q[t->kbd_qh] = ev;
+    t->kbd_qh = next;
+}
+
+static void input_push_mouse(task_t *t, const mouse_event_t *me) {
+    if (!t) return;
+    u32 next = (t->m_qh + 1) % TASK_MOUSEQ;
+    if (next == t->m_qt) return;               /* queue full: drop */
+    t->mouse_q[t->m_qh] = *me;
+    t->m_qh = next;
+}
+
+/* Called from IRQ context (PS/2 + USB).  IRQ-safe: interrupts are already
+ * off in the handler; the fanout lock only serializes against the syscall
+ * path on other CPUs. */
+static spinlock_t g_input_lock;
+
+void sys_input_kbd(int ev) {
+    u64 fl = irq_save();
+    spin_lock(&g_input_lock);
+    task_t *focus = sched_find(g_focus_pid);
+    input_push_kbd(focus ? focus : g_wm_task, ev);
+    spin_unlock(&g_input_lock);
+    irq_restore(fl);
+}
+
+void sys_input_mouse(const mouse_event_t *me) {
+    u64 fl = irq_save();
+    spin_lock(&g_input_lock);
+    input_push_mouse(g_wm_task, me);           /* wm always gets a copy */
+    task_t *focus = sched_find(g_focus_pid);
+    if (focus && focus != g_wm_task)
+        input_push_mouse(focus, me);
+    spin_unlock(&g_input_lock);
+    irq_restore(fl);
+}
+
+/* SYS_POLL_KEY -> 0 or ((scancode<<8)|ascii|flags).  The queue pop takes
+ * the fanout lock: the IRQ producer reads the tail under the same lock,
+ * so a pop can never race a push (SPSC ring, lock-protected both sides). */
 static u64 sys_poll_key(void) {
-    if (g_wm_task != cur()) return 0;
-    return (u64)kbd_poll_event();
+    task_t *t = cur();
+    if (!t) return 0;
+    if (t != g_wm_task && (g_focus_pid == 0 || t->pid != g_focus_pid)) return 0;
+    u64 fl = irq_save();
+    spin_lock(&g_input_lock);
+    int ev = 0;
+    if (t->kbd_qh != t->kbd_qt) {
+        ev = t->kbd_q[t->kbd_qt];
+        t->kbd_qt = (t->kbd_qt + 1) % TASK_KBDQ;
+    }
+    spin_unlock(&g_input_lock);
+    irq_restore(fl);
+    return (u64)ev;
 }
 
 /* SYS_POLL_MOUSE(mouse_ev_t *out) -> 1 if event, 0 if none */
 static u64 sys_poll_mouse(mouse_ev_t *out) {
-    if (g_wm_task != cur() || !uptr((u64)out, sizeof(mouse_ev_t))) return 0;
+    task_t *t = cur();
+    if (!t || !uptr((u64)out, sizeof(mouse_ev_t))) return 0;
+    if (t != g_wm_task && (g_focus_pid == 0 || t->pid != g_focus_pid)) return 0;
+    u64 fl = irq_save();
+    spin_lock(&g_input_lock);
     mouse_event_t me;
-    if (!mouse_poll(&me) || !me.valid) return 0;
+    int got = 0;
+    if (t->m_qh != t->m_qt) {
+        me = t->mouse_q[t->m_qt];
+        t->m_qt = (t->m_qt + 1) % TASK_MOUSEQ;
+        got = 1;
+    }
+    spin_unlock(&g_input_lock);
+    irq_restore(fl);
+    if (!got) return 0;
     stac();
     out->dx      = me.dx;
     out->dy      = me.dy;
@@ -1033,6 +1118,198 @@ static u64 sys_poll_mouse(mouse_ev_t *out) {
     out->buttons = me.buttons;
     clac();
     return 1;
+}
+
+/* ---------------- window surfaces (ring-3 apps) ----------------
+ * A surface is a physical-page-backed canvas mapped into BOTH the app's
+ * address space (it draws) and the wm's (it composites).  The kernel owns
+ * the refcounts: 1 per mapping + 1 for the table.  Layout:
+ *   app side: WM_SURF_APP_BASE + id*stride   (in the app's pml4)
+ *   wm  side: WM_SURF_WM_BASE  + id*stride   (in the wm's  pml4)
+ * The wm composites the surface at (win_x, win_y) - the kernel computes a
+ * centered position at create time and hands it to both sides. */
+
+#define WM_MAX_SURFACES 8
+#define WM_SURF_APP_BASE 0x7A000000UL
+#define WM_SURF_WM_BASE  0x76000000UL
+#define WM_SURF_STRIDE   0x200000UL        /* 2 MiB per slot             */
+#define WM_SURF_MAX_W 640
+#define WM_SURF_MAX_H 480
+#define WM_SURF_MAX_PAGES (WM_SURF_STRIDE / PAGE_SIZE)   /* 512 */
+
+typedef struct {
+    bool   used;
+    u32    id;
+    u32    owner_pid;
+    u32    w, h;
+    u32    win_x, win_y;
+    u32    npages;
+    paddr_t pages[WM_SURF_MAX_PAGES];
+    u64    app_va, wm_va;
+    bool   app_mapped, wm_mapped;
+    bool   dirty;
+} wm_surface_t;
+
+static wm_surface_t g_wm_surfs[WM_MAX_SURFACES];
+
+/* SYS_WM_CREATE(w, h, wm_surf_info_t *out) -> surface id or -1.
+ * Maps the canvas into the CALLER (the app); the wm side is mapped here
+ * too so the compositor can start showing the window immediately. */
+static i64 sys_wm_create(u32 w, u32 h, wm_surf_info_t *out) {
+    task_t *t = cur();
+    if (!t || !g_sys_from_user || !t->is_user) return -1;
+    if (w < 16 || h < 16 || w > WM_SURF_MAX_W || h > WM_SURF_MAX_H) return -1;
+    if (!uptr((u64)out, sizeof(wm_surf_info_t))) return -1;
+
+    wm_surface_t *s = NULL;
+    for (int i = 0; i < WM_MAX_SURFACES; i++)
+        if (!g_wm_surfs[i].used) { s = &g_wm_surfs[i]; s->id = (u32)i; break; }
+    if (!s) return -1;
+
+    u32 npages = (w * h * 4 + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (npages > WM_SURF_MAX_PAGES) return -1;
+
+    memset(s, 0, sizeof *s);
+    s->used = true;
+    s->owner_pid = t->pid;
+    s->w = w; s->h = h;
+    s->npages = npages;
+    s->app_va = WM_SURF_APP_BASE + (u64)s->id * WM_SURF_STRIDE;
+    s->wm_va  = WM_SURF_WM_BASE  + (u64)s->id * WM_SURF_STRIDE;
+    s->win_x  = (g_fb.width  > w) ? (g_fb.width  - w) / 2 : 0;
+    s->win_y  = (g_fb.height > h) ? (g_fb.height - h) / 2 : 0;
+
+    for (u32 i = 0; i < npages; i++) {
+        s->pages[i] = pmm_alloc_page();
+        if (!s->pages[i]) {
+            /* roll back */
+            for (u32 k = 0; k < i; k++) pmm_free_page(s->pages[k]);
+            s->used = false;
+            return -1;
+        }
+    }
+    /* map into the app (its pml4 is current during this syscall) */
+    for (u32 i = 0; i < npages; i++) {
+        vmm_map_in(vmm_current_pml4(), s->app_va + i * PAGE_SIZE, s->pages[i],
+                   PTE_PRESENT | PTE_RW | PTE_US | PTE_NX);
+        pmm_ref_page(s->pages[i]);
+    }
+    s->app_mapped = true;
+    /* map into the wm */
+    if (g_wm_task && g_wm_task->pml4) {
+        for (u32 i = 0; i < npages; i++) {
+            vmm_map_in(g_wm_task->pml4, s->wm_va + i * PAGE_SIZE, s->pages[i],
+                       PTE_PRESENT | PTE_RW | PTE_US | PTE_NX);
+            pmm_ref_page(s->pages[i]);
+        }
+        s->wm_mapped = true;
+    }
+    sched_charge_pages((i64)npages);
+
+    wm_surf_info_t info;
+    info.id = s->id;
+    info.w = s->w; info.h = s->h;
+    info.win_x = s->win_x; info.win_y = s->win_y;
+    info.app_va = s->app_va;
+    info.owner_pid = s->owner_pid;
+    info.dirty = 1;
+    stac();
+    *(wm_surf_info_t *)out = info;
+    clac();
+    kprintf("wm: surface %u created by pid %u (%ux%u @ %u,%u)\n",
+            s->id, t->pid, w, h, s->win_x, s->win_y);
+    return (i64)s->id;
+}
+
+static void wm_surface_teardown(wm_surface_t *s, bool unmap_app) {
+    task_t *owner = sched_find(s->owner_pid);
+    if (unmap_app && s->app_mapped) {
+        /* app side: unmap + drop the app refs (owner may be dead; its
+         * pml4 was already freed by vmm_free_pml4, which unrefs every
+         * present user PTE - so only unmap if the owner is alive) */
+        if (owner && owner->pml4) {
+            for (u32 i = 0; i < s->npages; i++)
+                vmm_unmap_in(owner->pml4, s->app_va + i * PAGE_SIZE);
+        }
+        s->app_mapped = false;
+    }
+    if (s->wm_mapped && g_wm_task && g_wm_task->pml4) {
+        for (u32 i = 0; i < s->npages; i++)
+            vmm_unmap_in(g_wm_task->pml4, s->wm_va + i * PAGE_SIZE);
+        s->wm_mapped = false;
+    }
+    /* table refs: free the frames for real */
+    for (u32 i = 0; i < s->npages; i++)
+        pmm_free_page(s->pages[i]);
+    if (g_focus_pid == s->owner_pid) g_focus_pid = 0;
+    kprintf("wm: surface %u destroyed (owner pid %u)\n", s->id, s->owner_pid);
+    memset(s, 0, sizeof *s);
+}
+
+static i64 sys_wm_destroy(u32 id) {
+    if (id >= WM_MAX_SURFACES || !g_wm_surfs[id].used) return -1;
+    task_t *t = cur();
+    if (t && t->pid != g_wm_surfs[id].owner_pid && t != g_wm_task) return -1;
+    wm_surface_teardown(&g_wm_surfs[id], true);
+    return 0;
+}
+
+/* SYS_WM_FLIP(id): the app finished drawing - mark the surface dirty so
+ * the compositor re-blits it. */
+static i64 sys_wm_flip(u32 id) {
+    if (id >= WM_MAX_SURFACES || !g_wm_surfs[id].used) return -1;
+    task_t *t = cur();
+    if (t && t->pid != g_wm_surfs[id].owner_pid) return -1;
+    g_wm_surfs[id].dirty = true;
+    return 0;
+}
+
+/* SYS_WM_SCAN(out, max): wm-only - list surfaces + clear their dirty
+ * flags.  The compositor calls this every frame. */
+static i64 sys_wm_scan(wm_surf_info_t *out, u32 max) {
+    if (cur() != g_wm_task) return -1;
+    if (max > WM_MAX_SURFACES) max = WM_MAX_SURFACES;
+    if (!uptr((u64)out, (u64)max * sizeof(wm_surf_info_t))) return -1;
+    u32 n = 0;
+    for (int i = 0; i < WM_MAX_SURFACES && n < max; i++) {
+        wm_surface_t *s = &g_wm_surfs[i];
+        if (!s->used) continue;
+        wm_surf_info_t info;
+        info.id = s->id;
+        info.w = s->w; info.h = s->h;
+        info.win_x = s->win_x; info.win_y = s->win_y;
+        info.app_va = s->wm_va;              /* the WM-side VA!          */
+        info.owner_pid = s->owner_pid;
+        info.dirty = s->dirty ? 1 : 0;
+        s->dirty = false;
+        stac();
+        out[n++] = info;
+        clac();
+    }
+    return (i64)n;
+}
+
+/* SYS_WM_FOCUS(pid): route keyboard to `pid` (and mouse copies).  The wm
+ * calls this when the user clicks a window; 0 clears the focus. */
+static i64 sys_wm_focus(u32 pid) {
+    if (cur() != g_wm_task) return -1;
+    if (pid == 0) { g_focus_pid = 0; return 0; }
+    task_t *t = sched_find(pid);
+    if (!t || !t->is_user || t->pid == 0) return -1;
+    g_focus_pid = pid;
+    kprintf("wm: input focus -> pid %u\n", pid);
+    return 0;
+}
+
+/* Called from the orphan reaper when a task dies: free any surface it
+ * owned (the app side was already unmapped+unref'd by vmm_free_pml4). */
+void wm_surface_owner_died(u32 pid) {
+    for (int i = 0; i < WM_MAX_SURFACES; i++) {
+        wm_surface_t *s = &g_wm_surfs[i];
+        if (s->used && s->owner_pid == pid)
+            wm_surface_teardown(s, false);
+    }
+    if (g_focus_pid == pid) g_focus_pid = 0;
 }
 
 /* SYS_TIME_MS -> uptime in milliseconds */

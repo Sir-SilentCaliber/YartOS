@@ -15,9 +15,9 @@
 #define KBD_DATA  0x60
 #define KBD_STAT  0x64
 
-#define EV_QSZ 256
-static volatile int evq[EV_QSZ];
-static volatile u32 ev_head, ev_tail;
+/* Events are fanned out to per-task queues by the syscall layer
+ * (sys_input_kbd) so the wm AND the focused app each get their own copy. */
+extern void sys_input_kbd(int ev);
 
 static bool shift, ctrl, alt, caps;
 static bool e0_pending;   /* saw the 0xE0 extended prefix */
@@ -37,12 +37,7 @@ static const char map_upper[128] = {
     '*',0,' ',0
 };
 
-static void enq(int ev) {
-    u32 next = (ev_head + 1) % EV_QSZ;
-    if (next == ev_tail) return;     /* drop */
-    evq[ev_head] = ev;
-    ev_head = next;
-}
+
 
 bool kbd_ctrl_held(void)  { return ctrl; }
 bool kbd_shift_held(void) { return shift; }
@@ -87,7 +82,7 @@ static void kbd_irq(cpu_regs_t *r) {
     if (shift)      ev |= KEY_SHIFT;
     if (ctrl)       ev |= KEY_CTRL;
     if (alt)        ev |= KEY_ALT;
-    enq(ev);
+    sys_input_kbd(ev);
     e0_pending = false;
 }
 
@@ -97,17 +92,9 @@ void kbd_init(void) {
     while (inb(KBD_STAT) & 1) (void)inb(KBD_DATA);
 }
 
-/* USB-HID keyboard input hook (row 18): translate a HID keycode + modifiers
- * into the same event the PS/2 driver pushes, so the desktop's
- * kbd_poll_event() drain works unchanged. */
+/* USB-HID keyboard input hook (row 18): route through the same fanout as
+ * the PS/2 driver so focused apps and the wm each get their own copy. */
 int kbd_enqueue(u8 scancode, u8 ascii, u32 flags) {
-    enq((int)(scancode << 8) | ascii | (int)flags);
+    sys_input_kbd((int)(scancode << 8) | ascii | (int)flags);
     return 0;
-}
-
-int kbd_poll_event(void) {
-    if (ev_head == ev_tail) return 0;
-    int ev = evq[ev_tail];
-    ev_tail = (ev_tail + 1) % EV_QSZ;
-    return ev;
 }

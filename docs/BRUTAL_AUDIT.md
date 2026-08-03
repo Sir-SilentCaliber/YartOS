@@ -26,6 +26,19 @@
 > New rows this pass: block 1 (blkfs layout), block 2 (silent truncation),
 > block 3 (fake auth), block 4 (unused fast path).  See CHANGELOG.md.
 
+> **2026-08-03 APP PASS (v0.7.0-apps).**  Compositor focus, on top of the
+> audit-fix pass: (1) FIXED the reported dock-hover freeze - the frame
+> pacing no longer spins on the tick clock (fixed 2 yields/frame + mid-slice
+> mouse poll) and dock icons are cached at rest size; (2) real PHOTO
+> cursors from web art (kora/cursors/, gen_cursors.py) with a live theme
+> switcher; (3) the FIRST REAL APP - /bin/settings - via a new window
+> surface protocol (SYS_WM_CREATE/FLIP/SCAN/FOCUS/DESTROY) and per-task
+> input queues (keyboard to the focused app, mouse copied to wm + app);
+> (4) dock cleaned of all fake apps (only Settings + Trash remain).
+> Rows 24/25 (per-window surfaces + IPC) are now PARTIALLY done: one
+> app window with input routing works; no pipes/sockets between apps yet.
+> See CHANGELOG.md.
+
 **The single list.** 48 problems, one row each, one under another, in the order we do
 them. Columns: `#` = number you tell me to fix, `Status` = OPEN or DONE with a
 completeness score out of 10 (**DONE x/10** means: fully working + QEMU-verified; the

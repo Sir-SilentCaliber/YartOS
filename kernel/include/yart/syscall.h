@@ -1,5 +1,6 @@
 #pragma once
 #include <yart/types.h>
+#include <yart/drivers.h>    /* mouse_event_t */
 
 /* Yart syscall numbers - kept small + linux-ish.  Used by both the kernel
  * dispatcher (kernel/arch/x86_64/syscall.c) and the userland libc
@@ -52,6 +53,11 @@ enum {
     SYS_TIME_MS  = 43,    /* monotonic millisecond uptime (for compositor fps)     */
     SYS_SLEEP    = 44,    /* block the calling task for ms (timer wakeup)          */
     SYS_EXEC     = 45,    /* replace the address space: exec(path, argv, envp)     */
+    SYS_WM_CREATE = 46,   /* app: create a window surface (maps into wm too)       */
+    SYS_WM_FLIP   = 47,   /* app: mark a surface dirty (needs recomposite)         */
+    SYS_WM_SCAN   = 48,   /* wm:  list surfaces + clear dirty flags                */
+    SYS_WM_FOCUS  = 49,   /* wm:  route keyboard to a task (0 = none)              */
+    SYS_WM_DESTROY = 50,  /* app/wm: destroy a surface                              */
     SYS_MAX
 };
 
@@ -82,6 +88,27 @@ typedef struct {
     u64  size;
     u64  mtime;
 } yart_stat_t;
+
+/* Window-surface info (SYS_WM_CREATE/SCAN).  app_va is the caller-side
+ * mapping for CREATE and the WM-side mapping for SCAN (same layout, the
+ * kernel picks the side). */
+typedef struct {
+    u32  id;
+    u32  w, h;
+    u32  win_x, win_y;     /* screen position the compositor uses       */
+    u64  app_va;           /* mapped canvas address (side depends)      */
+    u32  owner_pid;
+    u32  dirty;
+} wm_surf_info_t;
+
+void doas_init(void);          /* seed the salted-SHA-256 user database */
+
+/* Input fanout (called from the PS/2 + USB drivers, IRQ context) */
+void sys_input_kbd(int ev);
+void sys_input_mouse(const mouse_event_t *me);
+
+/* Called by the scheduler when a task is reaped: free its surfaces. */
+void wm_surface_owner_died(u32 pid);
 
 /* Framebuffer info returned by SYS_FB_INFO.  After a successful call the
  * caller's address space has `size` bytes mapped starting at `addr` (which

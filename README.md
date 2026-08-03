@@ -6,7 +6,9 @@ tweened dock with frosted glass, smooth 60fps software rendering.  Also:
 per-process page tables, CoW fork, demand paging + disk-backed swap,
 exec(2) with argv/envp, blocking waitpid/sleep, fast syscall/sysret, a
 journaled + CRC32'd persistent filesystem on virtio-blk, e1000 networking
-(ARP/IPv4/ICMP/UDP/DHCP) and Intel HDA audio.
+(ARP/IPv4/ICMP/UDP/DHCP), Intel HDA audio, REAL photo cursors (selectable
+from the Settings app) and the first real ring-3 app: /bin/settings with
+its own window surface (per-window input routing).
 
 ## Quick start
 
@@ -65,6 +67,8 @@ yart.iso               (generated) bootable hybrid ISO
 | Kernel                 | `/boot/yart.elf`    |
 | Compositor + assets    | `/bin/init`         |
 | exec() demo binary     | `/bin/hello`        |
+| Settings app (real)    | `/bin/settings`     |
+| Cursor theme config    | `/home/yart/cursor.conf` |
 | Fallback wallpaper BMP | `/etc/wallpaper.bmp`|
 | Home                   | `/home/yart/`       |
 

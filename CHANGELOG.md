@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.7.0-apps  (2026-08-03 - compositor fixes, photo cursors, first real app)
+
+Compositor / app pass on top of 0.6.0.  Focus: the reported dock-hover
+freeze, real photo cursors chosen from a real Settings app, and the first
+real ring-3 app.
+
+### The dock-hover freeze (fixed)
+The compositor's frame pacing was `while (time_ms() < target) { yield(); }`:
+every `yield()` parks the task until the next timer tick, so with a slow or
+stalled tick the loop never converged (and any mouse movement made it exit
+WITHOUT yielding, monopolizing the CPU).  The pacing is now a FIXED 2
+yields per frame with mid-slice mouse polling - the frame always completes
+and the compositor always gives the CPU back, independent of the clock.
+Also: the dock now caches rest-size icon sprites (the per-pixel scaled
+blend of 6 icons every hover frame was the biggest per-frame cost), the
+tween math is unchanged but can no longer be starved, and cursor
+restore/window draws are window-aware (no wallpaper holes through apps).
+
+### Real photo cursors from the web + Settings chooser
+- `kora/cursors/` now holds REAL cursor art (downloaded PNGs: a white
+  arrow with black outline, a flat-style arrow, a pointing-finger hand).
+- `scripts/gen_cursors.py` crops to the alpha bbox, LANCZOS-downscales to
+  32px (smooth anti-aliased edges), computes hotspots, and emits
+  `build/cursors.bin` + `cursor_assets.h` (2 themes: photo-white, photo-flat).
+- The compositor draws the photo cursors (arrow + hand) at the pointer;
+  the classic procedural cursors remain the "classic" theme and the
+  fallback for kinds without photos (ibeam, resize, ...).
+- `/home/yart/cursor.conf` selects the theme (default `theme=photo-white`);
+  the compositor polls it once a second and swaps live.
+
+### First REAL app: /bin/settings (window surface protocol)
+- New kernel surface protocol (SYS_WM_CREATE/FLIP/SCAN/FOCUS/DESTROY):
+  a canvas is mapped into BOTH the app's and the compositor's address
+  space; the kernel owns refcounts, computes a centered window position,
+  and cleans up on app death (reap hook).
+- Per-task input queues: keyboard goes to the focused task, mouse is
+  COPIED to the compositor (cursor) AND the focused app - each drains its
+  own queue, no event consumed twice (SPSC rings, lock-protected).
+- `userland/settings.c` is the first real app: a windowed cursor-theme
+  chooser with previews of every theme, click or 1-9 to select, Esc/X to
+  close; it writes cursor.conf and the compositor applies the change.
+- The dock now contains ONLY real things: **Settings** (launches the app,
+  refocuses if running) and **Trash** (shows "Trash is empty").  All fake
+  app icons (Files/Terminal/Browser/Launchpad) are gone.
+- Focus model: clicking a window focuses it; clicking the desktop drops
+  focus back to the compositor.
+
+### Also fixed in the kernel while wiring this up
+- `sys_sigaction` was fixed earlier; the input fanout now uses a
+  lock-protected SPSC ring per task (no push/pop race between the IRQ
+  producer and syscall consumers).
+
 ## 0.6.0-auditfix  (2026-08-03 - brutal-audit fix pass)
 
 This release fixes the concrete defects found by the external audit of the

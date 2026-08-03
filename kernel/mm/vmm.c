@@ -90,7 +90,13 @@ void vmm_set_flags_in(u64 *pml4, vaddr_t v, u64 flags) {
 }
 
 void vmm_unmap(vaddr_t v) {
-    u64 *pte = walk(cur_pml4(), v, false, 0);
+    vmm_unmap_in(cur_pml4(), v);
+}
+
+/* Unmap one page inside an explicit pml4 (used for window surfaces that
+ * are mapped into two address spaces at once). */
+void vmm_unmap_in(u64 *pml4, vaddr_t v) {
+    u64 *pte = walk(pml4, v, false, 0);
     if (!pte || !(*pte & PTE_PRESENT)) return;
     paddr_t phys = *pte & ~0xFFFULL & ~PTE_NX;
     *pte = 0;

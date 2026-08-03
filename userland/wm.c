@@ -36,6 +36,27 @@
 #include "sys.h"
 #include "gfx.h"
 #include "kora.h"
+#include "cursors.h"
+
+/* =================== real apps (window surfaces) =================== */
+#define WM_MAX_WIN 8
+typedef struct {
+    bool active;        /* the kernel still reports this surface          */
+    bool seen;          /* the kernel reported it this scan               */
+    u32  id;            /* kernel surface id                             */
+    u32  owner;         /* pid of the app                                */
+    int  x, y, w, h;    /* screen rect of the surface                     */
+    u64  va;            /* wm-side mapping of the surface (from scan)     */
+    bool dirty;
+} win_t;
+static win_t G_wins[WM_MAX_WIN];
+static int  G_app_pid;      /* pid of the launched real app (settings)   */
+static int  G_win_dirty;    /* any window needs recompositing            */
+
+/* =================== cursor themes =================== */
+static int  G_cur_theme;            /* 0 = classic procedural, 1.. photo */
+static char G_theme_name[24];       /* current theme name in config      */
+static long G_cfg_last_check;       /* ms of the last cursor.conf poll   */
 
 /* =================== theme =================== */
 #define C_PANEL_BG      ARGB(0xD2,0x14,0x16,0x1B)
@@ -66,13 +87,11 @@
 #define DOCK_PADX   14
 #define DOCK_SHADOW 16
 
-/* =================== dock items =================== */
+/* =================== dock items ===================
+ * NO FAKE APPS: only things that actually exist.  "Settings" launches the
+ * real ring-3 app (/bin/settings); "Trash" is a real concept (empty). */
 typedef struct { const char *name; int icon; } dock_item_t;
 static const dock_item_t G_dock[] = {
-    { "Files",      ICON_DOCK_FILES    },
-    { "Terminal",   ICON_DOCK_TERMINAL },
-    { "Browser",    ICON_DOCK_BROWSER  },
-    { "Launchpad",  ICON_DOCK_LAUNCHER },
     { "Settings",   ICON_DOCK_SETTINGS },
     { "Trash",      ICON_DOCK_TRASH    },
 };
@@ -101,6 +120,25 @@ static const int G_cursor_hoty[CUR_N] = {2,  3, 11, 2, 11, 11, 11};
 #define MAX_WS 9
 static int G_ws_count = 1;
 static int G_ws_active = 0;
+
+/* Pre-scaled dock icons at rest size (34px): while hovering/tweening we
+ * blit these instead of per-pixel scaling the 48px atlas icons every
+ * frame - the single biggest per-frame cost on TCG. */
+static surface_t G_icon_cache[DOCK_N];
+static int       G_icon_cache_ok;
+
+static void build_icon_cache(void) {
+    for (int i=0;i<DOCK_N;i++) {
+        if (G_icon_cache[i].px) sf_free(&G_icon_cache[i]);
+        icon_t ico = icon_get(G_dock[i].icon);
+        if (!ico.px || !ico.w || !ico.h) continue;
+        G_icon_cache[i] = sf_alloc(ICON_SZ, ICON_SZ);
+        if (!G_icon_cache[i].px) continue;
+        surface_t *c = &G_icon_cache[i];
+        sf_icon_scaled(c, ICON_SZ/2, ICON_SZ/2, ico, 0, ICON_SZ, 48);
+    }
+    G_icon_cache_ok = 1;
+}
 
 /* =================== animated tween state =================== */
 static int G_slot_size[DOCK_N];
@@ -175,6 +213,12 @@ static int abs_int(int x) { return x<0 ? -x : x; }
  * render them with a soft drop shadow for depth.
  * ================================================================ */
 static u32 G_cursor_buf[CUR_N][24*24] __attribute__((aligned(16)));
+/* Active cursor sprites: point either at the procedural buffers above or
+ * at photo-theme images (classic = procedural, photo themes = real
+ * raster art from the web).  `w/h` vary per sprite. */
+static surface_t G_cursor_spr[CUR_N];
+static int       G_cursor_hotx2[CUR_N];
+static int       G_cursor_hoty2[CUR_N];
 
 /* Inline alpha-blend helper for raw u32 buffers (used during cursor build).
  * Matches sf_putpx_blend's math exactly. c and d are ARGB-packed u32s. */
@@ -236,17 +280,71 @@ static void cursor_build_one(int id) {
 }
 static void cursor_build_all(void) {
     for (int i=0;i<CUR_N;i++) cursor_build_one(i);
+    /* default theme: classic procedural sprites */
+    for (int i=0;i<CUR_N;i++) {
+        G_cursor_spr[i].px = G_cursor_buf[i];
+        G_cursor_spr[i].w = 24; G_cursor_spr[i].h = 24;
+        G_cursor_spr[i].pitch = 24;
+        G_cursor_hotx2[i] = G_cursor_hotx[i];
+        G_cursor_hoty2[i] = G_cursor_hoty[i];
+    }
 }
+
+/* Switch the cursor theme: 0 = classic procedural; t >= 1 = photo theme
+ * (t-1 indexes the blob).  Photo themes replace the arrow + hand with the
+ * real raster art; all other cursor kinds keep the procedural sprites. */
+static void cursor_apply_theme(int t) {
+    int n = cursors_theme_count();
+    if (t < 0 || t > n) return;
+    G_cur_theme = t;
+    if (t == 0) {
+        for (int i=0;i<CUR_N;i++) {
+            G_cursor_spr[i].px = G_cursor_buf[i];
+            G_cursor_spr[i].w = 24; G_cursor_spr[i].h = 24;
+            G_cursor_spr[i].pitch = 24;
+            G_cursor_hotx2[i] = G_cursor_hotx[i];
+            G_cursor_hoty2[i] = G_cursor_hoty[i];
+        }
+        return;
+    }
+    cursor_theme_t *th = cursors_theme(t - 1);
+    if (!th) return;
+    /* map cursor kinds to photo kinds: ARROW, HAND (others keep procedural) */
+    int kind_of[CUR_N] = { CURSOR_KIND_ARROW, CURSOR_KIND_HAND,
+                           -1, -1, -1, -1, -1 };
+    for (int i=0;i<CUR_N;i++) {
+        if (kind_of[i] >= 0 && th->img[kind_of[i]].present) {
+            cursor_img_t *im = &th->img[kind_of[i]];
+            G_cursor_spr[i].px = (u32 *)im->px;
+            G_cursor_spr[i].w = im->w; G_cursor_spr[i].h = im->h;
+            G_cursor_spr[i].pitch = im->w;
+            G_cursor_hotx2[i] = im->hotx;
+            G_cursor_hoty2[i] = im->hoty;
+        } else {
+            G_cursor_spr[i].px = G_cursor_buf[i];
+            G_cursor_spr[i].w = 24; G_cursor_spr[i].h = 24;
+            G_cursor_spr[i].pitch = 24;
+            G_cursor_hotx2[i] = G_cursor_hotx[i];
+            G_cursor_hoty2[i] = G_cursor_hoty[i];
+        }
+    }
+}
+
 static void cursor_draw(surface_t *s, int id, int x, int y) {
     if (id<0||id>=CUR_N) id=0;
-    int x0=x-G_cursor_hotx[id], y0=y-G_cursor_hoty[id];
-    const u32 *sp = G_cursor_buf[id];
-    for (int j=0;j<24;j++) for (int i=0;i<24;i++) {
-        u32 c = sp[j*24+i];
-        if (!A(c)) continue;
-        int px=x0+i, py=y0+j;
-        if ((u32)px>=(u32)s->w || (u32)py>=(u32)s->h) continue;
-        sf_putpx_blend(s, px, py, c);
+    surface_t *sp = &G_cursor_spr[id];
+    if (!sp->px || sp->w <= 0 || sp->h <= 0) return;
+    int x0 = x - G_cursor_hotx2[id], y0 = y - G_cursor_hoty2[id];
+    for (int j=0;j<sp->h;j++) {
+        int py = y0+j;
+        if ((u32)py >= (u32)s->h) continue;
+        for (int i=0;i<sp->w;i++) {
+            u32 c = sp->px[j*sp->pitch+i];
+            if (!A(c)) continue;
+            int px = x0+i;
+            if ((u32)px >= (u32)s->w) continue;
+            sf_putpx_blend(s, px, py, c);
+        }
     }
 }
 
@@ -261,9 +359,28 @@ static void restore_rect(surface_t *fb, int x0, int y0, int w, int h) {
     if (w<=0||h<=0) return;
     sf_blit(fb, x0, y0, &G_wp, x0, y0, w, h);
 }
+static void draw_one_window(win_t *w);   /* defined later */
+
+/* Wallpaper-restore that re-blits any app window intersecting the rect
+ * (otherwise moving the cursor over a window would punch wallpaper holes
+ * through it). */
+static void restore_rect_win(surface_t *fb, int x0, int y0, int w, int h) {
+    restore_rect(fb, x0, y0, w, h);
+    for (int i=0;i<WM_MAX_WIN;i++) {
+        win_t *win = &G_wins[i];
+        if (!win->active || !win->va) continue;
+        int ty = win->y - 24;
+        if (ty < PANEL_H) ty = PANEL_H;
+        if (x0 < win->x + win->w && x0 + w > win->x &&
+            y0 < ty + 24 + win->h && y0 + h > ty)
+            draw_one_window(win);
+    }
+}
+
 static void restore_cursor(surface_t *fb) {
     if (G_last_cx < 0) return;
-    restore_rect(fb, G_last_cx-12, G_last_cy-12, 36, 36);
+    /* 44x44 covers both the 24px procedural and the 32px photo cursors */
+    restore_rect_win(fb, G_last_cx-14, G_last_cy-14, 44, 44);
 }
 static void restore_tooltip(surface_t *fb) {
     if (!G_tooltip_dirty) return;
@@ -534,10 +651,16 @@ static void draw_dock_content(surface_t *s, long now_ms, int pressed) {
                             pressed ? C_PRESS : C_HOVER);
     }
 
-    /* Icons */
+    /* Icons: rest size -> cached sprite blit; magnified -> per-pixel
+     * scale (only the hovered icon ever magnifies) */
     for (int i=0;i<DOCK_N;i++) {
         int cx=slot_pos[i], cy=G_dock_y+G_dock_h/2-1-G_slot_lift[i];
         int sc=G_slot_size[i];
+        if (sc == ICON_SZ && G_icon_cache_ok && G_icon_cache[i].px) {
+            sf_blit(s, cx-ICON_SZ/2, cy-ICON_SZ/2, &G_icon_cache[i],
+                    0, 0, ICON_SZ, ICON_SZ);
+            continue;
+        }
         icon_t ico = icon_get(G_dock[i].icon);
         if (!ico.px) continue;
         sf_icon_scaled(s, cx, cy, ico, 0, sc, ICON_SZ);
@@ -574,6 +697,15 @@ static void draw_osd(surface_t *s, long now) {
  * Cursor selection per region
  * ================================================================ */
 static int cursor_pick(int x, int y) {
+    /* App window title bars -> hand */
+    for (int i=0;i<WM_MAX_WIN;i++) {
+        win_t *w = &G_wins[i];
+        if (!w->active) continue;
+        int ty = w->y - 24;
+        if (ty < PANEL_H) ty = PANEL_H;
+        if (x >= w->x && x < w->x + w->w && y >= ty && y < ty + 24)
+            return CUR_HAND;
+    }
     /* Panel tray icons -> hand */
     for (int i=0;i<G_tray_n;i++) {
         if (x>=G_tray[i].x0 && x<G_tray[i].x1 && y>=G_tray[i].y0 && y<G_tray[i].y1)
@@ -598,8 +730,47 @@ static int cursor_pick(int x, int y) {
 /* ================================================================
  * Click handling
  * ================================================================ */
+static void launch_settings(void);   /* defined below */
 static void handle_click(int x, int y, int button) {
     if (button != 1) return;
+    /* App windows: title bar (close / refocus) and surface (focus).  A
+     * click anywhere else drops the input focus back to the wm. */
+    for (int i=0;i<WM_MAX_WIN;i++) {
+        win_t *w = &G_wins[i];
+        if (!w->active) continue;
+        int ty = w->y - 24;
+        if (ty < PANEL_H) ty = PANEL_H;
+        if (x >= w->x && x < w->x + w->w) {
+            if (y >= ty && y < ty + 24) {
+                /* title bar: close button or focus */
+                int cx = w->x + w->w - 18, cy = ty + 12;
+                if ((x-cx)*(x-cx) + (y-cy)*(y-cy) <= 81) {
+                    wm_destroy(w->id);          /* app closes itself too */
+                    klog("wm: close button clicked\n");
+                } else {
+                    wm_focus(w->owner);
+                }
+                return;
+            }
+            if (y >= ty + 24 && y < ty + 24 + w->h) {
+                wm_focus(w->owner);
+                return;
+            }
+        }
+    }
+    /* clicking outside any window releases input focus */
+    {
+        bool inside = false;
+        for (int i=0;i<WM_MAX_WIN;i++) {
+            win_t *w = &G_wins[i];
+            if (!w->active) continue;
+            int ty = w->y - 24;
+            if (ty < PANEL_H) ty = PANEL_H;
+            if (x >= w->x && x < w->x + w->w &&
+                y >= ty && y < ty + 24 + w->h) { inside = true; break; }
+        }
+        if (!inside) wm_focus(0);
+    }
     /* Tray */
     for (int i=0;i<G_tray_n;i++) {
         if (x>=G_tray[i].x0 && x<G_tray[i].x1 && y>=G_tray[i].y0 && y<G_tray[i].y1) {
@@ -626,7 +797,7 @@ static void handle_click(int x, int y, int button) {
             if ((x-cx)*(x-cx)+(y-cy)*(y-cy) <= 16) { G_ws_active=i; G_panel_dirty=1; return; }
         }
     }
-    /* Dock icon click: springy bounce (visual feedback). */
+    /* Dock icon click: launch the real app / act on the concept. */
     if (y >= G_dock_y-4 && y <= G_dock_y+G_dock_h) {
         int start_x = G_dock_x + G_dock_w/2 - (DOCK_N-1)*DOCK_MW/2;
         for (int i=0;i<DOCK_N;i++) {
@@ -635,6 +806,16 @@ static void handle_click(int x, int y, int button) {
                 G_slot_bounce[i] = 16;   /* initial upward velocity */
                 G_slot_bounce_t0[i] = time_ms();
                 G_dock_dirty = 1;
+                if (i == 0) {
+                    launch_settings();           /* the REAL app */
+                } else {
+                    /* Trash: a real concept, currently always empty */
+                    const char *msg = "Trash is empty";
+                    int k=0; const char *p=msg;
+                    while (*p && k<(int)sizeof(G_osd_text)-1) G_osd_text[k++]=*p++;
+                    G_osd_text[k]=0;
+                    G_osd_t0 = time_ms();
+                }
                 return;
             }
         }
@@ -642,8 +823,185 @@ static void handle_click(int x, int y, int button) {
 }
 
 /* ================================================================
+ * Real apps: window surfaces (composited by this wm)
+ * ================================================================ */
+static win_t *win_find(u32 id) {
+    for (int i=0;i<WM_MAX_WIN;i++)
+        if (G_wins[i].active && G_wins[i].id == id) return &G_wins[i];
+    return NULL;
+}
+static win_t *win_alloc(void) {
+    for (int i=0;i<WM_MAX_WIN;i++)
+        if (!G_wins[i].active) return &G_wins[i];
+    return NULL;
+}
+
+/* Ask the kernel for the current surfaces; track + focus new ones. */
+static void wm_scan_windows(void) {
+    wm_surf_info_t arr[WM_MAX_WIN];
+    int n = (int)wm_scan(arr, WM_MAX_WIN);
+    if (n < 0) return;
+    /* mark all as unseen this pass */
+    for (int i=0;i<WM_MAX_WIN;i++) G_wins[i].seen = false;
+    for (int i=0;i<n;i++) {
+        wm_surf_info_t *si = &arr[i];
+        win_t *w = win_find(si->id);
+        if (!w) {
+            w = win_alloc();
+            if (!w) continue;
+            w->active = true; w->id = si->id;
+            w->owner = si->owner_pid;
+            w->dirty = true;
+            G_win_dirty = 1;
+            /* new window: give it input focus */
+            wm_focus(si->owner_pid);
+            if (G_app_pid == 0) G_app_pid = (int)si->owner_pid;
+            klog("wm: new app window (surface ");
+            { char b[8]; itoa0((int)si->id,b,0); klog(b); }
+            klog(") pid ");
+            { char b[8]; itoa0((int)si->owner_pid,b,0); klog(b); klog("\n"); }
+        }
+        w->seen = true;
+        w->x = (int)si->win_x; w->y = (int)si->win_y;
+        w->w = (int)si->w;     w->h = (int)si->h;
+        w->va = si->app_va;                 /* wm-side mapping           */
+        if (si->dirty) { w->dirty = true; G_win_dirty = 1; }
+    }
+    /* windows that vanished: the app exited - clear state */
+    for (int i=0;i<WM_MAX_WIN;i++) {
+        if (G_wins[i].active && !G_wins[i].seen) {
+            if (G_app_pid == (int)G_wins[i].owner) G_app_pid = 0;
+            G_wins[i].active = false;
+            G_wins[i].dirty = false;
+            G_win_dirty = 1;
+            G_full_repaint = 1;      /* scrub its old pixels */
+        }
+    }
+}
+
+static void draw_one_window(win_t *w);   /* defined below */
+
+/* Draw every window that needs it (called from the paint path). */
+static void draw_windows(void) {
+    if (!G_win_dirty && !G_full_repaint) return;
+    int drew = 0;
+    for (int i=0;i<WM_MAX_WIN;i++) {
+        if (!G_wins[i].active) continue;
+        if (!G_wins[i].dirty && !G_full_repaint) continue;
+        draw_one_window(&G_wins[i]);
+        drew++;
+    }
+    if (drew) G_win_dirty = 0;
+}
+
+/* Dock click on Settings: launch /bin/settings if it isn't running, else
+ * refocus it.  fork() + exec() - the child becomes the app. */
+static void launch_settings(void) {
+    if (G_app_pid != 0) {
+        if (wm_focus((unsigned)G_app_pid) != 0) {
+            /* the app died but we hadn't noticed: relaunch */
+            G_app_pid = 0;
+        } else {
+            return;
+        }
+    }
+    long pid = fork();
+    if (pid == 0) {
+        char *argv[] = { "/bin/settings", 0 };
+        char *envp[] = { "HOME=/home/yart", 0 };
+        long r = exec("/bin/settings", argv, envp);
+        (void)r;
+        klog("wm: exec /bin/settings failed\n");
+        exit(1);
+    } else if (pid > 0) {
+        G_app_pid = (int)pid;
+        klog("wm: launched settings (pid ");
+        { char b[8]; itoa0((int)pid,b,0); klog(b); }
+        klog(")\n");
+    }
+}
+
+/* Poll /home/yart/cursor.conf once a second; the Settings app writes it
+ * when the user picks a cursor theme. */
+static void poll_cursor_config(long now_ms) {
+    if (now_ms - G_cfg_last_check < 1000) return;
+    G_cfg_last_check = now_ms;
+    int fd = open("/home/yart/cursor.conf", 0);          /* O_RDONLY */
+    if (fd < 0) return;
+    char buf[96];
+    long n = read(fd, buf, (long)sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return;
+    buf[n] = 0;
+    /* parse "theme=NAME" */
+    char *p = buf;
+    while (*p) {
+        if (p[0]=='t' && p[1]=='h' && p[2]=='e' && p[3]=='m' && p[4]=='e' && p[5]=='=') {
+            char name[24];
+            int i = 0;
+            p += 6;
+            while (*p && *p!='\n' && *p!='\r' && i<23) name[i++] = *p++;
+            name[i] = 0;
+            if (strcmp(name, G_theme_name) != 0) {
+                int t = 0;
+                if (strcmp(name, "classic") != 0) {
+                    int idx = cursors_theme_by_name(name);
+                    t = (idx >= 0) ? idx + 1 : 0;
+                }
+                cursor_apply_theme(t);
+                strncpy(G_theme_name, name, sizeof G_theme_name - 1);
+                G_last_cursor = -1;          /* force a repaint of the cursor */
+                klog("wm: cursor theme -> ");
+                klog(G_theme_name);
+                klog("\n");
+            }
+            return;
+        }
+        p++;
+    }
+}
+
+/* ================================================================
  * Input
  * ================================================================ */
+static void draw_one_window(win_t *w) {
+    int ty = w->y - 24;                 /* title bar above the surface  */
+    if (ty < PANEL_H) ty = PANEL_H;
+    int x0 = w->x - 6, y0 = ty - 6;
+    int x1 = w->x + w->w + 6, y1 = w->y + w->h + 6;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > G_fb.w) x1 = G_fb.w;
+    if (y1 > G_fb.h) y1 = G_fb.h;
+    /* restore the wallpaper under the window first */
+    sf_blit(&G_fb, x0, y0, &G_wp, x0, y0, x1-x0, y1-y0);
+
+    /* drop shadow */
+    sf_round_rect_blend(&G_fb, w->x-3, ty-3, w->w+6, w->h+ty-w->y+6, 10,
+                        ARGB(90,0,0,0));
+    sf_round_rect_blend(&G_fb, w->x-2, ty-2, w->w+4, w->h+ty-w->y+4, 10,
+                        ARGB(50,0,0,0));
+    /* title bar */
+    sf_round_rect(&G_fb, w->x, ty, w->w, 24, 8, RGB(0x1E,0x21,0x28));
+    sf_fill_rect(&G_fb, w->x, ty+10, w->w, 14, RGB(0x1E,0x21,0x28));
+    sf_text(&G_fb, w->x+10, ty+5, "Settings", RGB(0xEC,0xEE,0xF1));
+    /* close button (right) */
+    int cx = w->x + w->w - 18, cy = ty + 12;
+    sf_round_rect(&G_fb, cx-9, cy-9, 18, 18, 9, RGB(0x3A,0x3E,0x46));
+    sf_hline(&G_fb, cx-4, cy, 8, RGB(0xEC,0xEE,0xF1));
+    sf_vline(&G_fb, cx, cy-4, 8, RGB(0xEC,0xEE,0xF1));
+    /* body */
+    sf_fill_rect(&G_fb, w->x, ty+24, w->w, w->h, RGB(0x14,0x16,0x1B));
+    /* app content: the surface is mapped into OUR address space (the
+     * scan returned the wm-side VA) */
+    surface_t src;
+    src.px = (u32 *)w->va;
+    src.w = w->w; src.h = w->h; src.pitch = w->w;
+    if (src.px)
+        sf_blit(&G_fb, w->x, ty+24, &src, 0, 0, w->w, w->h);
+    w->dirty = false;
+}
+
 static void poll_input(void) {
     int ev;
     while ((ev = poll_key()) != 0) {
@@ -712,7 +1070,9 @@ void wm_run(void) {
     G_cx=G_fb.w/2; G_cy=G_fb.h/2;
 
     assets_init();
+    cursors_init();                 /* photo cursor themes (from the web) */
     cursor_build_all();
+    strncpy(G_theme_name, "classic", sizeof G_theme_name - 1);
     for (int i=0;i<DOCK_N;i++) {
         G_slot_size[i]=ICON_SZ; G_slot_lift[i]=0;
         G_slot_target_sz[i]=ICON_SZ; G_slot_target_lift[i]=0;
@@ -726,6 +1086,7 @@ void wm_run(void) {
     sf_blit(&G_fb,0,0,&G_wp,0,0,G_fb.w,G_fb.h);
     (void)n_wp;
 
+    build_icon_cache();
     build_panel_sprite();
     build_dock_sprite();
     G_panel_dirty = 1; G_dock_dirty = 1;
@@ -737,12 +1098,14 @@ void wm_run(void) {
     klog("wm: ring-3 compositor up [cached chrome, single-icon tween, cursors, tray clicks]\n");
 
     unsigned long frames=0;
-    long fps_start=G_start_ms, last_frame=0;
+    long fps_start=G_start_ms;
     for (;;) {
         poll_input();
         update_status();
         long now = time_ms();
         long uptime = now - G_start_ms;
+        poll_cursor_config(now);        /* pick up Settings changes ~1s */
+        wm_scan_windows();              /* new app windows -> focus+draw */
 
         unsigned long s = (unsigned long)(uptime/1000);
         if (s != G_last_clock_s) {
@@ -775,7 +1138,7 @@ void wm_run(void) {
         int tooltip_anim = (G_tooltip_item>=0) &&
             (dt < (long)(TOOLTIP_DELAY_MS+TOOLTIP_FADE_MS));
 
-        int need_paint = G_panel_dirty || G_dock_dirty || cursor_moved || tweening || tooltip_anim || G_full_repaint || osd_visible || osd_just_gone;
+        int need_paint = G_panel_dirty || G_dock_dirty || cursor_moved || tweening || tooltip_anim || G_full_repaint || osd_visible || osd_just_gone || G_win_dirty;
         if (osd_just_gone) {
             /* Clear the OSD area back to wallpaper so it doesn't linger. */
             int tw = sf_text_width(G_osd_text);
@@ -783,7 +1146,7 @@ void wm_run(void) {
             int x = G_fb.w/2 - w/2;
             int y = G_fb.h - DOCK_H - DOCK_MARGIN - h - 30;
             if (y < PANEL_H+10) y = PANEL_H+10;
-            sf_blit(&G_fb, x-6, y-6, &G_wp, x-6, y-6, w+12, h+12);
+            restore_rect_win(&G_fb, x-6, y-6, w+12, h+12);
         }
         if (need_paint) {
             if (G_full_repaint) {
@@ -807,6 +1170,8 @@ void wm_run(void) {
             /* 3. Dynamic content */
             draw_panel_content(&G_fb, now);
             draw_dock_content(&G_fb, now, pressed);
+            /* 4. App windows (title bars + surfaces) */
+            draw_windows();
             if (osd_visible) {
                 /* Wallpaper+chrome already painted under it; draw OSD on top.
                  * We also need to have restored the OSD area from wallpaper,
@@ -820,8 +1185,8 @@ void wm_run(void) {
                 int x = G_fb.w/2 - w/2;
                 int y = G_fb.h - DOCK_H - DOCK_MARGIN - h - 30;
                 if (y < PANEL_H+10) y = PANEL_H+10;
-                /* Blit a slightly-larger rect from wallpaper to clear prior frame */
-                sf_blit(&G_fb, x-4, y-4, &G_wp, x-4, y-4, w+8, h+8);
+                /* Clear prior frame (wallpaper + any window underneath) */
+                restore_rect_win(&G_fb, x-4, y-4, w+8, h+8);
                 /* Re-blit any dock shadow that overlaps that area (none at 30px above dock) */
                 draw_osd(&G_fb, now);
             }
@@ -841,13 +1206,17 @@ void wm_run(void) {
             frames=0; fps_start=now;
         }
 
-        /* --- 60Hz pacing with mid-slice input poll --- */
-        long target = last_frame + 16;
-        int spun = 0;
-        int got_input = 0;
-        while (time_ms() < target && !got_input) {
+        /* --- pacing: bounded yields, mid-slice input poll ---
+         * THE FREEZE FIX: the old loop spun on `time_ms() < target` with
+         * yield() inside; every yield parks us until the next timer tick,
+         * so a slow/stopped tick made the loop never converge (and mouse
+         * movement made it exit WITHOUT yielding, monopolizing the CPU).
+         * Now we yield a FIXED 2 times per frame (~50 fps max on a
+         * 100 Hz tick) and poll the mouse in the slices - the frame
+         * ALWAYS completes and the compositor ALWAYS gives the CPU back,
+         * no matter what the clock does. */
+        for (int slice = 0; slice < 2; slice++) {
             yield();
-            spun++;
             mouse_ev_t me;
             while (poll_mouse(&me)) {
                 G_cx+=me.dx; G_cy+=me.dy;
@@ -861,10 +1230,7 @@ void wm_run(void) {
                 if ((G_mb & 2) && !(prev & 2)) handle_click(G_cx,G_cy,3);
                 if ((G_mb & 4) && !(prev & 4)) handle_click(G_cx,G_cy,2);
                 G_dock_dirty=1;
-                got_input=1;
             }
-            if (spun > 20000) break;  /* safety: never spin forever */
         }
-        last_frame = time_ms();
     }
 }

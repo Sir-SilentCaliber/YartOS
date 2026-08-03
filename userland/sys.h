@@ -22,6 +22,10 @@ typedef signed char    i8;
 typedef signed short   i16;
 typedef signed int     i32;
 typedef signed long    i64;
+typedef unsigned char  bool;
+#define true 1
+#define false 0
+#define NULL ((void *)0)
 
 enum {
     SYS_EXIT     = 0,
@@ -70,6 +74,11 @@ enum {
     SYS_TIME_MS  = 43,
     SYS_SLEEP    = 44,
     SYS_EXEC     = 45,
+    SYS_WM_CREATE = 46,
+    SYS_WM_FLIP   = 47,
+    SYS_WM_SCAN   = 48,
+    SYS_WM_FOCUS  = 49,
+    SYS_WM_DESTROY = 50,
 };
 
 #define O_RDONLY 0x0
@@ -145,6 +154,16 @@ static inline long acl(const char *p, long uid, long mask) { return _sc(SYS_ACL,
 static inline void exit(int n) { _sc(SYS_EXIT, n, 0, 0); for(;;); }
 
 static inline size_t strlen(const char *s) { size_t n=0; while(s[n]) n++; return n; }
+static inline int strcmp(const char *a, const char *b) {
+    while (*a && *a == *b) { a++; b++; }
+    return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+static inline char *strncpy(char *d, const char *s, size_t n) {
+    size_t i = 0;
+    while (s[i] && i < n) { d[i] = s[i]; i++; }
+    while (i < n) d[i++] = 0;
+    return d;
+}
 static inline int puts(const char *s) { klog(s); return 0; }
 static inline void *memcpy(void *dst, const void *src, size_t n) {
     unsigned char *d=dst; const unsigned char *s=src;
@@ -172,5 +191,23 @@ static inline long sleep(long ms)   { return _sc(SYS_SLEEP, ms, 0, 0); }
 static inline long exec(const char *path, char *const argv[], char *const envp[]) {
     return _sc(SYS_EXEC, (long)path, (long)argv, (long)envp);
 }
+
+/* --- window surfaces (real ring-3 apps) --- */
+typedef struct {
+    unsigned id, w, h;
+    unsigned win_x, win_y;
+    unsigned long long app_va;   /* mapped canvas (side depends on call) */
+    unsigned owner_pid;
+    unsigned dirty;
+} wm_surf_info_t;
+static inline long wm_create(unsigned w, unsigned h, wm_surf_info_t *o) {
+    return _sc(SYS_WM_CREATE, w, h, (long)o);
+}
+static inline long wm_flip(unsigned id) { return _sc(SYS_WM_FLIP, id, 0, 0); }
+static inline long wm_scan(wm_surf_info_t *o, unsigned max) {
+    return _sc(SYS_WM_SCAN, (long)o, max, 0);
+}
+static inline long wm_focus(unsigned pid) { return _sc(SYS_WM_FOCUS, pid, 0, 0); }
+static inline long wm_destroy(unsigned id) { return _sc(SYS_WM_DESTROY, id, 0, 0); }
 
 #endif

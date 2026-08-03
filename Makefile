@@ -26,6 +26,8 @@ KORA_BIN := build/kora.bin
 KORA_H   := build/kora.h
 WP_BIN   := build/wallpaper.bin
 WP_PNG   := $(WP_DIR)/default.png
+CUR_BIN  := build/cursors.bin
+CUR_H    := build/cursor_assets.h
 # Asset layout: /YartOS/kora/ is the canonical location for shipped assets.
 # /etc is reserved for user-editable config (yart.conf, motd).
 BMP_WALL := initrd_root/YartOS/kora/wallpaper.bmp
@@ -42,7 +44,7 @@ CFLAGS := -std=gnu11 -ffreestanding -fno-stack-protector -fno-stack-check       
           -mcmodel=kernel -O2 -g -Wall -Wextra -Wno-unused-parameter             \
           -Wno-unused-function -Wno-address-of-packed-member                     \
           -Ikernel/include -MMD -MP                                              \
-          -DYART_VERSION='"0.5.0-quartz"'
+          -DYART_VERSION='"0.7.0-apps"'
 
 LDFLAGS := -nostdlib -static -m elf_x86_64 -z max-page-size=0x1000 \
            -T kernel/linker.ld
@@ -80,9 +82,9 @@ ifneq ($(PIL_OK),OK)
 endif
 
 .PHONY: all iso run clean distclean limine assets
-all: $(KERNEL) $(USER_ELF)
+all: $(KERNEL) $(USER_ELF) build/settings.elf
 
-assets: $(KORA_BIN) $(KORA_H) $(WP_BIN)
+assets: $(KORA_BIN) $(KORA_H) $(WP_BIN) $(CUR_BIN) $(CUR_H)
 
 # ---- Icon pack (Kora SVGs -> RGBA atlas) ----
 $(KORA_BIN) $(KORA_H): scripts/gen_assets.py
@@ -103,6 +105,13 @@ $(WP_BIN): scripts/gen_wallpaper_pack.py
 
 $(WP_PNG): $(WP_BIN)
 	@: default.png is produced as a side-effect of the pack step above
+
+# ---- Photo cursor themes (real raster art from kora/cursors/) ----
+$(CUR_BIN) $(CUR_H): scripts/gen_cursors.py $(wildcard kora/cursors/*.png)
+	@mkdir -p build
+	@chmod +x scripts/gen_cursors.py 2>/dev/null || true
+	python3 scripts/gen_cursors.py
+	@test -s $(CUR_BIN) || { echo "ERROR: cursors.bin missing after cursor build."; exit 1; }
 
 $(BMP_WALL): scripts/gen_wallpaper_bmp.py $(WP_PNG)
 	@mkdir -p initrd_root/YartOS/kora
@@ -128,7 +137,7 @@ build/start.o: userland/start.c userland/sys.h
 build/init.o: userland/init.c userland/sys.h userland/wm.c userland/gfx.h $(KORA_H)
 	@mkdir -p build
 	$(CC) $(UCFLAGS) -c userland/init.c -o build/init.o
-build/wm.o: userland/wm.c userland/sys.h userland/gfx.h $(KORA_H) assets
+build/wm.o: userland/wm.c userland/sys.h userland/gfx.h userland/cursors.h $(KORA_H) $(CUR_H) assets
 	@mkdir -p build
 	$(CC) $(UCFLAGS) -c userland/wm.c -o build/wm.o
 build/gfx.o: userland/gfx.c userland/gfx.h userland/sys.h $(KORA_H) assets
@@ -140,9 +149,12 @@ build/assets.o: $(KORA_BIN)
 build/wallpaper.o: $(WP_BIN)
 	@mkdir -p build
 	cd build && $(LD) -r -b binary -o wallpaper.o wallpaper.bin
+build/cursors.o: $(CUR_BIN)
+	@mkdir -p build
+	cd build && $(LD) -r -b binary -o cursors.o cursors.bin
 
-$(USER_ELF): build/start.o build/init.o build/wm.o build/gfx.o build/assets.o build/wallpaper.o userland/init.ld
-	$(LD) $(ULDFLAGS) build/start.o build/init.o build/wm.o build/gfx.o build/assets.o build/wallpaper.o -o $@
+$(USER_ELF): build/start.o build/init.o build/wm.o build/cursors_lib.o build/gfx.o build/assets.o build/wallpaper.o build/cursors.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/init.o build/wm.o build/cursors_lib.o build/gfx.o build/assets.o build/wallpaper.o build/cursors.o -o $@
 
 # ---- /bin/hello: the exec() demo binary ----
 build/hello.o: userland/hello.c userland/sys.h
@@ -152,6 +164,16 @@ build/hello.elf: build/start.o build/hello.o userland/init.ld
 	@mkdir -p build
 	$(LD) $(ULDFLAGS) build/start.o build/hello.o -o $@
 
+# ---- /bin/settings: the first real app (window surface + UI) ----
+build/settings.o: userland/settings.c userland/sys.h userland/gfx.h $(CUR_H)
+	@mkdir -p build
+	$(CC) $(UCFLAGS) -c userland/settings.c -o build/settings.o
+build/cursors_lib.o: userland/cursors.c userland/cursors.h $(CUR_H)
+	@mkdir -p build
+	$(CC) $(UCFLAGS) -c userland/cursors.c -o build/cursors_lib.o
+build/settings.elf: build/start.o build/settings.o build/cursors_lib.o build/gfx.o build/assets.o build/wallpaper.o build/cursors.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/settings.o build/cursors_lib.o build/gfx.o build/assets.o build/wallpaper.o build/cursors.o -o $@
+
 initrd_root/bin/init: $(USER_ELF)
 	@mkdir -p initrd_root/bin
 	cp $(USER_ELF) initrd_root/bin/init
@@ -159,6 +181,10 @@ initrd_root/bin/init: $(USER_ELF)
 initrd_root/bin/hello: build/hello.elf
 	@mkdir -p initrd_root/bin
 	cp build/hello.elf initrd_root/bin/hello
+
+initrd_root/bin/settings: build/settings.elf
+	@mkdir -p initrd_root/bin
+	cp build/settings.elf initrd_root/bin/settings
 
 initrd_root/etc/motd:
 	@mkdir -p initrd_root/etc
@@ -168,13 +194,19 @@ initrd_root/etc/yart.conf:
 	@mkdir -p initrd_root/etc
 	@printf "hostname=yart\ntheme=quartz\naccent=#5BA7DF\nborder=#5BA7DF\ncorner_radius=8\ndock.position=bottom\ndock.icon_size=34\ndock.spacing=44\nwallpaper.mode=image\nwallpaper.path=/YartOS/kora/wallpaper.bmp\nwallpaper.index=0\nfont.system=default\nfont.terminal=default\ndisplay.fps=60\ntime.format24=1\ncursor.size=24\n" > $@
 
+# Default cursor theme: the real photo cursor from the web (smooth raster
+# art), editable live from the Settings app.
+initrd_root/home/yart/cursor.conf:
+	@mkdir -p initrd_root/home/yart
+	@printf "theme=photo-white\n" > $@
+
 # ---- Limine (fetched on demand) ----
 $(LIMINE):
 	@chmod +x scripts/get-limine.sh 2>/dev/null || true
 	bash ./scripts/get-limine.sh
 
 # ---- Initrd ----
-build/initrd.tar: initrd_root/etc/motd initrd_root/etc/yart.conf $(BMP_WALL) initrd_root/bin/init initrd_root/bin/hello
+build/initrd.tar: initrd_root/etc/motd initrd_root/etc/yart.conf initrd_root/home/yart/cursor.conf $(BMP_WALL) initrd_root/bin/init initrd_root/bin/hello initrd_root/bin/settings
 	@mkdir -p build
 	cd initrd_root && tar --format=ustar -cf ../build/initrd.tar .
 
@@ -212,7 +244,8 @@ run-bios: $(ISO)
 
 clean:
 	rm -rf build $(ISO_ROOT) $(ISO) initrd_root/bin/init initrd_root/bin/hello \
-	           $(BMP_WALL) initrd_root/etc/motd initrd_root/etc/yart.conf \
+	           initrd_root/bin/settings $(BMP_WALL) initrd_root/etc/motd \
+	           initrd_root/etc/yart.conf initrd_root/home/yart/cursor.conf \
 	           initrd_root/YartOS
 distclean: clean
 	rm -rf $(LIMINE)

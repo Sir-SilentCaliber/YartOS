@@ -39,6 +39,7 @@
 #include <yart/spinlock.h>
 #include <yart/hal.h>
 #include <yart/watchdog.h>      /* watchdog_tick from the BSP timer */
+#include <yart/syscall.h>       /* wm_surface_owner_died */
 extern void lapic_send_ipi(u32 dest_apic, u8 vector);
 #define AP_WAKE_VEC 62
 
@@ -870,6 +871,7 @@ static void reap(task_t *t) {
         vmm_free_pml4(t->pml4);
     free_kstack(t->kstack_top);
     task_remove(t);
+    wm_surface_owner_died(t->pid);   /* free any window surfaces it owned */
     kprintf("sched: reaped task [%u] '%s'\n", t->pid, t->name);
     kfree(t);
 }

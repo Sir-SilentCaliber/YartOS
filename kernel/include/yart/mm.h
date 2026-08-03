@@ -51,6 +51,7 @@ void    pmm_oom_test_force(bool on);
 void   vmm_init(void);
 void   vmm_map(vaddr_t v, paddr_t p, u64 flags);
 void   vmm_unmap(vaddr_t v);
+void   vmm_unmap_in(u64 *pml4, vaddr_t v);   /* unmap in an explicit pml4 */
 paddr_t vmm_translate(vaddr_t v);
 void   vmm_invlpg(vaddr_t v);
 /* Re-set the flags of an already-mapped page (keeps the physical frame). */

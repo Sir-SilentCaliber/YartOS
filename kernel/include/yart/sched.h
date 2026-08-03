@@ -3,6 +3,7 @@
 #include <yart/fs.h>
 #include <yart/mm.h>
 #include <yart/hal.h>   /* cpu_regs_t */
+#include <yart/drivers.h> /* mouse_event_t (per-task input queues) */
 typedef struct task task_t;
 struct cpu_local_s;
 typedef struct cpu_local_s cpu_local_t;
@@ -10,6 +11,8 @@ typedef struct cpu_local_s cpu_local_t;
 #define TASK_NAME_LEN 16
 #define MAX_FD 32
 #define KSTACK_SIZE KB(16)
+#define TASK_KBDQ   64          /* per-task keyboard ring (input fanout) */
+#define TASK_MOUSEQ 16          /* per-task mouse ring                   */
 
 typedef struct {
     vnode_t *vn;
@@ -55,6 +58,13 @@ typedef struct task {
     vnode_t       *cwd;
     bool           waiting;        /* blocked on waitpid (reserved)      */
     u32            wait_pid;
+    /* Per-task input queues.  The kernel fanout (sys_input_kbd/mouse)
+     * pushes keyboard events to the focused task (or the wm) and mouse
+     * events to BOTH the wm (cursor movement) and the focused task. */
+    int            kbd_q[TASK_KBDQ];
+    volatile u32   kbd_qh, kbd_qt;
+    mouse_event_t  mouse_q[TASK_MOUSEQ];
+    volatile u32   m_qh, m_qt;
     user_region_t  regions[MAX_USER_REGIONS];   /* per-process demand map */
     int            region_count;
     /* SMP scheduling linkage.  `next` chains the GLOBAL all-tasks list

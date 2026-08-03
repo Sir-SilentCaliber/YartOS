@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """Render the wallpaper into a real 24-bit BMP that gets bundled into
-   /etc/wallpaper.bmp on the initrd. Uses a real Windows 11 wallpaper
-   from the windows-ui-assets repo instead of a procedural gradient."""
+   /etc/wallpaper.bmp on the initrd."""
 import os, sys, math
-from PIL import Image, ImageDraw, ImageFilter
+try:
+    from PIL import Image, ImageDraw, ImageFilter
+except ImportError:
+    sys.stderr.write("\nERROR: Pillow not found. Install with:\n  pip3 install Pillow\n  or: sudo apt install python3-pil\n\n")
+    sys.exit(1)
 
 W, H = 1280, 800
 
 BASE        = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+KORA_WALL   = os.path.join(BASE, "kora", "wallpapers", "default.png")
 WIN_WALL    = os.path.join(os.path.dirname(BASE), "windows-ui-assets", "Wallpapers", "Windows 11", "Desktop")
 
-# Try the Windows 11 "Bloom" wallpaper first, then others
+# Try our Kora wallpaper first, then Windows 11 "Bloom", then fallback
 candidates = [
+    KORA_WALL,
     os.path.join(WIN_WALL, "Windows", "img0.jpg"),
     os.path.join(WIN_WALL, "Sunrise", "img28.jpg"),
     os.path.join(WIN_WALL, "Glow", "img20.jpg"),

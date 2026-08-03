@@ -135,20 +135,17 @@ int klog_read(char *dst, int start, int max_lines) {
     return copied;
 }
 
+/* Legacy FB text cursor state — kept for future emergency kconsole; the ring-3
+ * compositor owns the screen during normal operation so kputc is serial-only. */
 static int tcx = 8, tcy = 8;
 static bool fb_ready = false;
+static void mark_fb_text_vars_used(void) { (void)tcx; (void)tcy; (void)fb_ready; }
 
 void kputc(char c) {
     serial_putc(c);
-    if (!fb_ready && g_fb.fb) fb_ready = true;
-    if (!fb_ready) return;
-    if (c == '\n') { tcx = 8; tcy += FONT_H; }
-    else if (c == '\r') { tcx = 8; }
-    else { draw_char(tcx, tcy, c, TH_TEXT, TH_DESKTOP_BOT); tcx += FONT_W; }
-    if (tcx + FONT_W >= (int)g_fb.width)  { tcx = 8; tcy += FONT_H; }
-    if (tcy + FONT_H >= (int)g_fb.height) {
-        fb_clear(TH_DESKTOP_BOT); tcx = 8; tcy = 8;
-    }
+    mark_fb_text_vars_used();
+    /* Framebuffer text output disabled: ring-3 compositor owns the screen. */
+    return;
 }
 
 void kputs(const char *s) {
@@ -181,12 +178,7 @@ NORETURN void kpanic(const char *fmt, ...) {
     serial_puts("\n");
 
     if (g_fb.fb) {
-        fb_clear(TH_DESKTOP_BOT);
-        draw_rect(0, 0, g_fb.width, 80, TH_PANEL);
-        draw_text(20, 24, "YART KERNEL PANIC", TH_ERR, 0);
-        draw_text(20, 100, buf, TH_TEXT, TH_DESKTOP_BOT);
-        draw_text(20, 130, "System halted. See serial log for trace.",
-                  TH_TEXT_DIM, TH_DESKTOP_BOT);
+        fb_clear(0xFF200000);
         fb_present();
     }
     for (;;) hlt();

@@ -1,10 +1,32 @@
+# Build outputs
 build/
-iso_root/
-limine/
-yart.iso
 *.o
 *.d
 *.elf
+*.iso
+*.img
+
+# Packaged bootloader (downloaded by `make limine` / scripts/get-limine.sh)
+limine/
+
+# Staged ISO root
+iso_root/
+
+# Packaged initrd (rebuilt by `make build/initrd.tar`)
+initrd_root/bin/
 initrd_root/etc/motd
 initrd_root/etc/yart.conf
+initrd_root/YartOS/kora/wallpaper.bmp
+!initrd_root/YartOS/kora/.gitkeep
+
+# Python / editor / OS cruft
+__pycache__/
+*.pyc
+*.swp
+*~
+.DS_Store
+
+# QEMU / debug
+*.log
+serial.out
 yart-disk.img

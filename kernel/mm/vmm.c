@@ -21,13 +21,14 @@
 #include <yart/blk.h>      /* disk-backed swap tier (virtio-blk)      */
 
 u64 g_hhdm_offset = 0;
+u32 g_cpu_features = 0;
 
 static u64 *kernel_pml4;        /* the bootloader's tables (kernel identity) */
 /* What CR3 points at right NOW on THIS CPU.  Per-CPU on SMP: the BSP and
  * every AP run different tasks with different page tables, so a single
  * global would be wrong for everyone but the last CPU to switch.
  * g_boot_pml4 is the fallback used before/without a per-CPU area. */
-static u64 *g_boot_pml4;
+u64 *g_boot_pml4;
 static ALWAYS_INLINE u64 *cur_pml4(void) {
     cpu_local_t *c = get_cpu_local();
     if (c && c->pml4_current) return c->pml4_current;
@@ -104,6 +105,28 @@ paddr_t vmm_translate_in(u64 *pml4, u64 va) {
 void vmm_map_in(u64 *pml4, u64 va, paddr_t p, u64 flags) {
     u64 *pte = walk(pml4, va, true, flags);
     *pte = (p & ~0xFFFULL) | flags | PTE_PRESENT;
+    /*
+     * Flush this VA from the TLB on the current CPU.
+     *
+     * Why this matters when we're mapping into a *different* pml4:
+     *  - If pml4 is currently loaded in CR3 (e.g. we're mid-syscall and
+     *    already switched to the target pml4), invlpg removes any stale
+     *    entry for this VA so the next access re-walks to the new PTE.
+     *  - If pml4 is NOT currently loaded (e.g. mapping fb pages into a
+     *    user task's pml4 from a kernel syscall), the PTE is in a tree
+     *    that CR3 doesn't point at right now; invlpg is a nop for the
+     *    currently-loaded tree, and the eventual CR3 write in switch_to()
+     *    does a full TLB flush for the target tree.
+     *  - Critically, if the top-level (PML4E) for this VA range was just
+     *    allocated by walk(), and the kernel pml4 had the same index *0*
+     *    (which it does - kernel pml4[0] is 0 for the unused low half),
+     *    the CPU's TLB might cache "PML4E[0] = not present" from a recent
+     *    kernel-side miss.  invlpg here ensures the next access under the
+     *    target pml4 re-walks the full 4-level table.  (On a full CR3
+     *    write the TLB is flushed anyway, so this is a belt-and-braces
+     *    guard for any future caller that does NOT switch CR3.)
+     */
+    invlpg(va);
 }
 
 u64 *vmm_kernel_pml4(void) { return kernel_pml4; }
@@ -784,4 +807,15 @@ bool vmm_selftest(void) {
     clac();
     kprintf("vmm: selftest %s\n", ok ? "PASS" : "FAIL");
     return ok;
+}
+
+void *mmio_map(paddr_t p, size_t n) {
+    vaddr_t start = (vaddr_t)phys_to_virt(p);
+    vaddr_t end   = start + n;
+    start &= ~(vaddr_t)0xFFF;
+    end   = (end + 0xFFF) & ~(vaddr_t)0xFFF;
+    for (vaddr_t v = start; v < end; v += 0x1000)
+        vmm_map(v, (paddr_t)(v - g_hhdm_offset),
+                PTE_PRESENT | PTE_RW | PTE_PCD | PTE_PWT | PTE_NX);
+    return (void *)((vaddr_t)phys_to_virt(p));
 }

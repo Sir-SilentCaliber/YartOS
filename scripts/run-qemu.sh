@@ -42,7 +42,7 @@ exec qemu-system-x86_64 \
   "${FW[@]}" \
   -cdrom "$ISO" \
   -drive "file=$DISK,format=raw,if=none,id=vda" \
-  -device virtio-blk-pci,drive=vda \   # modern virtio 1.0 + MSI-X
+  -device virtio-blk-pci,drive=vda \
   -boot d \
   -serial stdio \
   -vga std \

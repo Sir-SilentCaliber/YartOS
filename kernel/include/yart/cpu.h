@@ -42,9 +42,22 @@ static ALWAYS_INLINE void write_cr4(u64 v) {
 }
 
 /* Supervisor-Mode Access/Execution Prevention: stac() temporarily allows
- * kernel accesses to user pages (SMAP), clac() re-forbids them. */
-static ALWAYS_INLINE void stac(void) { __asm__ volatile("stac" ::: "cc", "memory"); }
-static ALWAYS_INLINE void clac(void) { __asm__ volatile("clac" ::: "cc", "memory"); }
+ * kernel accesses to user pages (SMAP), clac() re-forbids them.
+ *
+ * We use a runtime branch on g_have_smap so the kernel still boots on CPUs
+ * (like qemu64) that don't implement the SMAP extensions — executing `stac`
+ * on such a CPU #UDs.  On hardware / `-cpu host` the branch predicts hot. */
+extern u32 g_cpu_features;
+#define CPUFEAT_SMAP 2
+#define CPUFEAT_SMEP 1
+static ALWAYS_INLINE void stac(void) {
+    if (g_cpu_features & CPUFEAT_SMAP) __asm__ volatile("stac" ::: "cc", "memory");
+    else                              __asm__ volatile("" ::: "memory");
+}
+static ALWAYS_INLINE void clac(void) {
+    if (g_cpu_features & CPUFEAT_SMAP) __asm__ volatile("clac" ::: "cc", "memory");
+    else                              __asm__ volatile("" ::: "memory");
+}
 static ALWAYS_INLINE bool cpu_has_smep(void) {
     u32 a, b, c, d;
     cpuid_id(7, &a, &b, &c, &d);     /* leaf 7, subleaf 0 */
@@ -59,9 +72,10 @@ static ALWAYS_INLINE bool cpu_has_smap(void) {
 static ALWAYS_INLINE u32 smep_smap_enable(void) {
     u64 cr4 = read_cr4();
     u32 got = 0;
-    if (cpu_has_smep()) { cr4 |= (1ULL << 20); got |= 1; }
-    if (cpu_has_smap()) { cr4 |= (1ULL << 21); got |= 2; }
+    if (cpu_has_smep()) { cr4 |= (1ULL << 20); got |= CPUFEAT_SMEP; }
+    if (cpu_has_smap()) { cr4 |= (1ULL << 21); got |= CPUFEAT_SMAP; }
     write_cr4(cr4);
+    g_cpu_features = got;
     return got;   /* bit0 = SMEP, bit1 = SMAP */
 }
 
@@ -136,6 +150,8 @@ typedef struct cpu_local_s {
                                  belongs to the caller, so the entry stashes
                                  RSP here (memory, no register clobbered)
                                  before switching to the kernel stack. */
+    volatile u8 ap_yield_pending;   /* sched_yield() set: force immediate
+                                       reschedule via self-IPI */
 } cpu_local_t;
 
 /* The fast syscall/sysret assembly entry must touch two per-CPU slots by

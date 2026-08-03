@@ -15,6 +15,8 @@
  */
 #include "sys.h"
 
+void wm_run(void);
+
 static int my_atoi(const char *s) {
     int v = 0;
     while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s++; }
@@ -103,7 +105,7 @@ static void kill_demo(void) {
         for (;;) spin++;                /* never yields, never exits     */
     } else if (pid > 0) {
         /* give the child a moment to run, then kill it */
-        for (volatile long i = 0; i < 5000000L; i++) __asm__ volatile("pause");
+        for (volatile long i = 0; i < 200; i++) yield();
         if (kill(pid) == 0) klog("sig: parent killed the busy child (SIGKILL)\n");
         else                klog("sig: kill() failed\n");
         int status = 0;
@@ -147,9 +149,10 @@ static void smp_demo(void) {
                 while (*e) msg[i++] = *e++;
                 msg[i] = 0;
                 klog(msg);
-                /* busy work so all the cores really are busy at once */
-                for (volatile long spin = 0; spin < 9000000L; spin++)
+                /* short busy round so all the cores briefly run something */
+                for (volatile long spin = 0; spin < 2000000L; spin++)
                     __asm__ volatile("pause");
+                yield();
             }
             klog("smp-child: done, exiting\n");
             exit(0);
@@ -288,10 +291,10 @@ void _start(void) {
             int tries = 0;
             /* Bounded wait (the e1000's RX is gated by QEMU's 1s flush timer
              * after RCTL is written, so allow a few seconds). */
-            while (tries < 300 && !ip) {
+            while (tries < 100 && !ip) {
                 net_info(info);
                 ip = info[0];
-                if (!ip) { for (volatile long d = 0; d < 200000L; d++) __asm__ volatile("pause"); }
+                if (!ip) yield();
                 tries++;
             }
             if (!ip) {
@@ -319,15 +322,15 @@ void _start(void) {
                 int sent = 0;
                 for (int attempt = 0; attempt < 3 && !sent; attempt++) {
                     if (udp_send(gw, 7000, probe, 13) == 0) sent = 1;
-                    else { for (volatile long d = 0; d < 1000000L; d++) __asm__ volatile("pause"); }
+                    else { yield(); }
                 }
                 if (!sent) {
                     klog("net: UDP send FAILED\n");
                 } else {
                     char rbuf[64]; long n = 0;
-                    for (int wait = 0; wait < 60 && n == 0; wait++) {
+                    for (int wait = 0; wait < 20 && n == 0; wait++) {
                         n = udp_recv(rbuf, 64);
-                        if (!n) { for (volatile long d = 0; d < 1000000L; d++) __asm__ volatile("pause"); }
+                        if (!n) yield();
                     }
                     if (n == 13 && rbuf[0]=='Y' && rbuf[1]=='A' && rbuf[2]=='R' && rbuf[3]=='T') {
                         klog("net: UDP round-trip OK - host echoed our probe back!\n");
@@ -456,12 +459,12 @@ void _start(void) {
             sigaction(15, 0);                 /* SIGTERM: default (die)   */
             /* instead, install a real handler: exit(7) via a label is not
              * possible; we use an unhandled SIGTERM -> dies with 128+15 */
-            for (volatile long i = 0; i < 3000000L; i++) __asm__ volatile("pause");
+            for (volatile long i = 0; i < 100; i++) yield();
             klog("sig2: child slept without signal (BUG)\n");
             exit(0);
         } else if (spid > 0) {
             /* parent: let it start, then SIGTERM it */
-            for (volatile long i = 0; i < 1000000L; i++) __asm__ volatile("pause");
+            for (volatile long i = 0; i < 30; i++) yield();
             if (raise(spid, 15) == 0) klog("sig2: parent raised SIGTERM\n");
             int status = 0;
             long r;
@@ -563,6 +566,19 @@ void _start(void) {
         klog("init: fork failed\n");
     }
 
-    klog("init: exiting cleanly\n");
+    klog("init: boot tests complete; entering ring-3 compositor loop\n");
+
+    /* =================================================================
+     * RING-3 COMPOSITOR (row 23)
+     *
+     * The kernel no longer owns the framebuffer.  We are a normal ring-3
+     * task with the compositor role (SYS_FB_INFO claimed us).  From here
+     * on we own the screen: we draw everything (wallpaper, status bar,
+     * dock, cursor) and flip to the real scanout via SYS_FB_FLIP.  The
+     * kernel only services drivers and scheduling.
+     * ================================================================= */
+    wm_run();
+
+    klog("wm: compositor exited (shouldn't happen)\n");
     exit(0);
 }

@@ -7,7 +7,6 @@
  */
 #include <yart/fs.h>
 #include <yart/blk.h>
-#include <yart/icons.h>
 #include <yart/mm.h>
 #include <yart/string.h>
 #include <yart/console.h>

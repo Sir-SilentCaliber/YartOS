@@ -25,6 +25,7 @@
 #include <yart/cpu.h>
 #include <yart/limine.h>
 #include <yart/sched.h>
+#include <yart/syscall.h>
 #include <yart/acpi.h>   /* g_madt.lapic_addr */
 #define IA32_APIC_BASE_MSR 0x1B
 #define AP_WAKE_VEC 62
@@ -81,6 +82,8 @@ static void limine_ap_entry(struct limine_smp_info *info) {
     wrmsr64(MSR_GS_BASE, (u64)c);         /* this AP's per-CPU area */
     ap_install_tss(cpu, c->ap_rsp0);      /* per-AP TSS: RSP0 = this AP's
                                              kernel stack + its own ISTs */
+    syscall_install_percpu();             /* EFER.SCE + STAR/LSTAR/SFMASK
+                                             for SYSCALL on this AP */
 
     /* per-AP APIC timer: this core now ticks on our vector 48 and can
      * preempt user tasks exactly like the BSP */

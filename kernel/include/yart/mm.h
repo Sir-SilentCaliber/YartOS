@@ -9,6 +9,13 @@ extern u64 g_hhdm_offset;
 static ALWAYS_INLINE void *phys_to_virt(paddr_t p) { return (void *)(p + g_hhdm_offset); }
 static ALWAYS_INLINE paddr_t virt_to_phys(void *v) { return (paddr_t)v - g_hhdm_offset; }
 
+/* MMIO mapping: ensure the physical region [p, p+n) is mapped into kernel
+ * virtual address space at phys_to_virt(p) with PCD (cache-disabled) so that
+ * device MMIO BARs above RAM (e.g. 64-bit BARs above 4 GiB, which Limine's
+ * HHDM doesn't pre-map) are accessible.  Safe to call on already-mapped
+ * ranges. */
+void *mmio_map(paddr_t p, size_t n);
+
 /* PMM - bitmap allocator + per-page refcounts */
 void    pmm_init(struct limine_memmap_response *mm);
 paddr_t pmm_alloc_page(void);

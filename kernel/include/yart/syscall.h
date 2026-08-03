@@ -44,6 +44,12 @@ enum {
     SYS_NET_INFO = 36,    /* read the assigned IP/gw/dns/mask (ring 3)            */
     SYS_UDP_SEND = 37,    /* send a UDP datagram                                   */
     SYS_UDP_RECV = 38,    /* poll a received UDP datagram                          */
+    /* --- ring-3 compositor / display server syscalls (row 23) --- */
+    SYS_FB_INFO  = 39,    /* query framebuffer geometry; mmap FB pages             */
+    SYS_FB_FLIP  = 40,    /* copy the user's rendered buffer to the real scanout   */
+    SYS_POLL_KEY = 41,    /* dequeue one keyboard event (0 = none)                 */
+    SYS_POLL_MOUSE = 42,  /* dequeue one mouse event (dx,dy,buttons,wheel)         */
+    SYS_TIME_MS  = 43,    /* monotonic millisecond uptime (for compositor fps)     */
     SYS_MAX
 };
 
@@ -71,4 +77,20 @@ typedef struct {
     u64  mtime;
 } yart_stat_t;
 
+/* Framebuffer info returned by SYS_FB_INFO.  After a successful call the
+ * caller's address space has `size` bytes mapped starting at `addr` (which
+ * is returned) as a 32bpp ARGB/RGBx back buffer that the compositor writes.
+ * The framebuffer is double-buffered: the ring-3 wm renders into its
+ * mmap'd region then calls SYS_FB_FLIP to blit it to the real scanout. */
+typedef struct {
+    u32 width, height, pitch, bpp, rgb;
+} fb_info_t;
+
+/* Mouse event returned by SYS_POLL_MOUSE. */
+typedef struct {
+    int dx, dy, wheel;
+    u8  buttons;   /* bit0=left, bit1=right, bit2=middle */
+} mouse_ev_t;
+
 void syscall_install(void);
+void syscall_install_percpu(void);   /* per-CPU MSR setup (BSP + each AP) */

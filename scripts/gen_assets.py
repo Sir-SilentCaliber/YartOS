@@ -1,436 +1,500 @@
 #!/usr/bin/env python3
+"""Render Kora KDE icon SVGs into a flat RGBA binary (build/kora.bin) and a C
+header (build/kora.h) with the icon enum.
+
+Source Kora SVGs live in  kora/icons/kora/{apps,actions,places,...}/
+Outputs go to            build/kora.bin  +  build/kora.h
 """
-Yart OS - generate real raster assets (icons, cursor, wallpaper) and emit
-them as C source files containing raw ARGB byte arrays.
+import io, os, struct, subprocess, sys
 
-Output:
-  kernel/gui/asset_icons.c      - icon ARGB tables (24x24 each)
-  kernel/gui/asset_cursor.c     - 12x18 cursor
-  kernel/gui/asset_wallpaper.c  - wallpaper tile
+# --- Dependency check ---
+try:
+    subprocess.check_output(["rsvg-convert", "--version"], stderr=subprocess.STDOUT)
+except (FileNotFoundError, subprocess.CalledProcessError):
+    sys.stderr.write(
+        "\nERROR: rsvg-convert not found.\n"
+        "Install librsvg2-bin first:\n"
+        "  Debian/Ubuntu:  sudo apt install librsvg2-bin python3-pil\n"
+        "  Arch:           sudo pacman -S librsvg python-pillow\n"
+        "  Fedora:         sudo dnf install librsvg2-tools python3-pillow\n"
+        "  macOS:          brew install librsvg python3 && pip3 install pillow\n\n"
+    )
+    sys.exit(1)
+try:
+    from PIL import Image
+except ImportError:
+    sys.stderr.write(
+        "\nERROR: Pillow (Python imaging) not found.\n"
+        "  pip3 install Pillow\n"
+        "  or install python3-pil via your package manager.\n\n"
+    )
+    sys.exit(1)
 
-Each pixel is one 32-bit ARGB value: alpha=0 means transparent.
-"""
-import os, sys, math
-from PIL import Image, ImageDraw, ImageFilter
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+KORA = os.path.join(ROOT, "kora", "icons", "kora")
+OUT_H  = os.path.join(ROOT, "build", "kora.h")
+OUT_BIN = os.path.join(ROOT, "build", "kora.bin")
+os.makedirs(os.path.dirname(OUT_H), exist_ok=True)
 
-# palette
-ACCENT     = (232, 168, 124, 255)
-ACCENT_DIM = (176, 122, 85,  255)
-PANEL      = (31,  36,  44,  255)
-PANEL_HI   = (39,  45,  55,  255)
-TEXT       = (230, 232, 238, 255)
-TEXT_DIM   = (139, 147, 160, 255)
-TEXT_MUT   = (90,  98,  110, 255)
-OK         = (143, 188, 143, 255)
-WARN       = (224, 192, 136, 255)
-ERR        = (204, 119, 119, 255)
-BLK        = (10,  12,  16,  255)
-DGREY      = (60,  66,  76,  255)
-BG_TOP     = (27,  31,  36,  255)
-BG_BOT     = (17,  20,  26,  255)
-DOT        = (44,  50,  62,  255)
+# Preferred sizes
+SZ_TRAY   = 22
+SZ_DOCK   = 48
+SZ_WIN    = 22
+SZ_APP    = 48
+SZ_CURSOR = 24
 
-ICON_W, ICON_H = 32, 32
+# Aliases: Kora ships some standard fdo icon names under different filenames.
+# Map our requested name -> (actual_filename, category_override_or_None)
+ALIASES = {
+    # Cursors: Kora is an icon theme, not a cursor theme. Draw all cursor sprites
+    # procedurally in a clean macOS/Adwaita-hybrid style so they look crisp at 24px.
+    "cursor-arrow":              ("__proc_arrow",            "__builtin__"),
+    "tool-pointer":              ("__proc_arrow",            "__builtin__"),
+    "default":                   ("__proc_arrow",            "__builtin__"),
+    "pointer":                   ("__proc_hand",             "__builtin__"),     # hand/link
+    "hand":                      ("__proc_hand",             "__builtin__"),
+    "hand1":                     ("__proc_hand",             "__builtin__"),
+    "hand2":                     ("__proc_hand",             "__builtin__"),
+    "text":                      ("__proc_ibeam",            "__builtin__"),     # text select
+    "xterm":                     ("__proc_ibeam",            "__builtin__"),
+    "wait":                      ("__proc_wait",             "__builtin__"),     # busy/hourglass
+    "watch":                     ("__proc_wait",             "__builtin__"),
+    "progress":                  ("__proc_wait",             "__builtin__"),     # arrow+watch
+    "not-allowed":               ("__proc_forbidden",        "__builtin__"),     # circle-slash
+    "forbidden":                 ("__proc_forbidden",        "__builtin__"),
+    "no-drop":                   ("__proc_forbidden",        "__builtin__"),
+    "col-resize":                ("__proc_hresize",          "__builtin__"),
+    "row-resize":                ("__proc_vresize",          "__builtin__"),
+    "ew-resize":                 ("__proc_hresize",          "__builtin__"),
+    "ns-resize":                 ("__proc_vresize",          "__builtin__"),
+    # Dialog buttons Kora doesn't ship by the standard names -- draw procedurally
+    "dialog-ok":                 ("__proc_checkmark",        "__builtin__"),
+    "dialog-apply":              ("__proc_checkmark",        "__builtin__"),
+    "dialog-cancel":             ("__proc_xmark",            "__builtin__"),
+    "dialog-close":              ("window-close",            None),
+    "dialog-information":        ("dialog-information",      "status"),
+    # Network tray
+    "network-wireless-connected-100": ("network-wireless-signal-excellent", None),
+    "network-offline":           ("network-disconnect",      None),
+    # Mic tray
+    "audio-input-microphone-high": ("microphone-sensitivity-high", None),
+    # Actions
+    "system-search":             ("search",                  "apps"),
+    # Devices
+    "display":                   ("video-display",           None),
+    "phone":                     ("smartphone",              None),
+    # Mimetypes where Kora only ships -symbolic or uses different names
+    "application-x-compressed":  ("application-archive",     None),
+    "package-x-generic":         ("application-archive",     None),
+    "text-x-generic":            ("text-x-generic",          None),
+    "application-x-executable":  ("application-x-executable",None),
+    "video-x-generic":           ("video-x-generic",         None),
+    "audio-x-generic":           ("audio-x-generic",         None),
+    "x-office-calendar":         ("x-office-calendar",       None),
+    "x-office-spreadsheet":      ("x-office-spreadsheet",    None),
+    "x-office-document":         ("x-office-document",       None),
+    "x-office-presentation":     ("x-office-presentation",   None),
+    # Settings
+    "preferences-desktop":       ("preferences-desktop",     None),
+}
 
-def new_icon():
-    return Image.new("RGBA", (ICON_W, ICON_H), (0,0,0,0))
+# Procedurally-drawn builtin icons (RGBA tuples) keyed by name
+def _builtin_checkmark(size):
+    """Green checkmark on transparent bg."""
+    from PIL import Image, ImageDraw
+    im = Image.new("RGBA", (size, size), (0,0,0,0))
+    d = ImageDraw.Draw(im)
+    pad = max(2, size//8)
+    # Check path: \/ shape
+    pts = [(pad, size//2), (size//3, size-pad-1), (size-pad, pad+1)]
+    d.line(pts, fill=(80,200,120,255), width=max(2,size//8))
+    return im.tobytes()
 
-def rrect(d, box, r, fill, outline=None, w=1):
-    d.rounded_rectangle(box, radius=r, fill=fill, outline=outline, width=w)
+def _builtin_xmark(size):
+    """Red X on transparent bg."""
+    from PIL import Image, ImageDraw
+    im = Image.new("RGBA", (size, size), (0,0,0,0))
+    d = ImageDraw.Draw(im)
+    pad = max(2, size//4)
+    w = max(2, size//8)
+    d.line([(pad,pad),(size-pad,size-pad)], fill=(230,80,80,255), width=w)
+    d.line([(size-pad,pad),(pad,size-pad)], fill=(230,80,80,255), width=w)
+    return im.tobytes()
 
-# ---------- icons ----------
-def icon_files():
-    img = new_icon(); d = ImageDraw.Draw(img)
-    # back folder
-    rrect(d, (3,9,24,28), 2, fill=ACCENT_DIM, outline=BLK, w=1)
-    # tab on top
-    d.polygon([(3,9),(11,5),(17,5),(17,9)], fill=ACCENT, outline=BLK)
-    # front folder (offset)
-    rrect(d, (7,12,28,29), 2, fill=ACCENT, outline=BLK, w=1)
-    rrect(d, (7,13,28,16), 1, fill=(255,210,170,255))
-    return img
+# --------------- Cursors (24px canvas; drawn with soft drop-shadow + 1px outline)
+def _shadow(d, pts, fill):
+    """Draw a soft 2px drop shadow by offsetting +1,+1,+2,+2 at low alpha."""
+    from PIL import ImageDraw as _D
+    for ox,oy,a in [(1,1,30),(2,2,20),(2,1,16),(1,2,16)]:
+        sh = [(x+ox, y+oy) for x,y in pts]
+        d.polygon(sh, fill=(0,0,0,a))
 
-def icon_terminal():
-    img = new_icon(); d = ImageDraw.Draw(img)
-    rrect(d, (3,5,28,27), 3, fill=BLK, outline=PANEL_HI, w=1)
-    rrect(d, (3,5,28,9), 3, fill=PANEL_HI)
-    # 3 dots
-    d.ellipse((6,6,8,8),  fill=ERR)
-    d.ellipse((10,6,12,8), fill=WARN)
-    d.ellipse((14,6,16,8), fill=OK)
-    # ">" prompt
-    d.line((7,14,11,17), fill=ACCENT, width=2)
-    d.line((7,20,11,17), fill=ACCENT, width=2)
-    # underscore
-    d.line((13,21,21,21), fill=ACCENT, width=2)
-    return img
+def _curs_outline(d, pts, width, outline):
+    d.line(pts + [pts[0]], fill=outline, width=width, joint="curve")
 
-def icon_editor():
-    img = new_icon(); d = ImageDraw.Draw(img)
-    # paper
-    rrect(d, (4,4,23,28), 1, fill=TEXT, outline=BLK, w=1)
-    # text lines
-    for y in (9, 13, 17, 21):
-        d.line((7, y, 20, y), fill=TEXT_MUT, width=1)
-    # pencil overlay (top right corner sticks out)
-    d.polygon([(17,21),(26,12),(29,15),(20,24)], fill=ACCENT, outline=BLK)
-    d.polygon([(17,21),(15,24),(20,24)], fill=BLK)
-    d.polygon([(26,12),(29,15),(28,11),(25,12)], fill=DGREY, outline=BLK)
-    return img
+def _builtin_arrow(size):
+    """White arrow pointer with soft shadow + dark outline (Adwaita/mac hybrid).
+    Hotspot = tip at (2,2) in 24px coords."""
+    from PIL import Image, ImageDraw
+    im = Image.new("RGBA", (size, size), (0,0,0,0))
+    d = ImageDraw.Draw(im)
+    k = size / 24.0
+    def pt(x,y): return (x*k, y*k)
+    # Classic Windows/mac arrow shape: tip top-left, stem down then right, flat tail.
+    # Points chosen to be pixel-snappy at 24px and look good at 5x upscale.
+    poly = [pt(2,2), pt(2,17), pt(6,13), pt(9,18), pt(11,17), pt(8,12), pt(14,12)]
+    _shadow(d, poly, (0,0,0))
+    d.polygon(poly, fill=(248,249,251,255))
+    _curs_outline(d, poly, max(1,int(round(1.2*k))), (24,28,36,230))
+    # Top-left inner highlight
+    hl = [pt(3,3), pt(3,15), pt(6,12)]
+    d.line(hl, fill=(255,255,255,55), width=max(1,int(k)), joint="curve")
+    return im.tobytes()
 
-def icon_clock():
-    img = new_icon(); d = ImageDraw.Draw(img)
-    d.ellipse((2,2,29,29), fill=PANEL_HI, outline=BLK, width=1)
-    d.ellipse((4,4,27,27), fill=PANEL, outline=None)
-    # ticks
-    for ang in range(0, 360, 30):
-        x = 15.5 + 11 * math.cos(math.radians(ang - 90))
-        y = 15.5 + 11 * math.sin(math.radians(ang - 90))
-        d.ellipse((x-1,y-1,x+1,y+1), fill=TEXT)
-    # hands
-    d.line((15.5,15.5, 15.5, 8), fill=TEXT, width=2)
-    d.line((15.5,15.5, 22, 18), fill=ACCENT, width=2)
-    d.ellipse((14,14,17,17), fill=ACCENT, outline=BLK)
-    return img
+def _builtin_hand(size):
+    """Pointing hand (link/hover). Hotspot at index fingertip ~(12,3)."""
+    from PIL import Image, ImageDraw
+    im = Image.new("RGBA", (size, size), (0,0,0,0))
+    d = ImageDraw.Draw(im)
+    k = size/24.0
+    def pt(x,y): return (x*k, y*k)
+    # Standard pointing-hand (link) cursor: index finger up, others curled, thumb in.
+    poly = [pt(11,3), pt(13,3), pt(13,10), pt(15,10), pt(15,7), pt(17,7),
+            pt(17,11), pt(19,11), pt(19,8), pt(21,8), pt(21,15),
+            pt(19,19), pt(15,21), pt(9,21), pt(5,17), pt(5,12),
+            pt(8,12), pt(8,15), pt(10,15), pt(10,9)]
+    _shadow(d, poly, (0,0,0))
+    d.polygon(poly, fill=(248,249,251,255))
+    _curs_outline(d, poly, max(1,int(round(1.2*k))), (24,28,36,230))
+    return im.tobytes()
 
-def icon_info():
-    img = new_icon(); d = ImageDraw.Draw(img)
-    d.ellipse((2,2,29,29), fill=ACCENT_DIM, outline=BLK, width=1)
-    d.ellipse((4,4,27,27), fill=ACCENT)
-    d.ellipse((13,7,17,11),  fill=BLK)
-    d.rectangle((13,13,17,24), fill=BLK)
-    return img
+def _builtin_ibeam(size):
+    """Text I-beam. Hotspot at center (~12,12)."""
+    from PIL import Image, ImageDraw
+    im = Image.new("RGBA", (size, size), (0,0,0,0))
+    d = ImageDraw.Draw(im)
+    k = size/24.0
+    w = max(1, int(round(1.5*k)))
+    col = (244,245,247,255)
+    out = (10,12,16,255)
+    cx = 12*k
+    # vertical stem
+    d.line([(cx,4*k),(cx,20*k)], fill=out, width=w+2)
+    d.line([(cx,4*k),(cx,20*k)], fill=col, width=w)
+    # top and bottom serifs
+    for yy in (4*k, 20*k):
+        d.line([(cx-4*k, yy),(cx+4*k, yy)], fill=out, width=w+2)
+        d.line([(cx-4*k, yy),(cx+4*k, yy)], fill=col, width=w)
+    return im.tobytes()
 
-def icon_folder():
-    img = new_icon(); d = ImageDraw.Draw(img)
-    d.polygon([(3,11),(11,7),(17,7),(17,11)], fill=ACCENT_DIM, outline=BLK)
-    rrect(d, (3,10,29,27), 3, fill=ACCENT, outline=BLK, w=1)
-    rrect(d, (3,11,29,15), 1, fill=(255,210,170,255))
-    return img
+def _builtin_wait(size):
+    """Busy: spinning ring / watch. Drawn as a static ring with a gap so
+    users see 'something is happening' without animation in the sprite."""
+    from PIL import Image, ImageDraw
+    im = Image.new("RGBA", (size, size), (0,0,0,0))
+    d = ImageDraw.Draw(im)
+    k = size/24.0
+    cx=cy=12*k; r=6*k
+    # soft shadow circle
+    d.ellipse([cx-r-1, cy-r-1, cx+r+1, cy+r+1], outline=(0,0,0,40), width=max(2,int(2*k)))
+    d.arc([cx-r, cy-r, cx+r, cy+r], start=45, end=315,
+          fill=(244,245,247,255), width=max(2,int(2*k)))
+    # little arrow in the corner (progress = arrow+watch)
+    tip=(2*k,2*k); re=(7*k,7*k); notch=(4*k,8*k); sb=(4*k,15*k); sr=(6*k,15*k)
+    tail=(10*k,11*k); fr=(14*k,11*k)
+    poly=[tip,re,notch,sb,sr,tail,fr]
+    d.polygon(poly, fill=(244,245,247,255))
+    _curs_outline(d, poly, max(1,int(round(1.3*k))), (10,12,16,255))
+    return im.tobytes()
 
-def icon_file():
-    img = new_icon(); d = ImageDraw.Draw(img)
-    # paper with corner fold
-    d.polygon([(7,4),(20,4),(27,11),(27,28),(7,28)],
-              fill=TEXT, outline=BLK)
-    # corner fold
-    d.polygon([(20,4),(27,11),(20,11)], fill=TEXT_DIM, outline=BLK)
-    # text lines
-    for y in (15, 19, 23):
-        d.line((10, y, 24, y), fill=TEXT_MUT, width=1)
-    return img
+def _builtin_forbidden(size):
+    """Circle with slash (no-drop / not-allowed). Hotspot in center."""
+    from PIL import Image, ImageDraw
+    im = Image.new("RGBA", (size, size), (0,0,0,0))
+    d = ImageDraw.Draw(im)
+    k = size/24.0
+    cx=cy=12*k; r=8*k
+    d.ellipse([cx-r-1,cy-r-1,cx+r+1,cy+r+1], outline=(0,0,0,40), width=max(2,int(2*k)))
+    d.ellipse([cx-r,cy-r,cx+r,cy+r], outline=(220,70,70,255), width=max(2,int(2*k)), fill=(0,0,0,0))
+    # slash
+    import math
+    a = 3*math.pi/4
+    x1=cx+r*0.7*math.cos(a); y1=cy+r*0.7*math.sin(a)
+    x2=cx-r*0.7*math.cos(a); y2=cy-r*0.7*math.sin(a)
+    d.line([(x1,y1),(x2,y2)], fill=(220,70,70,255), width=max(2,int(2*k)))
+    return im.tobytes()
 
-def icon_home():
-    img = new_icon(); d = ImageDraw.Draw(img)
-    d.polygon([(2,16),(15.5,3),(29,16)], fill=ACCENT, outline=BLK)
-    d.rectangle((6,16,25,28), fill=PANEL_HI, outline=BLK, width=1)
-    d.rectangle((13,18,18,28), fill=ACCENT_DIM, outline=BLK)
-    d.rectangle((8,18,11,21), fill=TEXT)
-    d.rectangle((20,18,23,21), fill=TEXT)
-    return img
+def _builtin_hresize(size):
+    """Horizontal-resize: <-> arrow. Hotspot in center."""
+    from PIL import Image, ImageDraw
+    im = Image.new("RGBA", (size, size), (0,0,0,0))
+    d = ImageDraw.Draw(im)
+    k = size/24.0
+    cy=12*k
+    d.line([(5*k,cy),(19*k,cy)], fill=(244,245,247,255), width=max(1,int(2*k)))
+    col=(244,245,247,255); out=(10,12,16,255); w=max(1,int(1.5*k))
+    for x,dx in [(5*k,1),(19*k,-1)]:
+        pts=[(x,cy),(x+3*k*dx,cy-3*k),(x+3*k*dx,cy+3*k)]
+        d.polygon(pts, fill=col)
+        d.line(pts+[pts[0]], fill=out, width=w)
+    return im.tobytes()
 
-def icon_config():
-    img = new_icon(); d = ImageDraw.Draw(img)
-    cx_, cy_ = 15.5, 15.5
-    pts = []
-    for i in range(16):
-        ang = math.radians(i * 22.5)
-        r = 13 if (i % 2 == 0) else 9
-        pts.append((cx_ + r*math.cos(ang), cy_ + r*math.sin(ang)))
-    d.polygon(pts, fill=ACCENT_DIM, outline=BLK)
-    d.ellipse((6,6,25,25), fill=ACCENT, outline=BLK)
-    d.ellipse((11,11,20,20), fill=PANEL, outline=BLK)
-    return img
+def _builtin_vresize(size):
+    """Vertical-resize arrow."""
+    from PIL import Image, ImageDraw
+    im = Image.new("RGBA", (size, size), (0,0,0,0))
+    d = ImageDraw.Draw(im)
+    k = size/24.0
+    cx=12*k
+    d.line([(cx,5*k),(cx,19*k)], fill=(244,245,247,255), width=max(1,int(2*k)))
+    col=(244,245,247,255); out=(10,12,16,255); w=max(1,int(1.5*k))
+    for y,dy in [(5*k,1),(19*k,-1)]:
+        pts=[(cx,y),(cx-3*k,y+3*k*dy),(cx+3*k,y+3*k*dy)]
+        d.polygon(pts, fill=col)
+        d.line(pts+[pts[0]], fill=out, width=w)
+    return im.tobytes()
 
-def icon_drawer():
-    img = new_icon(); d = ImageDraw.Draw(img)
-    for r in range(3):
-        for c in range(3):
-            x = 5 + c*9
-            y = 5 + r*9
-            d.ellipse((x,y,x+5,y+5), fill=ACCENT)
-    return img
+BUILTINS = {
+    "__proc_checkmark": _builtin_checkmark,
+    "__proc_xmark":     _builtin_xmark,
+    "__proc_arrow":     _builtin_arrow,
+    "__proc_hand":      _builtin_hand,
+    "__proc_ibeam":     _builtin_ibeam,
+    "__proc_wait":      _builtin_wait,
+    "__proc_forbidden": _builtin_forbidden,
+    "__proc_hresize":   _builtin_hresize,
+    "__proc_vresize":   _builtin_vresize,
+}
 
-def icon_calc():
-    img = new_icon(); d = ImageDraw.Draw(img)
-    rrect(d, (4,3,27,28), 3, fill=PANEL_HI, outline=BLK, w=1)
-    # display
-    rrect(d, (6,6,25,11), 1, fill=BLK, outline=PANEL)
-    d.line((19, 8, 23, 8), fill=ACCENT, width=2)
-    # button grid (4 cols x 4 rows)
-    bw, bh = 4, 3
-    gap = 1
-    x0, y0 = 6, 13
-    for r in range(4):
-        for c in range(4):
-            x = x0 + c*(bw+gap)
-            y = y0 + r*(bh+gap)
-            color = ACCENT if (c==3) else (TEXT_DIM if r==0 else TEXT)
-            rrect(d, (x, y, x+bw, y+bh), 1, fill=color)
-    return img
+def find(name, category, size=None, symbolic=False):
+    """Search Kora icon tree for an icon.
 
-def icon_monitor():
-    img = new_icon(); d = ImageDraw.Draw(img)
-    # screen
-    rrect(d, (2,4,29,22), 2, fill=BLK, outline=PANEL_HI, w=1)
-    # graph bars
-    bars = [4, 7, 5, 9, 11, 8, 13, 10, 14, 12, 9, 15, 11, 13, 8, 12]
-    for i, h in enumerate(bars):
-        x = 4 + i*1.5
-        d.line((x, 20, x, 20-h), fill=ACCENT, width=1)
-    # baseline
-    d.line((3, 20, 28, 20), fill=ACCENT_DIM, width=1)
-    # stand
-    d.rectangle((13,22,18,26), fill=PANEL_HI, outline=BLK)
-    d.line((7,28,24,28), fill=PANEL_HI, width=2)
-    return img
+    Search order (per category):
+      1. scalable/  -> <name>.svg                       (full-color preferred)
+      2. scalable/  -> <name>-symbolic.svg
+      3. symbolic/  -> <name>-symbolic.svg              (explicit symbolic folder)
+      4. scalable@2/, <closest numeric>/, <n>@2/ (same suffix ordering)
+    If `symbolic=True`, symbolic variants are preferred.
+    Falls back across categories; tries ALIASES table if first pass fails.
+    """
+    cats = [category] if category else []
+    cats += ["apps", "actions", "places", "devices", "status", "categories",
+             "emblems", "mimetypes", "panel", "animations", "emotes"]
 
-# --- file-type icons (12-17) ---
-def icon_img():
+    def try_name(nm, cat):
+        base = f"{KORA}/{cat}"
+        if not os.path.isdir(base): return None
+        try:
+            entries = set(os.listdir(base))
+        except OSError:
+            return None
+        # Build ordered list of subfolders to search
+        folder_order = []
+        for sz_name in ["scalable", "scalable@2"]:
+            if sz_name in entries: folder_order.append(sz_name)
+        nums = []
+        for e in entries:
+            try: nums.append(int(e))
+            except ValueError: pass
+        if size: nums.sort(key=lambda s: (abs(s-size), -s))
+        else:    nums.sort(reverse=True)
+        for n in nums:
+            if str(n) in entries: folder_order.append(str(n))
+            n2 = f"{n}@2"
+            if n2 in entries: folder_order.append(n2)
+        # Also include symbolic/ folder itself (Kora ships standalone symbolic/ dirs)
+        if "symbolic" in entries: folder_order.append("symbolic")
+        if "symbolic@2" in entries: folder_order.append("symbolic@2")
 
-    img = new_icon(); d = ImageDraw.Draw(img)
-    rrect(d, (4,4,27,27), 3, fill=(45,120,190,255), outline=BLK, w=1)
-    d.ellipse((8,8,13,13), fill=WARN)
-    d.polygon([(6,24),(14,15),(21,24)], fill=(120,200,120,255), outline=BLK)
-    d.polygon([(15,24),(21,17),(26,24)], fill=(80,160,90,255), outline=BLK)
-    return img
+        # Suffix order depends on symbolic preference
+        if symbolic:
+            suffixes = (f"-symbolic.svg", ".svg")
+        else:
+            suffixes = (".svg", f"-symbolic.svg")
 
-def icon_video():
-    img = new_icon(); d = ImageDraw.Draw(img)
-    rrect(d, (3,5,28,26), 3, fill=(180,50,60,255), outline=BLK, w=1)
-    d.polygon([(12,10),(22,15),(12,21)], fill=TEXT, outline=BLK)
-    for y in (7, 12, 17, 22):
-        d.rectangle((4,y,6,y+2), fill=TEXT)
-        d.rectangle((25,y,27,y+2), fill=TEXT)
-    return img
+        for sz in folder_order:
+            for suf in suffixes:
+                # When inside a folder named 'symbolic' or 'symbolic@2', the file
+                # inside is usually already named <name>-symbolic.svg, but sometimes
+                # just <name>.svg -- try both.
+                if sz.startswith("symbolic"):
+                    cand = f"{base}/{sz}/{nm}-symbolic.svg"
+                    if os.path.exists(cand): return cand
+                    cand = f"{base}/{sz}/{nm}.svg"
+                    if os.path.exists(cand): return cand
+                else:
+                    cand = f"{base}/{sz}/{nm}{suf}"
+                    if os.path.exists(cand): return cand
+        return None
 
-def icon_code():
-    img = new_icon(); d = ImageDraw.Draw(img)
-    rrect(d, (4,4,27,27), 2, fill=PANEL_HI, outline=BLK, w=1)
-    d.line((11,10,6,15), fill=ACCENT, width=2)
-    d.line((6,15,11,21), fill=ACCENT, width=2)
-    d.line((20,10,25,15), fill=ACCENT, width=2)
-    d.line((25,15,20,21), fill=ACCENT, width=2)
-    d.line((17,9,14,22), fill=TEXT_DIM, width=2)
-    return img
+    # Try the requested name first in category-preferred order
+    for cat in cats:
+        p = try_name(name, cat)
+        if p: return ("file", p)
+    # If not found, try alias
+    if name in ALIASES:
+        real, cat_over = ALIASES[name]
+        if cat_over == "__builtin__":
+            return ("builtin", real)
+        al_cats = [cat_over] if cat_over else cats
+        for cat in al_cats:
+            p = try_name(real, cat)
+            if p: return ("file", p)
+    return None
 
-def icon_music():
-    img = new_icon(); d = ImageDraw.Draw(img)
-    rrect(d, (4,4,27,27), 3, fill=(140,70,180,255), outline=BLK, w=1)
-    d.ellipse((7,19,13,24), fill=TEXT, outline=BLK)
-    d.ellipse((17,17,23,22), fill=TEXT, outline=BLK)
-    d.line((13,21,13,9), fill=TEXT, width=2)
-    d.line((23,19,23,7), fill=TEXT, width=2)
-    d.polygon([(13,9),(23,7),(23,11),(13,13)], fill=TEXT)
-    return img
+def render_svg(svg, size, css=None):
+    args = ["rsvg-convert", "-w", str(size), "-h", str(size), "-f", "png"]
+    if css:
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".css", delete=False) as cf:
+            cf.write(css); cf.flush()
+            args += ["--stylesheet", cf.name]; args.append(svg)
+            png = subprocess.check_output(args)
+        os.unlink(cf.name)
+    else:
+        args.append(svg); png = subprocess.check_output(args)
+    from PIL import Image
+    im = Image.open(io.BytesIO(png)).convert("RGBA")
+    if im.size != (size,size):
+        im = im.resize((size,size), Image.LANCZOS)
+    return im.tobytes()
 
-def icon_archive():
-    img = new_icon(); d = ImageDraw.Draw(img)
-    rrect(d, (5,6,26,27), 2, fill=(210,160,50,255), outline=BLK, w=1)
-    for y in range(8, 22, 4):
-        d.rectangle((14,y,17,y+2), fill=DGREY, outline=BLK)
-    rrect(d, (13,22,18,26), 1, fill=TEXT, outline=BLK)
-    return img
+ICONS = []
+def add(name, filename, cat, size=SZ_APP, sym=False):
+    ICONS.append((name, filename, cat, size, sym))
 
-def icon_text():
-    return icon_file()
+# Tray (symbolic)
+add("tray_net_wired",    "network-wired",                  "panel",  SZ_TRAY, sym=True)
+add("tray_net_wifi",     "network-wireless-connected-100", "panel",  SZ_TRAY, sym=True)
+add("tray_net_idle",     "network-offline",                "panel",  SZ_TRAY, sym=True)
+add("tray_audio_hi",     "audio-volume-high",              "panel",  SZ_TRAY, sym=True)
+add("tray_audio_mute",   "audio-volume-muted",             "panel",  SZ_TRAY, sym=True)
+add("tray_battery",      "battery-090",                    "panel",  SZ_TRAY, sym=True)
+add("tray_shutdown",     "system-shutdown",                "actions",SZ_TRAY, sym=True)
+add("tray_lock",         "system-lock-screen",             "actions",SZ_TRAY, sym=True)
+add("tray_user",         "avatar-default",                 "panel",  SZ_TRAY, sym=True)
+add("tray_bluetooth",    "bluetooth-active",               "status", SZ_TRAY, sym=True)
+add("tray_airplane",     "airplane-mode",                  "status", SZ_TRAY, sym=True)
+add("tray_microphone",   "audio-input-microphone-high",    "panel",  SZ_TRAY, sym=True)
 
-# --- folder variants (18-23) ---
-def icon_folder_open():
-    img = new_icon(); d = ImageDraw.Draw(img)
-    d.polygon([(3,11),(11,7),(17,7),(17,11)], fill=ACCENT_DIM, outline=BLK)
-    rrect(d, (3,10,27,24), 2, fill=ACCENT_DIM, outline=BLK)
-    d.polygon([(1,28),(6,14),(30,14),(25,28)], fill=ACCENT, outline=BLK)
-    return img
+# Dock
+add("dock_terminal",     "utilities-terminal",             "apps",   SZ_DOCK)
+add("dock_files",        "system-file-manager",            "apps",   SZ_DOCK)
+add("dock_browser",      "web-browser",                    "apps",   SZ_DOCK)
+add("dock_editor",       "accessories-text-editor",        "apps",   SZ_DOCK)
+add("dock_settings",     "preferences-system",             "categories", SZ_DOCK)
+add("dock_launcher",    "applications-all",               "apps",   SZ_DOCK)
+add("dock_trash",       "user-trash",                     "places", SZ_DOCK)
 
-def _folder_badge(badge_fn):
-    img = new_icon(); d = ImageDraw.Draw(img)
-    d.polygon([(3,11),(11,7),(17,7),(17,11)], fill=ACCENT_DIM, outline=BLK)
-    rrect(d, (3,10,29,27), 3, fill=ACCENT, outline=BLK, w=1)
-    rrect(d, (3,11,29,15), 1, fill=(255,210,170,255))
-    badge_fn(d)
-    return img
+# Places
+add("place_desktop",     "user-desktop",                   "places", SZ_APP)
+add("place_docs",        "folder-documents",               "places", SZ_APP)
+add("place_dl",          "folder-download",                "places", SZ_APP)
+add("place_music",       "folder-music",                   "places", SZ_APP)
+add("place_pics",        "folder-pictures",                "places", SZ_APP)
+add("place_videos",      "folder-videos",                  "places", SZ_APP)
+add("place_home",        "user-home",                      "places", SZ_APP)
+add("place_folder",      "folder",                         "places", SZ_APP)
+add("place_drive",       "drive-harddisk",                 "devices",SZ_APP)
 
-def icon_folder_pic():
-    def b(d):
-        rrect(d, (16,14,28,26), 2, fill=(45,120,190,255), outline=BLK)
-        d.ellipse((18,16,21,19), fill=WARN)
-        d.polygon([(17,24),(21,19),(26,24)], fill=(120,200,120,255))
-    return _folder_badge(b)
+# Window controls
+add("win_close",         "window-close",                   "actions",SZ_WIN, sym=True)
+add("win_max",           "window-maximize",                "actions",SZ_WIN, sym=True)
+add("win_min",           "window-minimize",                "actions",SZ_WIN, sym=True)
+add("win_restore",       "window-restore",                 "actions",SZ_WIN, sym=True)
 
-def icon_folder_music():
-    def b(d):
-        rrect(d, (16,14,28,26), 2, fill=(140,70,180,255), outline=BLK)
-        d.ellipse((18,21,22,25), fill=TEXT)
-        d.line((22,23,22,16), fill=TEXT, width=1)
-        d.line((22,16,26,15), fill=TEXT, width=1)
-    return _folder_badge(b)
+# Actions
+for a in ["go-up","go-down","go-next","go-previous","go-home","document-new",
+         "document-open","document-save","document-save-as","edit-delete",
+         "edit-cut","edit-copy","edit-paste","edit-undo","edit-redo",
+         "edit-find","view-refresh","view-fullscreen","application-exit",
+         "list-add","list-remove","zoom-in","zoom-out","system-run","system-search",
+         "media-playback-start","media-playback-pause","media-playback-stop",
+         "media-skip-forward","media-skip-backward","media-seek-forward","media-seek-backward",
+         "audio-volume-high","audio-volume-low",
+         "dialog-ok","dialog-cancel","dialog-close","dialog-apply","dialog-warning","dialog-error","dialog-information",
+         "folder-new","go-jump","preferences-desktop","help-about"]:
+    add("act_" + a.replace("-", "_"), a, "actions", SZ_WIN, sym=True)
 
-def icon_folder_video():
-    def b(d):
-        rrect(d, (16,14,28,26), 2, fill=(180,50,60,255), outline=BLK)
-        d.polygon([(20,17),(26,20),(20,23)], fill=TEXT)
-    return _folder_badge(b)
+# Devices
+for d in ["drive-harddisk","drive-removable-media","drive-optical",
+         "audio-card","input-keyboard","input-mouse","input-tablet","camera-photo",
+         "camera-video","display","printer","scanner","computer","phone","network-wired","network-wireless"]:
+    add("dev_" + d.replace("-", "_"), d, "devices", 32)
 
-def icon_folder_doc():
-    def b(d):
-        rrect(d, (16,14,28,26), 2, fill=TEXT, outline=BLK)
-        for y in (17, 20, 23):
-            d.line((18,y,26,y), fill=TEXT_MUT, width=1)
-    return _folder_badge(b)
+# Mimetypes
+for m in ["text-x-generic","text-html","text-css","text-x-script","application-x-executable",
+         "folder","package-x-generic","image-x-generic","video-x-generic","audio-x-generic",
+         "application-pdf","x-office-calendar","x-office-spreadsheet","x-office-document","x-office-presentation",
+         "application-x-compressed"]:
+    add("mime_" + m.replace("-","_").replace("+","_").replace(".","_"), m, "mimetypes", 32)
 
-def icon_folder_dl():
-    def b(d):
-        rrect(d, (16,14,28,26), 2, fill=OK, outline=BLK)
-        d.line((22,16,22,22), fill=BLK, width=2)
-        d.polygon([(19,20),(22,24),(25,20)], fill=BLK)
-    return _folder_badge(b)
-
-# --- system icons (24-26) ---
-def icon_recycle():
-    img = new_icon(); d = ImageDraw.Draw(img)
-    rrect(d, (7,9,24,27), 2, fill=DGREY, outline=BLK, w=1)
-    rrect(d, (5,6,26,9), 1, fill=PANEL_HI, outline=BLK)
-    d.rectangle((13,4,18,6), fill=PANEL_HI, outline=BLK)
-    for x in (11, 15, 19):
-        d.line((x,12,x,24), fill=OK, width=2)
-    return img
-
-def icon_network():
-    img = new_icon(); d = ImageDraw.Draw(img)
-    d.ellipse((4,4,27,27), fill=(40,140,220,255), outline=BLK, width=1)
-    d.ellipse((9,4,22,27), fill=(0,0,0,0), outline=TEXT, width=1)
-    d.line((4,15,27,15), fill=TEXT, width=1)
-    d.line((6,10,25,10), fill=TEXT, width=1)
-    d.line((6,21,25,21), fill=TEXT, width=1)
-    return img
-
-def icon_lock():
-    img = new_icon(); d = ImageDraw.Draw(img)
-    d.arc((9,4,22,18), start=180, end=0, fill=WARN, width=3)
-    rrect(d, (6,13,25,27), 3, fill=WARN, outline=BLK, w=1)
-    d.ellipse((14,17,17,20), fill=BLK)
-    d.line((15,19,15,23), fill=BLK, width=2)
-    return img
-
-ICONS = [
-    # 0-11: app/system
-    ("FILES",        icon_files),
-    ("TERM",         icon_terminal),
-    ("EDITOR",       icon_editor),
-    ("CLOCK",        icon_clock),
-    ("INFO",         icon_info),
-    ("FOLDER",       icon_folder),
-    ("FILE",         icon_file),
-    ("HOME",         icon_home),
-    ("CONFIG",       icon_config),
-    ("DRAWER",       icon_drawer),
-    ("CALC",         icon_calc),
-    ("MONITOR",      icon_monitor),
-    # 12-17: file types
-    ("IMG",          icon_img),
-    ("VIDEO",        icon_video),
-    ("CODE",         icon_code),
-    ("MUSIC",        icon_music),
-    ("ARCHIVE",      icon_archive),
-    ("TEXT",         icon_text),
-    # 18-23: folder variants
-    ("FOLDER_OPEN",  icon_folder_open),
-    ("FOLDER_PIC",   icon_folder_pic),
-    ("FOLDER_MUSIC", icon_folder_music),
-    ("FOLDER_VIDEO", icon_folder_video),
-    ("FOLDER_DOC",   icon_folder_doc),
-    ("FOLDER_DL",    icon_folder_dl),
-    # 24-26: system
-    ("RECYCLE",      icon_recycle),
-    ("NETWORK",      icon_network),
-    ("LOCK",         icon_lock),
-]
-
-
-# ---------- cursor ----------
-CURSOR_W, CURSOR_H = 12, 18
-def make_cursor():
-    img = Image.new("RGBA", (CURSOR_W, CURSOR_H), (0,0,0,0))
-    d = ImageDraw.Draw(img)
-    # outline shadow
-    d.polygon([(0,0),(0,15),(4,11),(7,17),(9,17),(6,11),(11,11)],
-              fill=(0,0,0,255))
-    # white fill
-    d.polygon([(1,2),(1,12),(4,9),(6,15),(7,15),(5,9),(9,9)],
-              fill=(244,245,247,255))
-    return img
-
-# ---------- wallpaper ----------
-def make_wallpaper(w=480, h=300):
-    img = Image.new("RGBA", (w, h), BG_BOT)
-    px = img.load()
-    for y in range(h):
-        t = y / (h - 1)
-        r = int(BG_TOP[0] + (BG_BOT[0]-BG_TOP[0]) * t)
-        g = int(BG_TOP[1] + (BG_BOT[1]-BG_TOP[1]) * t)
-        b = int(BG_TOP[2] + (BG_BOT[2]-BG_TOP[2]) * t)
-        for x in range(w):
-            px[x, y] = (r, g, b, 255)
-    # subtle dot grid every 32 px
-    d = ImageDraw.Draw(img)
-    for y in range(32, h, 32):
-        for x in range(32, w, 32):
-            d.point((x, y), fill=DOT)
-    # warm corner glow (top-left)
-    glow = Image.new("RGBA", (w, h), (0,0,0,0))
-    gd = ImageDraw.Draw(glow)
-    gd.ellipse((-120, -120, 360, 360), fill=(232, 168, 124, 50))
-    glow = glow.filter(ImageFilter.GaussianBlur(60))
-    img = Image.alpha_composite(img, glow)
-    # cool counter-glow (bottom-right)
-    glow2 = Image.new("RGBA", (w, h), (0,0,0,0))
-    gd2 = ImageDraw.Draw(glow2)
-    gd2.ellipse((w-360, h-360, w+120, h+120), fill=(80, 110, 160, 30))
-    glow2 = glow2.filter(ImageFilter.GaussianBlur(80))
-    img = Image.alpha_composite(img, glow2)
-    return img
-
-# ---------- emit ----------
-def emit_argb_array(name, img, f):
-    px = img.load()
-    w, h = img.size
-    f.write(f"const u32 {name}_pixels[{w*h}] = {{\n  ")
-    n = 0
-    for y in range(h):
-        for x in range(w):
-            r,g,b,a = px[x,y]
-            v = (a<<24) | (r<<16) | (g<<8) | b
-            f.write(f"0x{v:08X},")
-            n += 1
-            if n % 12 == 0:
-                f.write("\n  ")
-    f.write("\n};\n")
-    f.write(f"const int {name}_w = {w};\nconst int {name}_h = {h};\n\n")
+# Cursors (all 24px, procedurally drawn)
+add("cursor_arrow",      "default",                        "actions",SZ_CURSOR)
+add("cursor_hand",       "pointer",                        "actions",SZ_CURSOR)
+add("cursor_ibeam",      "text",                           "actions",SZ_CURSOR)
+add("cursor_wait",       "wait",                           "actions",SZ_CURSOR)
+add("cursor_forbidden",  "forbidden",                      "actions",SZ_CURSOR)
+add("cursor_hresize",    "col-resize",                     "actions",SZ_CURSOR)
+add("cursor_vresize",    "row-resize",                     "actions",SZ_CURSOR)
+add("cursor_prefs",      "preferences-desktop-cursors",    "apps",   32)
 
 def main():
-    os.makedirs("kernel/gui", exist_ok=True)
-    with open("kernel/gui/asset_icons.c","w") as f:
-        f.write("/* AUTO-GENERATED by scripts/gen_assets.py */\n")
-        f.write('#include <yart/types.h>\n\n')
-        for name, fn in ICONS:
-            img = fn()
-            emit_argb_array(f"icon_{name}", img, f)
-        f.write("typedef struct { const u32 *px; int w; int h; } icon_asset_t;\n")
-        f.write("const icon_asset_t yart_icons[] = {\n")
-        for name, _ in ICONS:
-            f.write(f"  {{ icon_{name}_pixels, icon_{name}_w, icon_{name}_h }},\n")
+    bin_data = bytearray()
+    entries = []
+    bin_data += b"YICON" + struct.pack("<BH", 2, len(ICONS))
+    bin_data += b"\x00" * (16 - len(bin_data))
+    assert len(bin_data) == 16
+    table_off = len(bin_data)
+    bin_data += b"\x00" * (16 * len(ICONS))
+
+    name_buf = bytearray()
+    missing = 0
+    for i,(name, fname, cat, size, sym) in enumerate(ICONS):
+        found = find(fname, cat, size=size, symbolic=sym)
+        if found is None:
+            print(f"MISSING icon: {name} ({fname})", file=sys.stderr)
+            missing += 1
+            raw = b"\x00\x00\x00\x00"; w = h = 1
+        else:
+            kind, path = found
+            try:
+                if kind == "builtin":
+                    raw = BUILTINS[path](size)
+                else:
+                    raw = render_svg(path, size)
+            except Exception as e:
+                print(f"FAIL icon {name} ({path}): {e}", file=sys.stderr)
+                missing += 1
+                raw = b"\x00\x00\x00\x00"; w=h=1; continue
+            w = h = size
+            assert len(raw) == w*h*4, f"{name}: bad pixel len {len(raw)}"
+        n_off = len(name_buf)
+        name_buf += name.encode() + b"\x00"
+        px_off = len(bin_data)
+        bin_data += raw
+        entries.append((name, n_off, px_off, w, h))
+    name_off_in_bin = len(bin_data)
+    bin_data += name_buf
+    for i, (name, n_off, px_off, w, h) in enumerate(entries):
+        ent = table_off + i*16
+        struct.pack_into("<IHIHHH", bin_data, ent,
+                         name_off_in_bin + n_off,
+                         len(name),
+                         px_off, w, h, w*4)
+    with open(OUT_BIN, "wb") as f: f.write(bin_data)
+    with open(OUT_H, "w") as f:
+        f.write("/* Auto-generated by scripts/gen_assets.py */\n")
+        f.write("#pragma once\n#include \"sys.h\"\n")
+        f.write(f"#define ASSET_BIN_SIZE {len(bin_data)}\n")
+        f.write(f"#define ASSET_ICON_COUNT {len(ICONS)}\n")
+        f.write("enum {\n")
+        for i,(name,*_) in enumerate(ICONS):
+            f.write(f"    ICON_{name.upper()} = {i},\n")
+        f.write(f"    ICON_COUNT = {len(ICONS)}\n")
         f.write("};\n")
-        f.write(f"const int yart_icons_count = {len(ICONS)};\n")
-    with open("kernel/gui/asset_cursor.c","w") as f:
-        f.write("/* AUTO-GENERATED */\n#include <yart/types.h>\n\n")
-        emit_argb_array("yart_cursor", make_cursor(), f)
-    with open("kernel/gui/asset_wallpaper.c","w") as f:
-        f.write("/* AUTO-GENERATED */\n#include <yart/types.h>\n\n")
-        emit_argb_array("yart_wallpaper", make_wallpaper(), f)
-    print("Generated asset files:",
-          "icons %dx%d, cursor %dx%d, wallpaper rendered" %
-          (ICON_W, ICON_H, CURSOR_W, CURSOR_H))
+    print(f"wrote {OUT_BIN} ({len(bin_data)} bytes, {len(ICONS)} icons, {missing} missing)")
+    print(f"wrote {OUT_H}")
 
 if __name__ == "__main__":
     main()

@@ -1,16 +1,5 @@
 /* =============================================================================
  *  Yart OS - kernel entry point.
- *
- *  Boot flow:
- *    Limine  -> kmain()  (this file)
- *      console_init  -> serial banner
- *      gdt + idt + pic + pit + rtc
- *      pmm + vmm + heap
- *      framebuffer + desktop
- *      vfs (mount initrd)
- *      keyboard + mouse
- *      irq enable
- *      main loop : desktop_tick(); hlt
  * ===========================================================================*/
 #include <yart/types.h>
 #include <yart/limine.h>
@@ -29,19 +18,24 @@
 #include <yart/user.h>
 #include <yart/sched.h>
 #include <yart/blk.h>
-#include <yart/session.h>
-#include <yart/cpu.h>    /* fpu_enable() */
-#include <yart/watchdog.h>   /* service supervisor + watchdog selftest */
-#include <yart/net.h>        /* e1000 + IP stack + DHCP                 */
-#include <yart/audio.h>      /* Intel HDA audio (row 17)                */
-#include <yart/usb.h>        /* xHCI USB HID (row 18)                   */
-int smp_start_aps(void);   /* smp.c */
-void smp_ap_kwork_demo(void); /* smp.c */
+#include <yart/cpu.h>
+#include <yart/watchdog.h>
+#include <yart/net.h>
+#include <yart/audio.h>
+#include <yart/usb.h>
+int smp_start_aps(void);
+void smp_ap_kwork_demo(void);
 
-/* The desktop loop is a supervised kernel service: it kicks its heartbeat
- * every iteration, so the watchdog (driven from the APIC timer) can detect
- * and restart it if it ever stops making progress. */
-static int g_desktop_wd;
+/* Watchdog index for the ring-3 compositor.  The compositor kicks the
+ * watchdog on every SYS_FB_FLIP; if frames stop arriving the supervisor
+ * invokes wm_reset() which paints a recovery screen. */
+int g_desktop_wd;
+
+static void wm_reset(void) {
+    kprintf("wm: watchdog recovery - painting recovery screen\n");
+    fb_clear(0xFF301010);
+    fb_present();
+}
 
 LIMINE_BASE_REVISION(2);
 LIMINE_REQUESTS_START_MARKER;
@@ -66,27 +60,22 @@ __attribute__((used, section(".limine_requests")))
 static volatile struct limine_bootloader_info_request bli_request = {
     .id = LIMINE_BOOTLOADER_INFO_REQUEST, .revision = 0, .response = 0
 };
-
 __attribute__((used, section(".limine_requests")))
 static volatile struct limine_rsdp_request rsdp_request = {
     .id = LIMINE_RSDP_REQUEST, .revision = 0, .response = 0
 };
-
 LIMINE_REQUESTS_END_MARKER;
 
 static void banner(void) {
     serial_puts(
         "\n"
         "================================================================\n"
-        "  Y A R T   O S   " YART_VERSION "  -  neon-purple\n"
-        "  64-bit  /  Limine  /  framebuffer  /  custom desktop\n"
+        "  Y A R T   O S   " YART_VERSION "  -  ring-3 compositor\n"
+        "  64-bit  /  Limine  /  framebuffer  /  userspace desktop\n"
         "================================================================\n"
     );
-    if (bli_request.response) {
-        kprintf("boot: %s %s\n",
-                bli_request.response->name,
-                bli_request.response->version);
-    }
+    if (bli_request.response)
+        kprintf("boot: %s %s\n", bli_request.response->name, bli_request.response->version);
 }
 
 void kmain(void) {
@@ -97,92 +86,66 @@ void kmain(void) {
         kpanic("Limine framebuffer not available");
     if (!memmap_request.response) kpanic("Limine memmap not available");
     if (!hhdm_request.response)   kpanic("Limine HHDM not available");
-
     g_hhdm_offset = hhdm_request.response->offset;
 
-    /* HAL */
     gdt_init();
     idt_init();
-    fpu_enable();                /* x87 + SSE on; clean FPU state         */
+    fpu_enable();
     pic_remap(32, 40);
-    /* mask all PIC IRQs initially; drivers will unmask theirs */
     for (int i = 0; i < 16; i++) pic_mask(i);
 
-    /* memory */
     pmm_init(memmap_request.response);
     vmm_init();
     heap_init();
 
-    /* memory-subsystem selftests (allocator accounting, refcounts, demand
-     * paging, copy-on-write, per-process page tables, heap canaries) */
     pmm_selftest();
     vmm_selftest();
     heap_selftest();
 
-    /* framebuffer + desktop */
     fb_init(fb_request.response->framebuffers[0]);
     kprintf("Welcome to Yart OS\n");
 
-    /* VFS over the first module (initrd.tar) */
     void *initrd = NULL; size_t initrd_size = 0;
     if (mod_request.response && mod_request.response->module_count > 0) {
-        initrd      = mod_request.response->modules[0]->address;
+        initrd = mod_request.response->modules[0]->address;
         initrd_size = mod_request.response->modules[0]->size;
         kprintf("initrd: %lu KiB at %p\n", initrd_size / 1024, initrd);
     }
     vfs_init(initrd, initrd_size);
-    blk_init();          /* find + bring up the virtio-blk disk (if any) */
-    blkfs_init();        /* format on first boot, otherwise mount disk   */
-    vmm_swap_disk_init();/* arm the disk-backed swap tier (if a disk)    */
-    config_load("/etc/yart.conf");   /* disk copy wins over initrd copy  */
+    blk_init();
+    blkfs_init();
+    vmm_swap_disk_init();
+    config_load("/etc/yart.conf");
 
-    /* ACPI */
-    if (rsdp_request.response)
-        acpi_init(rsdp_request.response->address);
-    else
-        kprintf("acpi: no RSDP from bootloader\n");
+    if (rsdp_request.response) acpi_init(rsdp_request.response->address);
+    else kprintf("acpi: no RSDP from bootloader\n");
 
-    /* syscall dispatcher (for future ring-3 tasks) */
     pci_init();
     syscall_install();
 
-    /* Print initrd /etc/motd if present */
     vnode_t *motd = vfs_lookup("/etc/motd");
     if (motd) {
         char buf[512] = {0};
         int n = vfs_read(motd, buf, 0,
-                         motd->size < sizeof buf - 1 ? motd->size : sizeof buf - 1);
+            motd->size < sizeof buf - 1 ? motd->size : sizeof buf - 1);
         if (n > 0) { buf[n] = 0; serial_puts(buf); }
     }
 
-    /* timing + drivers */
-    pit_init(100);             /* 100 Hz (APIC timer takes over if available) */
-    apic_init();               /* LAPIC/IOAPIC + APIC timer, PIC fallback   */
-    smp_start_aps();           /* bring the other cores online (SMP)       */
+    pit_init(100);
+    apic_init();
+    smp_start_aps();
     kbd_init();
     mouse_init();
 
-    /* desktop */
-    desktop_init();
-
-    /* preemptive scheduler: the desktop loop becomes the idle task (pid 0) */
     sched_init();
-    /* OOM killer: prove that when RAM is exhausted we kill the hungriest
-     * user task and keep going instead of panicking. */
     oom_selftest();
 
-    /* Networking: bring up the e1000 + IP stack.  This MUST run after the
-     * APIC/IOAPIC + APs + scheduler are up: touching the NIC's PCI config /
-     * MMIO (and its interrupt line) before apic_init/smp_start_aps leaves
-     * interrupt routing in a bad state that later starves an AP's scheduling
-     * (observed as a fork-child on CPU 1 never being preempted).  DHCP is
-     * driven from the main loop's net_service(). */
     nic_init();
     net_init();
-    audio_init();                       /* Intel HDA: codec + playback     */
-    usb_init();                         /* xHCI USB HID (row 18)           */
+    audio_init();
+    usb_init();
 
-    /* A root-owned secret file used by the permission/doas boot test. */
+    /* /etc/secret.txt used by the doas/perm boot test */
     {
         vnode_t *d = vfs_lookup("/etc");
         if (d) {
@@ -196,63 +159,41 @@ void kmain(void) {
             }
         }
     }
+    /* user home */
+    vfs_mkdir_p("/home/yart");
 
-    /* Bring up /bin/init as a preemptively-scheduled ring-3 task.  It runs
-       alongside the desktop loop; the scheduler time-slices it. */
+    /* Load /bin/init as the ring-3 compositor (wm). */
     vnode_t *initbin = vfs_lookup("/bin/init");
     if (initbin) {
         u64 entry = 0, rsp = 0;
-        kprintf("yart: preparing /bin/init for ring 3...\n");
+        kprintf("yart: loading ring-3 compositor (/bin/init)...\n");
         if (user_prepare_elf(initbin, &entry, &rsp)) {
-            task_t *it = sched_create_user("init", entry, rsp);
+            task_t *it = sched_create_user("wm", entry, rsp);
             if (it) {
-                /* assign the logged-in user's identity to the init task */
-                u32 uid = 1000;
-                const char *acct = "root";
-                bool admin = true;
-                if (g_session.current_user >= 0) {
-                    uid  = 1000u + (u32)g_session.current_user;
-                    acct = g_session.users[g_session.current_user].username;
-                    admin = g_session.users[g_session.current_user].is_admin;
-                }
-                it->uid = uid; it->euid = uid; it->gid = uid;
-                it->elev_allowed = admin;
-                strncpy(it->account, acct, sizeof it->account - 1);
-                /* give the user their home directory */
+                it->uid = it->euid = it->gid = 1000;
+                it->elev_allowed = true;
+                strncpy(it->account, "demo", sizeof it->account - 1);
                 vnode_t *hy = vfs_lookup("/home/yart");
-                if (hy) { hy->uid = uid; hy->mode = 0755; hy->dirty = true; }
-                kprintf("yart: init task uid=%u account=%s admin=%d\n",
-                        uid, acct, admin ? 1 : 0);
+                if (hy) { hy->uid = 1000; hy->mode = 0755; hy->dirty = true; }
+                kprintf("yart: wm task pid=%u (ring-3 compositor)\n", it->pid);
             }
-        } else {
-            kprintf("yart: /bin/init prepare failed\n");
-        }
-    } else {
-        kprintf("yart: /bin/init not found, skipping ring-3 launch\n");
-    }
+        } else kprintf("yart: /bin/init ELF prepare failed\n");
+    } else kprintf("yart: /bin/init not found\n");
 
-    /* Watchdog / service supervisor: verify it detects + restarts a stalled
-     * service, then register the desktop loop as a supervised service. */
     watchdog_selftest();
-    g_desktop_wd = watchdog_register_service("desktop", desktop_reset);
+    g_desktop_wd = watchdog_register_service("wm", wm_reset);
 
-    kprintf("yart: kernel up; entering desktop loop (idle task pid 0).\n");
+    kprintf("yart: kernel up.  compositor owns the screen.\n");
     sti();
-    smp_ap_kwork_demo();   /* queue kernel work to every AP (wake-IPI proof) */
+    smp_ap_kwork_demo();
 
-    /* event loop - runs as the idle task; sched_idle_sleep() hands the CPU
-       to user tasks when they are ready.  User tasks run on the APs too:
-       /bin/init forks children and the scheduler load-balances them onto
-       the least-loaded core (see the 'smp:' lines for each child's CPU). */
     u64 last_sync = 0;
     for (;;) {
-        watchdog_kick(g_desktop_wd);      /* heartbeat: "desktop is alive" */
-        net_service();                    /* NIC RX/TX + DHCP + UDP        */
-        audio_poll();                     /* accumulate HDA playback pos   */
-        usb_hid_poll();                   /* poll the USB keyboard         */
-        desktop_tick(pit_ticks() * 10);   /* PIT/APIC @100Hz -> ms */
+        watchdog_kick(g_desktop_wd);
+        net_service();
+        audio_poll();
+        usb_hid_poll();
         sched_reap_orphans();
-        /* persist dirty files about once a second (disk-backed) */
         if (blkfs_active() && pit_ticks() - last_sync >= 100) {
             int n = blkfs_sync();
             last_sync = pit_ticks();

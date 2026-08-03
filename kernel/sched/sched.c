@@ -705,10 +705,32 @@ u64 sched_after_isr(u64 current_rsp) {
     return sched_switch_after(cur, current_rsp);
 }
 
+/* Yield: mark the calling task ready and immediately call sched_switch_after
+ * via the "pending" flag path used by block/exit.  sched_after_isr() and
+ * sched_tick() honor TASK_READY on the current task; but when yield is
+ * entered from syscall context, sched_after_isr only switches away if the
+ * state is NOT TASK_RUNNING, so setting TASK_READY alone would not reschedule
+ * until the next timer tick.  We set a small thread-local flag via
+ * ap_yield_pending so the caller's sched_after_isr/sched_tick invocation
+ * immediately reconsiders.
+ *
+ * Simpler (and more reliable): we do the switch inline here and return the
+ * new RSP via a trampoline in the caller's stack frame... but that requires
+ * cooperation from the syscall stub.  Instead, we piggy-back on the
+ * sched_tick path by noting the yield and kicking the local APIC timer IPI
+ * (self-IPI) to force an immediate reschedule interrupt. */
 void sched_yield(void) {
     task_t *cur = sched_current();
-    if (cur && cur->state == TASK_RUNNING)
-        cur->state = TASK_READY;
+    if (!cur || cur->state != TASK_RUNNING) return;
+    cpu_local_t *c = get_cpu_local();
+    if (!c) return;
+    c->ap_yield_pending = 1;
+    cur->state = TASK_READY;
+    /* Send ourselves a reschedule IPI - this interrupts the kernel at the
+     * syscall return path and forces sched_tick() to run, which will pick
+     * the next task.  Cheaper than busy-looping for a tick. */
+    u8 my_id = (u8)apic_local_id();
+    lapic_send_ipi(my_id, 62);   /* vector 62 = AP_WAKE_VEC (reschedule) */
 }
 
 void sched_exit(int status) {

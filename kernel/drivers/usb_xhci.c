@@ -184,8 +184,31 @@ void usb_init(void) {
     cmd |= 0x07;
     pci_wr32(bus, dev, fn, 0x04, cmd);
 
-    u32 bar0 = pci_rd32(bus, dev, fn, 0x10) & ~0xF;
-    g_cap = (volatile u32 *)phys_to_virt((paddr_t)bar0);
+    /* Iterate BARs properly - skip over 64-bit BAR pairs.  QEMU's qemu-xhci
+     * places its MMIO BAR at BAR0 as a 64-bit BAR, and the high 32 bits are
+     * at offset 0x14 (BAR1) when BAR0's type field is 0x4 (64-bit). */
+    paddr_t bar0 = 0;
+    int bar_off;
+    for (bar_off = 0x10; bar_off <= 0x24; bar_off += 4) {
+        u32 lo = pci_rd32(bus, dev, fn, bar_off) & ~0xFu;
+        u32 type = pci_rd32(bus, dev, fn, bar_off) & 0x6;
+        if (type == 0x0) {                     /* 32-bit memory BAR */
+            bar0 = (paddr_t)lo;
+            break;
+        } else if (type == 0x4) {              /* 64-bit memory BAR */
+            u32 hi = pci_rd32(bus, dev, fn, bar_off + 4);
+            bar0 = ((paddr_t)hi << 32) | lo;
+            break;
+        }
+        /* type 0x1 = I/O, type 0x2 (reserved) -> skip */
+    }
+    if (!bar0) { kprintf("usb: xHCI BAR not found\n"); return; }
+    /* The xHCI BAR can land above 4 GiB (QEMU places qemu-xhci at
+     * 0xc000004000) where Limine's HHDM pre-mapping may not cover it.
+     * Explicitly ensure the BAR is mapped before dereferencing. */
+    mmio_map(bar0, 0x4000);
+    g_cap = (volatile u32 *)phys_to_virt(bar0);
+    if (!g_cap) { kprintf("usb: xHCI BAR is NULL\n"); return; }
     u8 caplen = (u8)(g_cap[0] & 0xFF);
     g_oper = (volatile u32 *)((u8 *)g_cap + caplen);
     u32 hcsp1 = g_cap[0x04 >> 2];

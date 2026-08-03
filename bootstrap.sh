@@ -1,66 +1,58 @@
 #!/usr/bin/env bash
-# bootstrap.sh - one-shot setup + build + run for Yart OS.
-#
-# Run from inside the yart/ directory:
-#     chmod +x bootstrap.sh
-#     ./bootstrap.sh            # builds toolchain (if missing), limine, ISO, then runs QEMU
-#     ./bootstrap.sh fast       # SKIP cross-compiler; use host x86_64-linux-gnu-gcc
-#     ./bootstrap.sh iso        # build ISO only (no run)
-#     ./bootstrap.sh usb /dev/sdX   # burn to USB
-#
+# bootstrap.sh — install host build dependencies on common distros.
+# Usage: ./bootstrap.sh         (auto-detects distro)
 set -euo pipefail
-cd "$(dirname "$0")"
 
-MODE="${1:-full}"
+echo "Yart OS — host dependency bootstrap"
+echo
 
-step() { printf "\n\033[1;36m==>\033[0m %s\n" "$*"; }
+install_debian() {
+    echo "[*] Debian/Ubuntu detected — installing build deps with apt..."
+    sudo apt update
+    sudo apt install -y build-essential nasm xorriso git python3 python3-pil \
+                        librsvg2-bin qemu-system-x86 ovmf
+}
 
-# ---- 0. host deps ----
-step "Installing host dependencies (sudo)"
-sudo apt-get update -qq
-sudo apt-get install -y --no-install-recommends \
-    build-essential nasm xorriso qemu-system-x86 ovmf mtools git \
-    bison flex libgmp-dev libmpc-dev libmpfr-dev texinfo wget \
-    imagemagick
+install_arch() {
+    echo "[*] Arch detected — installing build deps with pacman..."
+    sudo pacman -Sy --needed base-devel nasm xorriso git python python-pillow \
+                            librsvg qemu-system-x86 edk2-ovmf
+}
 
-# ---- 1. toolchain ----
-if [ "$MODE" = "fast" ]; then
-    CROSS=x86_64-linux-gnu
-    step "Using host toolchain ($CROSS-gcc)"
-else
-    if ! command -v x86_64-elf-gcc >/dev/null 2>&1 \
-       && [ ! -x "$HOME/opt/cross/bin/x86_64-elf-gcc" ]; then
-        step "Building x86_64-elf cross compiler (~20 min, one time)"
-        ./scripts/build-toolchain.sh
+install_fedora() {
+    echo "[*] Fedora detected — installing build deps with dnf..."
+    sudo dnf install -y @development-tools nasm xorriso git python3 python3-pillow \
+                        librsvg2-tools qemu-system-x86 edk2-ovmf
+}
+
+install_macos() {
+    echo "[*] macOS detected — installing build deps with Homebrew..."
+    if ! command -v brew >/dev/null; then
+        echo "Install Homebrew first: https://brew.sh"; exit 1
     fi
-    export PATH="$HOME/opt/cross/bin:$PATH"
-    CROSS=x86_64-elf
-    step "Using cross toolchain ($CROSS-gcc)"
+    brew install nasm xorriso git python3 qemu librsvg
+    pip3 install Pillow
+    echo "NOTE: OVMF (UEFI firmware) not installed via brew — BIOS boot will work."
+}
+
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    case "$ID" in
+        ubuntu|debian|linuxmint|pop|elementary|zorin|kali) install_debian ;;
+        arch|manjaro|endeavouros)                         install_arch ;;
+        fedora|rhel|centos|rocky|alma)                    install_fedora ;;
+        *) echo "Unrecognized distro: $ID — see README.md for manual deps."; exit 1 ;;
+    esac
+elif [ "$(uname)" = "Darwin" ]; then
+    install_macos
+else
+    echo "Can't detect your OS. Install these manually:"
+    echo "  - C compiler (gcc/clang), GNU make, nasm, xorriso, git"
+    echo "  - python3 + Pillow (python3-pil)"
+    echo "  - rsvg-convert (librsvg2-bin / librsvg)"
+    echo "  - qemu-system-x86 (+ OVMF for UEFI)"
+    exit 1
 fi
 
-# ---- 2. Limine ----
-if [ ! -d limine ]; then
-    step "Fetching Limine bootloader"
-    ./scripts/get-limine.sh
-fi
-
-# ---- 3. build ISO ----
-step "Building Yart kernel + ISO ($(nproc) jobs)"
-make CROSS="$CROSS" -j"$(nproc)" iso
-
-# ---- 4. action ----
-case "$MODE" in
-  iso)
-    step "Done. yart.iso is at $(pwd)/yart.iso"
-    ;;
-  usb)
-    DEV="${2:-}"
-    [ -n "$DEV" ] || { echo "Usage: $0 usb /dev/sdX"; exit 1; }
-    step "Burning to $DEV"
-    sudo ./scripts/usb-deploy.sh "$DEV"
-    ;;
-  *)
-    step "Booting in QEMU (Ctrl+Alt+G to release mouse, close window to quit)"
-    ./scripts/run-qemu.sh
-    ;;
-esac
+echo
+echo "All dependencies installed. Try:  make -j\$(nproc) iso && ./scripts/run-qemu.sh"

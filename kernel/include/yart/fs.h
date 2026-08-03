@@ -16,9 +16,7 @@ typedef struct { u32 uid; u16 mask; } vfs_acl_entry_t; /* mask = PERM_* bits */
 
 typedef enum { VN_FILE = 1, VN_DIR = 2 } vnode_type_t;
 
-/* icon_id_t is defined in icons.h (the real enum with all ICON_* values).
- * Include it here so vnode can use the proper type in any include order. */
-#include <yart/icons.h>
+typedef int icon_id_t;   /* icons live in ring-3 now; kernel stores int */
 
 typedef struct vnode {
     char         name[VFS_MAX_NAME];

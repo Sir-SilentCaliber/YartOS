@@ -3,12 +3,15 @@
 #include <yart/fs.h>
 
 #define USER_VBASE   0x40000000UL    /* matches userland/init.ld          */
-#define USER_STACK_TOP 0x70000000UL
-#define USER_STACK_PAGES 4
+#define USER_STACK_TOP 0x80000000UL
+#define USER_STACK_PAGES 32
 
 /* Dynamic-memory (mmap) arena: between the ASLR code span and the stack. */
 #define USER_MMAP_BASE   0x50000000UL
 #define USER_MMAP_END    0x60000000UL
+/* Framebuffer window (ring-3 wm maps it here, above stack - well below
+ * the canonical-address hole and far away from the mmap/code regions). */
+#define USER_FB_BASE     0x70000000UL
 #define USER_CS      0x1B            /* GDT entry 3 (user code) | RPL=3   */
 #define USER_DS      0x23            /* GDT entry 4 (user data) | RPL=3   */
 

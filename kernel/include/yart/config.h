@@ -18,8 +18,9 @@
  *   topbar.height=26
  *   topbar.alpha=255
  *
- *   wallpaper.mode=gradient     # gradient|image
- *   wallpaper.path=/etc/wallpaper.bmp
+ *   wallpaper.mode=image        # gradient|image
+ *   wallpaper.path=/YartOS/kora/wallpaper.bmp
+ *   wallpaper.index=0
  *
  *   font.system=default
  *   font.terminal=default
@@ -65,6 +66,7 @@ typedef struct {
     /* wallpaper */
     char     wallpaper_mode[12];    /* "gradient" | "image" */
     char     wallpaper_path[128];
+    int      wallpaper_index;      /* index into wallpaper pack */
 
     /* fonts */
     char     font_system[CONFIG_STR_LEN];

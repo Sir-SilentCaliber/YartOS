@@ -29,8 +29,9 @@ void config_load_defaults(void) {
     g_config.topbar_height = 26;
     g_config.topbar_alpha  = 255;
 
-    strncpy(g_config.wallpaper_mode, "gradient", 11);
-    strncpy(g_config.wallpaper_path, "/etc/wallpaper.bmp", 127);
+    strncpy(g_config.wallpaper_mode, "image", 11);
+    strncpy(g_config.wallpaper_path, "/YartOS/kora/wallpaper.bmp", 127);
+    g_config.wallpaper_index = 0;
 
     strncpy(g_config.font_system,   "default", CONFIG_STR_LEN-1);
     strncpy(g_config.font_terminal, "default", CONFIG_STR_LEN-1);
@@ -112,8 +113,9 @@ static void apply(const char *key, const char *val) {
     }
     else if (strcmp(key, "topbar.height") == 0) g_config.topbar_height = parse_int(val);
     else if (strcmp(key, "topbar.alpha") == 0)  g_config.topbar_alpha = parse_int(val);
-    else if (strcmp(key, "wallpaper.mode") == 0) strncpy(g_config.wallpaper_mode, val, 11);
-    else if (strcmp(key, "wallpaper.path") == 0) strncpy(g_config.wallpaper_path, val, 127);
+    else if (strcmp(key, "wallpaper.mode") == 0)  strncpy(g_config.wallpaper_mode, val, 11);
+    else if (strcmp(key, "wallpaper.path") == 0)  strncpy(g_config.wallpaper_path, val, 127);
+    else if (strcmp(key, "wallpaper.index") == 0) g_config.wallpaper_index = parse_int(val);
     else if (strcmp(key, "font.system") == 0)    strncpy(g_config.font_system,   val, CONFIG_STR_LEN-1);
     else if (strcmp(key, "font.terminal") == 0)  strncpy(g_config.font_terminal, val, CONFIG_STR_LEN-1);
     else if (strcmp(key, "mouse.accel") == 0)    g_config.mouse_accel = parse_int(val);
@@ -182,6 +184,7 @@ int config_save(const char *path) {
     n += snprintf(buf + n, sizeof buf - n, "topbar.height=%d\n", g_config.topbar_height);
     n += snprintf(buf + n, sizeof buf - n, "wallpaper.mode=%s\n", g_config.wallpaper_mode);
     n += snprintf(buf + n, sizeof buf - n, "wallpaper.path=%s\n", g_config.wallpaper_path);
+    n += snprintf(buf + n, sizeof buf - n, "wallpaper.index=%d\n", g_config.wallpaper_index);
     n += snprintf(buf + n, sizeof buf - n, "font.system=%s\n", g_config.font_system);
     n += snprintf(buf + n, sizeof buf - n, "font.terminal=%s\n", g_config.font_terminal);
     n += snprintf(buf + n, sizeof buf - n, "display.fps=%d\n", g_config.display_fps);
@@ -190,9 +193,21 @@ int config_save(const char *path) {
 
     vnode_t *v = vfs_lookup(path);
     if (!v) {
-        if (vfs_mkdir_p("/etc") < 0) return -1;
-        vnode_t *parent = vfs_lookup("/etc");
-        v = vfs_create(parent, "yart.conf", VN_FILE);
+        /* Ensure parent directory exists. Config lives in /etc/ by default
+         * (user-editable), while shipped assets live under /YartOS/kora/. */
+        const char *slash = path;
+        const char *last = 0;
+        while (*slash) { if (*slash == '/') last = slash; slash++; }
+        char parent[128]; int plen = 0;
+        if (last && last > path) {
+            plen = (int)(last - path);
+            if (plen >= (int)sizeof parent) plen = (int)sizeof parent - 1;
+            memcpy(parent, path, plen); parent[plen] = 0;
+            if (vfs_mkdir_p(parent) < 0) { /* fall through, maybe root */ }
+        }
+        vnode_t *pdir = vfs_lookup(parent[0] ? parent : "/");
+        const char *file_name = last ? last+1 : path;
+        v = vfs_create(pdir, file_name, VN_FILE);
         if (!v) return -1;
     }
     vfs_truncate(v, 0);

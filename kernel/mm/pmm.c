@@ -238,6 +238,28 @@ void pmm_mark_page_used(paddr_t p) {
     spin_unlock(&pmm_lock);
 }
 
+/* Reserve a contiguous range (e.g. the bootloader's initrd module: Limine
+ * loads modules into memory the memmap still reports as USABLE, so the
+ * PMM would happily allocate + ZERO those frames - destroying the initrd
+ * the moment a heap grow lands inside it during vfs import).  Called
+ * BEFORE any pmm allocation. */
+void pmm_mark_range_used(paddr_t base, size_t npages) {
+    for (size_t k = 0; k < npages; k++)
+        pmm_mark_page_used(base + k * PAGE_SIZE);
+}
+
+bool pmm_page_used(paddr_t p) {
+    size_t i = p / PAGE_SIZE;
+    if (i >= total_pages) return true;
+    return BIT_TST(i);
+}
+
+u32 pmm_page_refs(paddr_t p) {
+    size_t i = p / PAGE_SIZE;
+    if (i >= total_pages) return 0;
+    return refs[i];
+}
+
 /* Boot-time battery: alloc/ref/unref/free accounting, zero-on-free, and
  * double-free detection.  Returns true when everything checks out. */
 bool pmm_selftest(void) {

@@ -446,6 +446,9 @@ static void sync_node(vnode_t *v) {
 
 int blkfs_sync(void) {
     if (!g_active) return 0;
+    /* The tree is walked + written through here while user syscalls may
+     * mutate it on other CPUs: hold the VFS lock for the whole sync. */
+    vfs_lock();
     /* process queued deletes first (journaled so a crash can't resurrect) */
     for (int i = 0; i < g_deleted_count; i++) {
         jrn_write(g_deleted[i], JRN_DELETE, NULL, 0);
@@ -458,7 +461,9 @@ int blkfs_sync(void) {
     sync_node(vfs_root());
     flush_bitmaps();
     jrn_clear_range();      /* all records applied - compact the log */
-    return (int)(g_synced_files - before);
+    int n = (int)(g_synced_files - before);
+    vfs_unlock();
+    return n;
 }
 
 void blkfs_note_delete(const char *path) {
@@ -648,6 +653,66 @@ static void load_inode_into_tree(blkfs_inode_t *in) {
             off += take;
         }
     }
+}
+
+/* Boot-time durability test for the indirect-block path: a 64 KiB file is
+ * 128 blocks - past the 32 direct pointers, so blocks 32..127 must be
+ * reached through the indirect tables.  We write it, sync, then read every
+ * block back FROM THE DISK (through inode_data_block) and CRC-verify it.
+ * The file is deleted afterwards (exercising indirect-table freeing). */
+void blkfs_selftest(void) {
+    if (!g_active) return;
+    kprintf("blkfs: selftest (64 KiB through indirect blocks)\n");
+    bool ok = true;
+    vnode_t *d = vfs_lookup("/home/yart");
+    if (!d) { kprintf("blkfs: !! no /home/yart for selftest\n"); return; }
+    vnode_t *v = vfs_lookup("/home/yart/big_selftest.bin");
+    if (!v) v = vfs_create(d, "big_selftest.bin", VN_FILE);
+    if (!v) { kprintf("blkfs: !! selftest create failed\n"); return; }
+
+    const u32 SZ = 64 * 1024;
+    u8 *buf = kmalloc(SZ);
+    for (u32 i = 0; i < SZ; i++) buf[i] = (u8)(i * 31 + 7);
+    if (vfs_write(v, buf, 0, SZ) != (int)SZ) { ok = false; }
+    blkfs_sync();
+    if (v->size != SZ) {
+        kprintf("blkfs: !! selftest: vnode size %u != %u\n",
+                (u32)v->size, SZ);
+        ok = false;
+    }
+    blkfs_inode_t *in = inode_find("/home/yart/big_selftest.bin");
+    if (!in) { ok = false; }
+    else if (in->blocks != SZ / BLK_SECTOR_SIZE) {
+        kprintf("blkfs: !! selftest: on-disk blocks %u != %u\n",
+                in->blocks, SZ / BLK_SECTOR_SIZE);
+        ok = false;
+    }
+    if (ok && in) {
+        u32 nblocks = in->blocks;
+        for (u32 b = 0; b < nblocks; b++) {
+            u32 db = inode_data_block(in, b, false);
+            if (db == 0xFFFFFFFFu) { ok = false; break; }
+            u8 rb[BLK_SECTOR_SIZE];
+            io_read(g_super.data_start_sector + db, 1, rb);
+            if (memcmp(rb, buf + (size_t)b * BLK_SECTOR_SIZE,
+                       BLK_SECTOR_SIZE) != 0) {
+                kprintf("blkfs: !! selftest: block %u content mismatch\n", b);
+                ok = false;
+                break;
+            }
+            u32 expect = crc_of(g_super.data_start_sector + db);
+            if (expect != crc32_bytes(rb, BLK_SECTOR_SIZE)) {
+                kprintf("blkfs: !! selftest: block %u CRC mismatch\n", b);
+                ok = false;
+                break;
+            }
+        }
+    }
+    kprintf("blkfs: selftest %s (128 blocks, indirect tables, CRCs)\n",
+            ok ? "PASS" : "FAIL");
+    kfree(buf);
+    vfs_unlink(v);                /* also frees indirect tables */
+    blkfs_sync();
 }
 
 int blkfs_init(void) {

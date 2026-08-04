@@ -143,6 +143,33 @@ static int alloc_fd(void) {
 }
 
 /* ---------- syscall handlers ---------- */
+/* ---- pipe helpers ---- */
+static yart_pipe_t *pipe_new(void) {
+    yart_pipe_t *p = kzalloc(sizeof *p);
+    if (p) { p->refs = 2; p->read_ends = 1; p->write_ends = 1; }
+    return p;
+}
+static void pipe_put(yart_pipe_t *p) {
+    if (!p) return;
+    if (--p->refs <= 0) kfree(p);
+}
+static void pipe_write(yart_pipe_t *p, const u8 *src, u32 n) {
+    for (u32 i = 0; i < n; i++) {
+        p->buf[p->head] = src[i];
+        p->head = (p->head + 1) % PIPE_BUF_SIZE;
+    }
+    p->count += n;
+}
+static u32 pipe_read(yart_pipe_t *p, u8 *dst, u32 n) {
+    u32 got = 0;
+    while (got < n && p->count > 0) {
+        dst[got++] = p->buf[p->tail];
+        p->tail = (p->tail + 1) % PIPE_BUF_SIZE;
+        p->count--;
+    }
+    return got;
+}
+
 static i64 sys_write(int fd, const char *buf, u64 n) {
     if (!uptr((u64)buf, n)) return -1;
     if (fd == 1 || fd == 2) {
@@ -156,6 +183,18 @@ static i64 sys_write(int fd, const char *buf, u64 n) {
     }
     fd_entry_t *f = fd_get(fd);
     if (!f) return -1;
+    if (f->is_pipe) {
+        yart_pipe_t *p = f->pipe;
+        if (!p) return -1;
+        if (p->read_ends == 0) return -1;        /* reader gone: EPIPE-ish */
+        u32 room = PIPE_BUF_SIZE - p->count;
+        if (room == 0) return -2;                /* would block            */
+        u32 k = (u32)n < room ? (u32)n : room;
+        stac();
+        pipe_write(p, (const u8 *)buf, k);
+        clac();
+        return (i64)k;
+    }
     if (!perm_ok(f->vn, PERM_W)) return -1;     /* write permission        */
     stac();
     int w = vfs_write(f->vn, buf, f->pos, n);
@@ -169,6 +208,19 @@ static i64 sys_read(int fd, char *buf, u64 n) {
     fd_entry_t *f = fd_get(fd);
     if (!f) return -1;
     if (fd <= 2) return 0;
+    if (f->is_pipe) {
+        yart_pipe_t *p = f->pipe;
+        if (!p) return -1;
+        if (p->count == 0) {
+            if (p->write_ends == 0) return 0;    /* EOF: writer closed    */
+            return -2;                           /* would block           */
+        }
+        u32 k = (u32)n;
+        stac();
+        k = pipe_read(p, (u8 *)buf, k);
+        clac();
+        return (i64)k;
+    }
     if (!perm_ok(f->vn, PERM_R)) return -1;     /* read permission         */
     stac();
     int r = vfs_read(f->vn, buf, f->pos, n);
@@ -227,9 +279,53 @@ static i64 sys_open(const char *path, int flags) {
 static i64 sys_close(int fd) {
     fd_entry_t *f = fd_get(fd);
     if (!f || fd < 3) return -1;
-    vnode_unref(f->vn);                  /* release the fd's reference      */
+    if (f->is_pipe && f->pipe) {
+        yart_pipe_t *p = f->pipe;
+        if (f->pipe_is_read_end) {
+            if (p->read_ends > 0) p->read_ends--;
+        } else {
+            if (p->write_ends > 0) p->write_ends--;
+        }
+        pipe_put(p);
+        f->pipe = NULL;
+    } else {
+        vnode_unref(f->vn);              /* release the fd's reference      */
+    }
     f->in_use = false;
     f->vn = NULL;
+    f->is_pipe = false;
+    return 0;
+}
+
+/* pipe(fds[2]): create an in-kernel byte pipe.  fds[0] = read end,
+ * fds[1] = write end.  Returns 0 or -1. */
+static i64 sys_pipe(int *fds) {
+    if (!g_sys_from_user) return -1;
+    if (!uptr((u64)fds, 2 * sizeof(int))) return -1;
+    task_t *t = cur();
+    if (!t) return -1;
+    /* allocate ONE fd, mark it in_use, THEN allocate the second - alloc_fd
+     * returns the first free slot, so allocating both up front yields the
+     * SAME fd twice (the first isn't reserved yet) */
+    int r = alloc_fd();
+    if (r < 0) return -1;
+    t->fds[r].in_use = true;
+    int w = alloc_fd();
+    if (w < 0) { t->fds[r].in_use = false; return -1; }
+    t->fds[w].in_use = true;
+    yart_pipe_t *p = pipe_new();
+    if (!p) { t->fds[r].in_use = t->fds[w].in_use = false; return -1; }
+    fd_entry_t *fr = &t->fds[r];
+    fd_entry_t *fw = &t->fds[w];
+    fr->is_pipe = true; fr->pipe_is_read_end = true;
+    fr->pipe = p; fr->vn = NULL; fr->pos = 0;
+    fw->is_pipe = true; fw->pipe_is_read_end = false;
+    fw->pipe = p; fw->vn = NULL; fw->pos = 0;
+    stac();
+    fds[0] = r;
+    fds[1] = w;
+    clac();
+    kprintf("pipe: pid %d got fds %d/%d\n", t->pid, r, w);
     return 0;
 }
 
@@ -535,10 +631,10 @@ static i64 sys_time(void) {
            (i64)(t.hour * 10000 + t.minute * 100 + t.second);
 }
 
-static i64 sys_waitpid(u32 pid, int *status_out) {
+static i64 sys_waitpid(u32 pid, int *status_out, int flags) {
     if (status_out && !uptr((u64)status_out, sizeof(int))) return -1;
     if (status_out) { stac(); }
-    i64 r = (i64)sched_waitpid(pid, status_out);
+    i64 r = (i64)sched_waitpid(pid, status_out, flags);
     if (status_out) { clac(); }
     return r;
 }
@@ -612,7 +708,54 @@ static i64 sys_udp_recv(u8 *buf, u16 cap) {
     return (i64)n;
 }
 
+/* sigreturn: restore a frame that signal delivery saved on the user
+ * stack.  The user handler returned into the vdso-style trampoline,
+ * which called this with rdi = the saved frame's address.  We copy it
+ * back into the current frame and return into the interrupted code. */
+#define SIGRETURN_TRAMP_VA 0x6F000000UL   /* must match sched.c/user.c */
+static void sys_sigreturn(cpu_regs_t *r) {
+    if (!g_sys_from_user) return;
+    u64 fp = r->rdi;
+    if (fp < USER_VBASE || fp + sizeof(cpu_regs_t) > USER_STACK_TOP ||
+        !vmm_user_range_ok(fp, sizeof(cpu_regs_t))) {
+        kprintf("sigreturn: bad frame ptr %p - killing task %d\n",
+                (void *)fp, task_getpid());
+        sched_exit(-1);
+        return;
+    }
+    cpu_regs_t saved;
+    stac();
+    memcpy(&saved, (void *)fp, sizeof saved);
+    clac();
+    /* Restore the interrupted instruction state.  The saved frame must be
+     * a USER frame: resuming with a kernel cs/ss would iretq into kernel
+     * mode with the user handler's registers (corruption), and a user
+     * frame whose SS.RPL != 3 would iretq -> #GP(err = SS selector) on
+     * some CPUs.  Both are fatal classes - reject the frame and kill. */
+    if ((saved.cs & 3) != 3 || (saved.ss & 3) != 3 ||
+        saved.rip == 0 || saved.rip == SIGRETURN_TRAMP_VA) {
+        kprintf("sigreturn: BAD saved frame (cs=%lx ss=%lx rip=%p) - "
+                "killing task %d\n", saved.cs, saved.ss,
+                (void *)saved.rip, task_getpid());
+        sched_exit(-1);
+        return;
+    }
+    saved.ss = USER_DS;                    /* normalize (never 0x20) */
+    /* restore ALL 15 GPRs (r15..rax) + flags + instruction state */
+    memcpy(&r->r15, &saved.r15, 15 * 8);
+    r->rip = saved.rip;
+    r->cs  = saved.cs;
+    r->rflags = saved.rflags;
+    r->rsp = saved.rsp;
+    r->ss  = saved.ss;
+}
+
 /* exec: replace this task's address space with `path`, passing `argv` and
+ * `envp` (both NULL-terminated arrays of user strings).  All strings are
+ * copied into KERNEL memory first, because user_exec destroys the old
+ * address space.  On success the frame is rewritten and the syscall
+ * returns 0 from inside the NEW program. */
+#define EXEC_MAX_ARGS  32/* exec: replace this task's address space with `path`, passing `argv` and
  * `envp` (both NULL-terminated arrays of user strings).  All strings are
  * copied into KERNEL memory first, because user_exec destroys the old
  * address space.  On success the frame is rewritten and the syscall
@@ -830,6 +973,9 @@ static i64 sys_wm_flip(u32 id);
 static i64 sys_wm_scan(wm_surf_info_t *out, u32 max);
 static i64 sys_wm_focus(u32 pid);
 static i64 sys_wm_destroy(u32 id);
+static i64 sys_wm_title(u32 id, const char *name);
+static void sys_sigreturn(cpu_regs_t *r);
+static i64 sys_pipe(int *fds);
 
 static void syscall_handler(cpu_regs_t *r) {
     check_user_segments(r);
@@ -858,7 +1004,8 @@ static void syscall_handler(cpu_regs_t *r) {
         r->rax = c ? (u64)c->pid : (u64)-1;   /* parent gets the child pid */
         break;
     }
-    case SYS_WAITPID:  r->rax = (u64)sys_waitpid((u32)a0, (int *)a1); break;
+    case SYS_WAITPID:  r->rax = (u64)sys_waitpid((u32)a0, (int *)a1,
+                                                 (int)r->r10); break;
     case SYS_DOAS:     r->rax = (u64)sys_doas((const char *)a0); break;
     case SYS_CHMOD:    r->rax = (u64)sys_chmod((const char *)a0, (u16)a1); break;
     case SYS_DROP:     r->rax = (u64)sys_drop(); break;
@@ -898,6 +1045,9 @@ static void syscall_handler(cpu_regs_t *r) {
                                                   (u32)a1); break;
     case SYS_WM_FOCUS:  r->rax = (u64)sys_wm_focus((u32)a0); break;
     case SYS_WM_DESTROY: r->rax = (u64)sys_wm_destroy((u32)a0); break;
+    case SYS_SIGRETURN:  sys_sigreturn(r); break;
+    case SYS_WM_TITLE:   r->rax = (u64)sys_wm_title((u32)a0, (const char *)a1); break;
+    case SYS_PIPE:       r->rax = (u64)sys_pipe((int *)a0); break;
     default:
         kprintf("syscall: bad #%lu\n", r->rax);
         r->rax = (u64)-1;
@@ -1130,8 +1280,8 @@ static u64 sys_poll_mouse(mouse_ev_t *out) {
  * centered position at create time and hands it to both sides. */
 
 #define WM_MAX_SURFACES 8
-#define WM_SURF_APP_BASE 0x7A000000UL
-#define WM_SURF_WM_BASE  0x76000000UL
+#define WM_SURF_APP_BASE 0x6C000000UL
+#define WM_SURF_WM_BASE  0x6D000000UL
 #define WM_SURF_STRIDE   0x200000UL        /* 2 MiB per slot             */
 #define WM_SURF_MAX_W 640
 #define WM_SURF_MAX_H 480
@@ -1148,6 +1298,7 @@ typedef struct {
     u64    app_va, wm_va;
     bool   app_mapped, wm_mapped;
     bool   dirty;
+    char   title[32];
 } wm_surface_t;
 
 static wm_surface_t g_wm_surfs[WM_MAX_SURFACES];
@@ -1213,6 +1364,8 @@ static i64 sys_wm_create(u32 w, u32 h, wm_surf_info_t *out) {
     info.app_va = s->app_va;
     info.owner_pid = s->owner_pid;
     info.dirty = 1;
+    strncpy(info.title, s->title[0] ? s->title : "App",
+            sizeof info.title - 1);
     stac();
     *(wm_surf_info_t *)out = info;
     clac();
@@ -1281,6 +1434,8 @@ static i64 sys_wm_scan(wm_surf_info_t *out, u32 max) {
         info.app_va = s->wm_va;              /* the WM-side VA!          */
         info.owner_pid = s->owner_pid;
         info.dirty = s->dirty ? 1 : 0;
+        strncpy(info.title, s->title[0] ? s->title : "App",
+                sizeof info.title - 1);
         s->dirty = false;
         stac();
         out[n++] = info;
@@ -1289,13 +1444,29 @@ static i64 sys_wm_scan(wm_surf_info_t *out, u32 max) {
     return (i64)n;
 }
 
+/* SYS_WM_TITLE(id, name): set the window title (drawn by the compositor
+ * in the title bar). */
+static i64 sys_wm_title(u32 id, const char *name) {
+    if (id >= WM_MAX_SURFACES || !g_wm_surfs[id].used) return -1;
+    task_t *t = cur();
+    if (t && t->pid != g_wm_surfs[id].owner_pid && t != g_wm_task) return -1;
+    char kt[32];
+    if (!copy_user_str((u64)name, kt, sizeof kt)) return -1;
+    strncpy(g_wm_surfs[id].title, kt, sizeof g_wm_surfs[id].title - 1);
+    g_wm_surfs[id].dirty = true;
+    return 0;
+}
+
 /* SYS_WM_FOCUS(pid): route keyboard to `pid` (and mouse copies).  The wm
  * calls this when the user clicks a window; 0 clears the focus. */
 static i64 sys_wm_focus(u32 pid) {
     if (cur() != g_wm_task) return -1;
     if (pid == 0) { g_focus_pid = 0; return 0; }
     task_t *t = sched_find(pid);
-    if (!t || !t->is_user || t->pid == 0) return -1;
+    /* reject dead/zombie tasks: focusing a zombie makes the wm think a
+     * relaunch isn't needed while the app never runs again */
+    if (!t || !t->is_user || t->pid == 0 ||
+        t->state == TASK_ZOMBIE) return -1;
     g_focus_pid = pid;
     kprintf("wm: input focus -> pid %u\n", pid);
     return 0;

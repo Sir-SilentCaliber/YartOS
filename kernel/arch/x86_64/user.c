@@ -40,6 +40,79 @@ typedef struct PACKED {
     u64 offset, vaddr, paddr, filesz, memsz, align;
 } phdr_t;
 #define PT_LOAD 1
+#define SHT_RELA 4          /* .rela.dyn section type (NOT DT_RELA=7!) */
+#define R_X86_64_RELATIVE 8
+
+/* ELF section header (for finding .rela.dyn without section names).
+ * NOTE: sh_link/sh_info are u32 each - declaring them u64 makes the
+ * struct 72 bytes instead of the real 64 and the shentsize guard below
+ * rejects every file (64 < 72). */
+typedef struct PACKED {
+    u32 name, type;
+    u64 flags, addr, offset, size;
+    u32 link, info;
+    u64 addralign, entsize;
+} shdr_t;
+
+/* Apply R_X86_64_RELATIVE relocations: for a PIE linked with
+ * -z combreloc, every absolute pointer in .data.rel.ro (e.g.
+ * char *argv[] = {...}) is stored as a bias-relative addend and needs
+ * the load bias added.  Without this, an exec'd binary's first argv
+ * access reads an unrelocated ~0xf018 and crashes.  The relocation
+ * section (.rela.dyn) is NON-alloc, so we read it straight from the
+ * file buffer (v->data) - no mapping needed. */
+static void apply_relocations(vnode_t *v, const ehdr_t *eh, u64 bias) {
+    if (eh->shoff == 0 || eh->shnum == 0 || eh->shentsize < sizeof(shdr_t))
+        return;
+    if (eh->shoff > v->size) return;
+    u64 n = (u64)eh->shnum;
+    if (eh->shoff + n * eh->shentsize > v->size) return;
+    for (u64 i = 0; i < n; i++) {
+        shdr_t *sh = (shdr_t *)((u8 *)v->data + eh->shoff + i * eh->shentsize);
+        if (sh->type != SHT_RELA) continue;      /* SHT_RELA = 4 */
+        if (sh->offset > v->size ||
+            sh->offset + sh->size > v->size) continue;
+        u8 *base = (u8 *)v->data + sh->offset;
+        for (u64 off = 0; off + 24 <= sh->size; off += 24) {
+            u64 r_offset = *(u64 *)(base + off);        /* +0 */
+            u64 r_info   = *(u64 *)(base + off + 8);    /* +8 */
+            u64 r_addend = *(u64 *)(base + off + 16);   /* +16 */
+            if ((r_info & 0xFFFFFFFFu) != R_X86_64_RELATIVE) continue;
+            /* For -z combreloc PIE, the addend is the value to place
+             * (bias-relative, e.g. 0xf018).  The final value = bias + addend. */
+            u64 *slot = (u64 *)(bias + r_offset);
+            stac();
+            *slot = bias + r_addend;
+            clac();
+        }
+    }
+}
+
+/* vdso-style sigreturn trampoline, mapped RX into every user process at a
+ * fixed VA.  A signal handler returns into it; it syscalls SYS_SIGRETURN
+ * so the kernel can restore the interrupted frame.  Must match
+ * SIGRETURN_TRAMP_VA in sched.c and SYS_SIGRETURN_NR. */
+#define SIGRETURN_TRAMP_VA 0x6F000000UL
+#define SIGRETURN_TRAMP_NR 51
+
+static void user_map_trampoline(u64 *pml4, user_region_t *rs, int *nrs) {
+    /* mov rdi, [rsp-16] ; at trampoline entry rsp == ret_va+8, and the
+     * frame-pointer slot lives at ret_va-8 == rsp-16 (see sched.c) */
+    u8 code[32];
+    code[0] = 0x48; code[1] = 0x8B; code[2] = 0x7C; code[3] = 0x24; /* mov rdi,[rsp+disp8] */
+    code[4] = 0xF0;                                                 /* -16 */
+    code[5]  = 0x48; code[6]  = 0xC7; code[7]  = 0xC0;              /* mov rax, imm32 */
+    code[8]  = SIGRETURN_TRAMP_NR; code[9] = 0; code[10] = 0; code[11] = 0;
+    code[12] = 0x0F; code[13] = 0x05;                               /* syscall */
+    code[14] = 0xEB; code[15] = 0xFE;                               /* jmp $  */
+    if (vmm_reserve_in(pml4, rs, nrs, SIGRETURN_TRAMP_VA, 1,
+                       PTE_US, 0) != 0)            /* RX (no NX, no RW) */
+        return;
+    paddr_t p = pmm_alloc_page();
+    if (!p) return;
+    memcpy(phys_to_virt(p), code, 16);
+    vmm_map_in(pml4, SIGRETURN_TRAMP_VA, p, PTE_PRESENT | PTE_US);
+}
 
 /* ELF program-header permission bits */
 #define PF_X 1
@@ -204,6 +277,9 @@ static u64 build_user_stack_into(u64 *pml4, user_region_t *rs, int *nrs,
     u64 strbytes = 0;
     for (int i = 0; i < argc; i++) strbytes += strlen(kargv[i]) + 1;
     for (int i = 0; i < envc; i++) strbytes += strlen(kenvp[i]) + 1;
+    /* argv strings byte count (envp strings follow them in memory) */
+    u64 argv_bytes = 0;
+    for (int i = 0; i < argc; i++) argv_bytes += strlen(kargv[i]) + 1;
 
     u64 strings = top - 8 - strbytes;        /* grows DOWN from top-8 */
     u64 envp_va = strings - (u64)(envc + 1) * 8;
@@ -223,9 +299,11 @@ static u64 build_user_stack_into(u64 *pml4, user_region_t *rs, int *nrs,
         memcpy(p, kenvp[i], n);
         p += n;
     }
-    /* envp pointers */
+    /* envp pointers: walk AFTER the argv strings (a naive walk from the
+     * top makes envp[0] point at argv[0]'s string - exec'd programs saw
+     * env = "/bin/hello") */
     u64 *ep = (u64 *)envp_va;
-    p = (char *)strings;
+    p = (char *)strings + argv_bytes;
     for (int i = 0; i < envc; i++) {
         ep[i] = (u64)p;
         p += strlen(kenvp[i]) + 1;
@@ -265,6 +343,8 @@ bool user_prepare_elf(vnode_t *v, u64 *entry_out, u64 *rsp_out,
     u64 top  = pick_stack_top();
     u64 entry = load_user_elf_into(v, bias, pml4, rs, &nrs);
     if (!entry) goto fail;
+    apply_relocations(v, (const ehdr_t *)v->data, bias);
+    user_map_trampoline(pml4, rs, &nrs);       /* sigreturn helper page */
 
     /* minimal process image: argc=1, argv=["init"] */
     char *argv0 = (char *)"init";
@@ -316,6 +396,8 @@ bool user_exec(vnode_t *v, char *const kargv[], int argc,
     u64 top  = pick_stack_top();
     u64 entry = load_user_elf_into(v, bias, new_pml4, rs, &nrs);
     if (!entry) goto fail;
+    apply_relocations(v, (const ehdr_t *)v->data, bias);
+    user_map_trampoline(new_pml4, rs, &nrs);   /* sigreturn helper page */
 
     u64 user_rsp = build_user_stack_into(new_pml4, rs, &nrs, top,
                                          kargv, argc, kenvp, envc);
@@ -335,6 +417,11 @@ bool user_exec(vnode_t *v, char *const kargv[], int argc,
     t->mem_pages = 0;
     for (int i = 0; i < nrs; i++) t->mem_pages += rs[i].npages;
     fpu_capture_clean(t->fpu_area);          /* fresh FPU state, like a real exec */
+    /* exec resets signal state: handlers, pending and blocked signals all
+     * die with the old image (POSIX: caught signals reset to default) */
+    memset(t->sig_handlers, 0, sizeof t->sig_handlers);
+    t->sig_pending = 0;
+    t->sig_blocked = 0;
 
     /* Rewrite the frame: the syscall returns straight into the new
      * program (rax = 0 = exec success). */

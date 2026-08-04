@@ -47,17 +47,16 @@ static void draw_classic_arrow(surface_t *s, int cx, int cy, u32 c) {
 
 static void draw_ui(void) {
     surface_t *s = &G_surf;
-    /* body */
+    /* body.  NOTE: no title bar here - the COMPOSITOR draws the window
+     * chrome (title + close X) above this surface; drawing a second one
+     * inside the client area looked like a duplicated window frame. */
     sf_fill(s, RGB(0x14, 0x16, 0x1B));
-    sf_fill_rect(s, 0, 0, WIN_W, TITLE_H, RGB(0x1E, 0x21, 0x28));
-    sf_text(s, 10, 5, "Yart Settings", RGB(0xEC, 0xEE, 0xF1));
-    sf_text(s, WIN_W - 60, 5, "X", RGB(0xEC, 0xEE, 0xF1));
 
-    sf_text(s, 16, TITLE_H + 14, "Cursor theme", RGB(0xEC, 0xEE, 0xF1));
-    sf_hline(s, 16, TITLE_H + 34, WIN_W - 32, RGB(0x2A, 0x2E, 0x36));
+    sf_text(s, 16, 14, "Cursor theme", RGB(0xEC, 0xEE, 0xF1));
+    sf_hline(s, 16, 34, WIN_W - 32, RGB(0x2A, 0x2E, 0x36));
 
     /* theme rows */
-    int y = TITLE_H + 48;
+    int y = 48;
     for (int i = 0; i < G_row_n; i++) {
         int ry = y + i * 52;
         u32 bg = (i == G_sel) ? RGB(0x24, 0x2E, 0x3E) : RGB(0x1A, 0x1D, 0x24);
@@ -104,7 +103,8 @@ static void write_config(void) {
 }
 
 static int hit_row(int y) {
-    int ry = TITLE_H + 48;
+    int ry = 48;                     /* content starts at y=48 now (no
+                                        client-area title bar) */
     for (int i = 0; i < G_row_n; i++) {
         if (y >= ry + i * 52 && y < ry + i * 52 + 46) return i;
     }
@@ -132,6 +132,33 @@ int main_entry(int argc, char **argv, char **envp) {
         G_row_n++;
     }
     G_sel = 0;
+    /* select the row matching the CURRENT config (the wm polls this file,
+     * so the app must show what is actually active, not always row 0) */
+    {
+        int fd = open("/home/yart/cursor.conf", 0);      /* O_RDONLY */
+        if (fd >= 0) {
+            char cfg[64];
+            long n = read(fd, cfg, (long)sizeof cfg - 1);
+            close(fd);
+            if (n > 0) {
+                cfg[n] = 0;
+                char *p = cfg;
+                while (*p) {
+                    if (p[0]=='t'&&p[1]=='h'&&p[2]=='e'&&p[3]=='m'&&p[4]=='e'&&p[5]=='=') {
+                        char name[24];
+                        int i = 0;
+                        p += 6;
+                        while (*p && *p!='\n' && *p!='\r' && i<23) name[i++] = *p++;
+                        name[i] = 0;
+                        for (int r = 0; r < G_row_n; r++)
+                            if (strcmp(G_rows[r].cfg, name) == 0) { G_sel = r; break; }
+                        break;
+                    }
+                    p++;
+                }
+            }
+        }
+    }
 
     long id = wm_create(WIN_W, WIN_H, &G_info);
     if (id < 0) {
@@ -143,6 +170,7 @@ int main_entry(int argc, char **argv, char **envp) {
     G_surf.h = (int)G_info.h;
     G_surf.pitch = (int)G_info.w;
 
+    wm_title((unsigned)id, "Settings");
     draw_ui();
     wm_flip((unsigned)id);
     klog("settings: window up (");
@@ -165,22 +193,18 @@ int main_entry(int argc, char **argv, char **envp) {
             mx += m.dx; my += m.dy;
             if (mx < 0) mx = 0;
             if (my < 0) my = 0;
-            int lx = mx - (int)G_info.win_x;
             int ly = my - (int)G_info.win_y;
             unsigned char prev = mb;
             mb = m.buttons;
             if ((mb & 1) && !(prev & 1)) {
-                /* click: theme row or close X */
-                if (lx >= WIN_W - 20 && ly < TITLE_H + 6) {
-                    running = 0;               /* X button */
-                } else {
-                    int row = hit_row(ly);
-                    if (row >= 0 && row != G_sel) {
-                        G_sel = row;
-                        draw_ui();
-                        wm_flip((unsigned)id);
-                        write_config();
-                    }
+                /* click: theme row (the title-bar X is the compositor's -
+                 * clicks there never reach this surface) */
+                int row = hit_row(ly);
+                if (row >= 0 && row != G_sel) {
+                    G_sel = row;
+                    draw_ui();
+                    wm_flip((unsigned)id);
+                    write_config();
                 }
             }
         }

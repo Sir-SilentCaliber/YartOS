@@ -19,7 +19,25 @@ typedef struct {
     u64      pos;
     u32      flags;
     bool     in_use;
+    /* pipes: when is_pipe, vn is NULL and `pipe` owns the buffer */
+    bool     is_pipe;
+    bool     pipe_is_read_end;   /* true = read end, false = write end */
+    struct yart_pipe *pipe;
 } fd_entry_t;
+
+/* Kernel pipe: a single fixed ring buffer with end-closed tracking.
+ * Reads/writes return -2 (EAGAIN-ish "would block") when the buffer is
+ * empty/full - userland cooperatively sleeps and retries.  The struct
+ * is refcounted per open fd (fork duplicates fds, so refs can exceed 2). */
+#define PIPE_BUF_SIZE 4096
+typedef struct yart_pipe {
+    u8   buf[PIPE_BUF_SIZE];
+    u32  head, tail;      /* ring indices (count = (head - tail) mod SZ) */
+    u32  count;
+    int  refs;            /* open fds referencing this pipe               */
+    int  read_ends;       /* open read-end fds                            */
+    int  write_ends;      /* open write-end fds                           */
+} yart_pipe_t;
 
 typedef enum { TASK_READY, TASK_RUNNING, TASK_BLOCKED, TASK_ZOMBIE } task_state_t;
 
@@ -49,7 +67,7 @@ typedef struct task {
                                    uses this to spot a READY-but-starved task) */
     u64            brk;         /* program break (top of the data segment)     */
     u64            brk_base;    /* bottom of the heap region                   */
-    u64            sig_handlers[8]; /* per-signal handler VAs (0 = default)    */
+    u64            sig_handlers[32]; /* per-signal handler VAs (0 = default)   */
     u64            sig_pending;     /* pending signal bitmask (1<<sig)         */
     u64            sig_blocked;     /* blocked signal bitmask                   */
     u64            mem_pages;      /* physical pages this task currently uses */
@@ -114,7 +132,7 @@ void    sched_ap_steal(cpu_local_t *c);   /* idle AP: steal work (LB) */
 /* smp.c: least-loaded online CPU (AP) for a new task; NULL if no APs. */
 cpu_local_t *smp_least_loaded(void);
 cpu_local_t *smp_get_ap_area(u32 idx);   /* per-AP area by cpu id (1..7) */
-int     sched_waitpid(u32 pid, int *status_out);
+int     sched_waitpid(u32 pid, int *status_out, int flags);  /* WNOHANG=1 */
 void    sched_reap_orphans(void);
 /* SIGKILL: mark another task dead (exit_status -9); it never runs again
  * and is reaped by its parent or the orphan reaper.  Returns 0 on success,

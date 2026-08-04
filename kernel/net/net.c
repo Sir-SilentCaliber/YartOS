@@ -94,11 +94,26 @@ static void arp_send(u16 oper, u32 srcip, u32 dstip, const u8 *dstmac) {
 }
 
 /* ---- IPv4 + ICMP + UDP send ---- */
+
+/* Next-hop selection: destinations on the local subnet go directly; the
+ * rest go through the gateway (the IP header still carries the original
+ * destination - only the ARP/Ethernet target changes). */
+static u32 next_hop(u32 dst) {
+    if (dst == 0xFFFFFFFFu) return 0xFFFFFFFFu;
+    if (g_mask == 0 || g_ip == 0) return dst;          /* no config yet */
+    if ((dst & g_mask) == (g_ip & g_mask)) return dst; /* local subnet  */
+    if (g_gw == 0) return 0;                           /* no route      */
+    return g_gw;
+}
+
 static int ip_send_src(u32 src, u32 dst, u8 proto, const u8 *payload, u16 plen) {
     u8 *mac;
-    if (dst == 0xFFFFFFFFu) {
+    u32 nh = next_hop(dst);
+    if (nh == 0xFFFFFFFFu) {
         mac = (u8 *)BROADCAST;
-    } else if ((mac = arp_lookup(dst)) == 0) {
+    } else if (nh == 0) {
+        return -1;   /* no route to host */
+    } else if ((mac = arp_lookup(nh)) == 0) {
         return -1;   /* need ARP first */
     }
     u16 total = 20 + plen;
@@ -127,10 +142,12 @@ static int ip_send(u32 dst, u8 proto, const u8 *payload, u16 plen) {
  * during DHCP).  Broadcasts skip ARP. */
 static int udp_raw_send(u32 src_ip, u32 dst_ip, u16 sport, u16 dport,
                         const u8 *buf, u16 len) {
-    if (dst_ip != 0xFFFFFFFFu && !arp_lookup(dst_ip)) {
-        arp_send(1, src_ip ? src_ip : g_ip, dst_ip, BROADCAST);
+    u32 nh = next_hop(dst_ip);
+    if (nh == 0) return -1;              /* no route */
+    if (nh != 0xFFFFFFFFu && !arp_lookup(nh)) {
+        arp_send(1, src_ip ? src_ip : g_ip, nh, BROADCAST);
         u64 t0 = pit_ticks();
-        while (!arp_lookup(dst_ip)) {
+        while (!arp_lookup(nh)) {
             net_service();               /* process the ARP reply */
             if (pit_ticks() - t0 > 50) return -1;   /* timeout */
             __asm__ volatile("pause");

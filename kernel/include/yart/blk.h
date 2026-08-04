@@ -86,3 +86,7 @@ int  blkfs_sync(void);          /* persist dirty nodes; call periodically   */
 void blkfs_note_delete(const char *path);  /* queue a delete for next sync  */
 bool blkfs_active(void);
 u64  blkfs_synced_files(void);
+/* Boot-time durability test: write a 64 KiB file (past the old 16 KiB
+ * direct-block cap), sync, verify on-disk size/block count/CRCs, then
+ * delete it.  Exercises the indirect-block + journal + CRC paths. */
+void blkfs_selftest(void);

@@ -110,6 +110,13 @@ syscall_entry:
     cli
     iretq
 .user_resume:
+    ; Sanity: a USER resume must have SS.RPL == 3.  Some CPUs/environments
+    ; leave the user SS as 0x20 (RPL 0) after SYSRET; if a corrupt frame
+    ; ever carries ss=0x20 here, the subsequent interrupt's iretq would
+    ; #GP(err=0x20).  sysretq loads SS itself from STAR (0x23), so the
+    ; frame's SS slot does not matter for THIS exit - but normalize it
+    ; anyway so the frame is consistent for the next interrupt.
+    mov  qword [rsp+32], 0x23 ; ss slot @32 = USER_DS
     mov  rcx, [rsp]           ; rip      @0   (sysret return address)
     mov  r11, rsp             ; r11 = frame ptr (temp)
     mov  rsp, [r11+24]        ; user rsp @24  (switch to the user stack)

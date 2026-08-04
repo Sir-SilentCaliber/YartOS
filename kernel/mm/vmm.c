@@ -18,6 +18,7 @@
 #include <yart/user.h>     /* USER_VBASE / USER_STACK_TOP */
 #include <yart/sched.h>    /* sched_current() for per-task regions */
 #include <yart/cpu.h>      /* rdmsr64/wrmsr64 for EFER.NXE */
+#include <yart/spinlock.h> /* g_swap_lock */
 #include <yart/blk.h>      /* disk-backed swap tier (virtio-blk)      */
 
 u64 g_hhdm_offset = 0;
@@ -455,6 +456,9 @@ void vmm_free_pml4(u64 *pml4) {
 
 static u8  *swap_pool[SWAP_CPUS];
 static u64  swap_used[SWAP_CPUS][SWAP_SLOTS / 64];
+/* Protects the slot bitmaps (RAM + disk tiers).  pmm_alloc_page drops the
+ * PMM lock before eviction, so two CPUs can reach the bitmap concurrently. */
+static spinlock_t g_swap_lock;
 
 /* disk-backed tier: armed when a virtio-blk disk is present.  Evicted
  * pages go to disk sectors (freeing the RAM frame for real) instead of the
@@ -474,6 +478,7 @@ static int swap_cpu(void) {
 
 void vmm_swap_init(void) {
     if (swap_pool[0]) return;
+    spin_init(&g_swap_lock);
     for (int c = 0; c < SWAP_CPUS; c++) {
         paddr_t p = pmm_alloc_pages(SWAP_SLOTS);
         swap_pool[c] = phys_to_virt(p);
@@ -533,28 +538,42 @@ void vmm_swap_disk_init(void) {
 
 static int swap_alloc_slot(void) {
     int c = swap_cpu();
+    u64 fl = irq_save();
+    spin_lock(&g_swap_lock);
     for (int i = 0; i < SWAP_SLOTS; i++)
         if (!(swap_used[c][i / 64] & (1ULL << (i % 64)))) {
             swap_used[c][i / 64] |= (1ULL << (i % 64));
+            spin_unlock(&g_swap_lock);
+            irq_restore(fl);
             return i;
         }
     if (swap_disk_armed) {
         for (u64 i = 0; i < swap_disk_npages; i++)
             if (!(swap_disk_used[i / 64] & (1ULL << (i % 64)))) {
                 swap_disk_used[i / 64] |= (1ULL << (i % 64));
+                spin_unlock(&g_swap_lock);
+                irq_restore(fl);
                 return (int)(SWAP_DISK_SLOT_BASE + i);
             }
     }
+    spin_unlock(&g_swap_lock);
+    irq_restore(fl);
     return -1;                 /* both tiers full: caller sees OOM */
 }
 static void swap_free_slot(int s) {
+    u64 fl = irq_save();
+    spin_lock(&g_swap_lock);
     if (swap_disk_armed && s >= SWAP_DISK_SLOT_BASE) {
         u64 i = (u64)(s - SWAP_DISK_SLOT_BASE);
         swap_disk_used[i / 64] &= ~(1ULL << (i % 64));
+        spin_unlock(&g_swap_lock);
+        irq_restore(fl);
         return;
     }
     int c = swap_cpu();
     swap_used[c][s / 64] &= ~(1ULL << (s % 64));
+    spin_unlock(&g_swap_lock);
+    irq_restore(fl);
 }
 static bool slot_is_disk(int s) {
     return swap_disk_armed && s >= SWAP_DISK_SLOT_BASE;
@@ -696,7 +715,7 @@ bool vmm_user_str_ok(u64 s, u64 max) {
  * image itself is mapped at 0xffffffff80000000 (PML4 index 511) by the
  * bootloader and stays executable.  Per-CPU page tables copy the kernel
  * half verbatim, so one pass on the boot PML4 covers every address space. */
-static void nx_direct_map(void) {
+void vmm_nx_direct_map(void) {
     u64 *pml4 = kernel_pml4;
     if (!(pml4[256] & PTE_PRESENT)) return;
     if (pml4[256] & PTE_HUGE) {                 /* 512 GiB huge page      */
@@ -728,6 +747,75 @@ done:
     kprintf("vmm: HHDM direct map marked NX (heap/stacks/fb cannot execute)\n");
 }
 
+
+/* Guard-page helpers.  IMPORTANT: these walk kernel_pml4 directly - the
+ * kernel half of every PML4 points at the SAME physical page tables, so
+ * a change here is visible from every address space (and every CPU).  The
+ * refcount is deliberately NOT touched: the guard frame stays allocated.
+ *
+ * The bootloader maps the direct map with HUGE pages (2 MiB or 1 GiB), so
+ * clearing a single 4 KiB guard PTE requires SPLITTING the containing
+ * huge page first.
+ *
+ * CRITICAL FIX: a 1 GiB page holds 512 x 2 MiB pages, so the split stride
+ * is 0x200000 per entry - writing 0x40000000 (1 GiB) here left the direct
+ * map covering only the first 2 MiB plus garbage, and every phys_to_virt
+ * past 2 MiB faulted once the TLB evicted (the red-panic boot crash). */
+static u64 *direct_pte_splitting(paddr_t p) {
+    u64 va = (u64)phys_to_virt(p);
+    u64 *pml4 = kernel_pml4;
+    int i4 = (va >> 39) & 0x1FF;
+    int i3 = (va >> 30) & 0x1FF;
+    int i2 = (va >> 21) & 0x1FF;
+    int i1 = (va >> 12) & 0x1FF;
+    if (!(pml4[i4] & PTE_PRESENT)) return NULL;
+    if (pml4[i4] & PTE_HUGE) return NULL;   /* 512 GiB page: fail open */
+    u64 *pdpt = (u64 *)phys_to_virt(pml4[i4] & ~0xFFFULL & ~PTE_NX);
+    if (!(pdpt[i3] & PTE_PRESENT)) return NULL;
+    if (pdpt[i3] & PTE_HUGE) {
+        /* 1 GiB page -> split into 512 x 2 MiB pages (stride 0x200000) */
+        u64 base = pdpt[i3] & ~0x3FFFFFFFULL & ~PTE_NX;
+        u64 fl   = pdpt[i3] & (PTE_PWT | PTE_PCD | PTE_NX);
+        paddr_t pd_p = pmm_alloc_page();
+        u64 *pd = (u64 *)phys_to_virt(pd_p);
+        for (int j = 0; j < 512; j++)
+            pd[j] = (base + (u64)j * 0x200000ULL) |
+                    PTE_PRESENT | PTE_RW | PTE_HUGE | fl;
+        pdpt[i3] = pd_p | PTE_PRESENT | PTE_RW |
+                   (pml4[i4] & (PTE_PWT | PTE_PCD | PTE_NX));
+    }
+    u64 *pd = (u64 *)phys_to_virt(pdpt[i3] & ~0xFFFULL & ~PTE_NX);
+    if (!(pd[i2] & PTE_PRESENT)) return NULL;
+    if (pd[i2] & PTE_HUGE) {
+        /* 2 MiB page -> split into 512 x 4 KiB pages */
+        u64 base = pd[i2] & ~0x1FFFFFULL & ~PTE_NX;
+        u64 fl   = pd[i2] & (PTE_PWT | PTE_PCD | PTE_NX);
+        paddr_t pt_p = pmm_alloc_page();
+        u64 *pt = (u64 *)phys_to_virt(pt_p);
+        for (int j = 0; j < 512; j++)
+            pt[j] = (base + (u64)j * PAGE_SIZE) |
+                    PTE_PRESENT | PTE_RW | fl;
+        pd[i2] = pt_p | PTE_PRESENT | PTE_RW |
+                 (pdpt[i3] & (PTE_PWT | PTE_PCD | PTE_NX));
+    }
+    u64 *pt = (u64 *)phys_to_virt(pd[i2] & ~0xFFFULL & ~PTE_NX);
+    return &pt[i1];
+}
+
+void vmm_unmap_direct_page(paddr_t p) {
+    u64 *pte = direct_pte_splitting(p);
+    if (!pte || !(*pte & PTE_PRESENT)) return;
+    *pte = 0;
+    invlpg((u64)phys_to_virt(p));
+}
+
+void vmm_remap_direct_page(paddr_t p) {
+    u64 *pte = direct_pte_splitting(p);
+    if (!pte) return;
+    *pte = (p & ~0xFFFULL) | PTE_PRESENT | PTE_RW | PTE_NX;
+    invlpg((u64)phys_to_virt(p));
+}
+
 void vmm_init(void) {
     paddr_t cr3 = read_cr3() & ~0xFFFULL;
     kernel_pml4 = (u64 *)phys_to_virt(cr3);
@@ -744,7 +832,10 @@ void vmm_init(void) {
     u32 sm = smep_smap_enable();
     kprintf("vmm: SMEP=%s SMAP=%s (kernel cannot exec/access user pages)\n",
             (sm & 1) ? "on" : "n/a", (sm & 2) ? "on" : "n/a");
-    nx_direct_map();
+    /* NOTE: the HHDM direct map is marked NX in kmain AFTER
+     * the APs come online (vmm_nx_direct_map) - Limine's SMP
+     * trampoline executes from the direct map, so NX-before-APs
+     * triple-faults every AP. */
     kprintf("vmm: PML4 @ phys %p (virt %p), HHDM offset %p\n",
             (void *)cr3, kernel_pml4, (void *)g_hhdm_offset);
     vmm_swap_init();

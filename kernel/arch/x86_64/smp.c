@@ -84,6 +84,10 @@ static void limine_ap_entry(struct limine_smp_info *info) {
                                              kernel stack + its own ISTs */
     syscall_install_percpu();             /* EFER.SCE + STAR/LSTAR/SFMASK
                                              for SYSCALL on this AP */
+    /* CR0/CR4 are PER-CPU: the BSP's fpu_enable() did not touch this AP,
+     * so without this every SSE instruction in a user task on this core
+     * (#UD) - e.g. the first XMM load in an exec'd binary. */
+    fpu_enable();
 
     /* per-AP APIC timer: this core now ticks on our vector 48 and can
      * preempt user tasks exactly like the BSP */

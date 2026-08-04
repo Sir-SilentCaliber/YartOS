@@ -48,6 +48,7 @@ typedef struct {
     int  x, y, w, h;    /* screen rect of the surface                     */
     u64  va;            /* wm-side mapping of the surface (from scan)     */
     bool dirty;
+    char title[32];     /* window title (set by the app via SYS_WM_TITLE) */
 } win_t;
 static win_t G_wins[WM_MAX_WIN];
 static int  G_app_pid;      /* pid of the launched real app (settings)   */
@@ -745,7 +746,13 @@ static void handle_click(int x, int y, int button) {
                 /* title bar: close button or focus */
                 int cx = w->x + w->w - 18, cy = ty + 12;
                 if ((x-cx)*(x-cx) + (y-cy)*(y-cy) <= 81) {
-                    wm_destroy(w->id);          /* app closes itself too */
+                    /* close = destroy the surface AND kill the app (the
+                     * app keeps running invisible otherwise, and clicking
+                     * the dock icon again would refocus a windowless
+                     * ghost that never relaunches) */
+                    wm_destroy(w->id);
+                    kill((long)w->owner);
+                    if (G_app_pid == (int)w->owner) G_app_pid = 0;
                     klog("wm: close button clicked\n");
                 } else {
                     wm_focus(w->owner);
@@ -882,6 +889,19 @@ static void wm_scan_windows(void) {
 static void draw_one_window(win_t *w);   /* defined below */
 
 /* Draw every window that needs it (called from the paint path). */
+/* Erase every DIRTY window's old rect back to wallpaper (drag moves the
+ * window; without this the old position keeps its pixels and smears). */
+static void restore_dirty_windows(void) {
+    for (int i=0;i<WM_MAX_WIN;i++) {
+        win_t *w = &G_wins[i];
+        if (!w->active || !w->dirty) continue;
+        int ty = w->y - 24;
+        if (ty < PANEL_H) ty = PANEL_H;
+        restore_rect(&G_fb, w->x - 6, ty - 6, w->w + 12,
+                     (ty + 24 + w->h) - (ty - 6));
+    }
+}
+
 static void draw_windows(void) {
     if (!G_win_dirty && !G_full_repaint) return;
     int drew = 0;
@@ -898,8 +918,18 @@ static void draw_windows(void) {
  * refocus it.  fork() + exec() - the child becomes the app. */
 static void launch_settings(void) {
     if (G_app_pid != 0) {
-        if (wm_focus((unsigned)G_app_pid) != 0) {
-            /* the app died but we hadn't noticed: relaunch */
+        /* ghost check: if the app is alive but has NO window anymore
+         * (it was closed via the title-bar X), kill the leftover and
+         * relaunch fresh */
+        bool has_win = false;
+        for (int i=0;i<WM_MAX_WIN;i++)
+            if (G_wins[i].active && G_wins[i].owner == (u32)G_app_pid)
+                { has_win = true; break; }
+        if (!has_win) {
+            kill((long)G_app_pid);
+            G_app_pid = 0;
+        } else if (wm_focus((unsigned)G_app_pid) != 0) {
+            /* app died but we hadn't noticed: relaunch */
             G_app_pid = 0;
         } else {
             return;
@@ -919,6 +949,16 @@ static void launch_settings(void) {
         { char b[8]; itoa0((int)pid,b,0); klog(b); }
         klog(")\n");
     }
+}
+
+/* Reap our app child when it exits (WNOHANG - never blocks the wm) so
+ * G_app_pid doesn't point at a zombie and the dock can relaunch. */
+static void poll_app_child(void) {
+    if (G_app_pid <= 0) return;
+    int st = 0;
+    long r = waitpid_nohang((long)G_app_pid, &st);
+    if (r == G_app_pid || r == -1)
+        G_app_pid = 0;         /* reaped or already gone */
 }
 
 /* Poll /home/yart/cursor.conf once a second; the Settings app writes it
@@ -984,7 +1024,8 @@ static void draw_one_window(win_t *w) {
     /* title bar */
     sf_round_rect(&G_fb, w->x, ty, w->w, 24, 8, RGB(0x1E,0x21,0x28));
     sf_fill_rect(&G_fb, w->x, ty+10, w->w, 14, RGB(0x1E,0x21,0x28));
-    sf_text(&G_fb, w->x+10, ty+5, "Settings", RGB(0xEC,0xEE,0xF1));
+    sf_text(&G_fb, w->x+10, ty+5,
+            w->title[0] ? w->title : "App", RGB(0xEC,0xEE,0xF1));
     /* close button (right) */
     int cx = w->x + w->w - 18, cy = ty + 12;
     sf_round_rect(&G_fb, cx-9, cy-9, 18, 18, 9, RGB(0x3A,0x3E,0x46));
@@ -1105,6 +1146,7 @@ void wm_run(void) {
         long now = time_ms();
         long uptime = now - G_start_ms;
         poll_cursor_config(now);        /* pick up Settings changes ~1s */
+        poll_app_child();               /* reap the app when it exits    */
         wm_scan_windows();              /* new app windows -> focus+draw */
 
         unsigned long s = (unsigned long)(uptime/1000);
@@ -1156,12 +1198,15 @@ void wm_run(void) {
                 /* rebuild cached chrome so it re-samples the new wallpaper */
                 build_panel_sprite();
                 build_dock_sprite();
+                G_win_dirty = 1;   /* windows must be redrawn over the
+                                      new wallpaper */
             } else {
                 /* 1. Restore wallpaper under dirty regions */
                 restore_cursor(&G_fb);
                 restore_tooltip(&G_fb);
                 if (G_dock_dirty || tweening || tooltip_anim) restore_dock_region(&G_fb);
                 if (G_panel_dirty) restore_panel(&G_fb);
+                if (G_win_dirty) restore_dirty_windows();
             }
             /* 2. Blit cached chrome */
             sf_blit(&G_fb, 0, 0, &G_panel_spr, 0, 0, G_panel_spr.w, G_panel_spr.h);

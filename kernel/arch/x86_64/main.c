@@ -94,6 +94,22 @@ void kmain(void) {
     for (int i = 0; i < 16; i++) pic_mask(i);
 
     pmm_init(memmap_request.response);
+
+    /* Reserve the initrd module's physical frames NOW, before anything
+     * allocates: Limine loads modules into memory the memmap still marks
+     * USABLE, so without this the PMM would hand those frames out and
+     * ZERO them - corrupting the initrd mid-import. */
+    if (mod_request.response && mod_request.response->module_count > 0) {
+        paddr_t mod_phys = (paddr_t)((u64)mod_request.response->modules[0]->address -
+                                     g_hhdm_offset);
+        size_t mod_pages = PAGE_ALIGN_UP(
+            mod_request.response->modules[0]->size) / PAGE_SIZE;
+        pmm_mark_range_used(mod_phys, mod_pages);
+        kprintf("initrd: reserving %lu KiB @ phys %p\n",
+                mod_request.response->modules[0]->size / 1024,
+                (void *)mod_phys);
+    }
+
     vmm_init();
     heap_init();
 
@@ -133,6 +149,9 @@ void kmain(void) {
     pit_init(100);
     apic_init();
     smp_start_aps();
+    /* APs are up: Limine's SMP trampoline is no longer needed, so the
+     * whole direct map (heap/stacks/fb/initrd/DMA buffers) can be NX. */
+    vmm_nx_direct_map();
     kbd_init();
     mouse_init();
 
@@ -160,6 +179,7 @@ void kmain(void) {
     }
     /* user home */
     vfs_mkdir_p("/home/yart");
+    blkfs_selftest();      /* 64 KiB through indirect blocks + CRCs */
 
     /* Load /bin/init as the ring-3 compositor (wm). */
     vnode_t *initbin = vfs_lookup("/bin/init");

@@ -111,10 +111,18 @@ static block_t *bucket_pop(int ci) {
 /* Unlink a free block from its bucket (used when coalescing a free
  * neighbour).  Buckets are short so the scan is cheap. */
 static void bucket_remove(block_t *b) {
-    int ci = class_for(b->size);
-    if (buckets[ci] == b) { buckets[ci] = bfree_next(b); return; }
-    for (block_t *t = buckets[ci]; t; t = bfree_next(t)) {
-        if (bfree_next(t) == b) { bfree_set_next(t, bfree_next(b)); return; }
+    /* The block may have been bucketed under a DIFFERENT class than
+     * class_for(b->size) (its size changed after it was pushed), so a
+     * single-bucket scan would silently miss and leave a stale link ->
+     * the block could be handed out twice.  Scan every bucket. */
+    for (int i = 0; i < NUM_BUCKETS; i++) {
+        if (buckets[i] == b) { buckets[i] = bfree_next(b); return; }
+        for (block_t *t = buckets[i]; t; t = bfree_next(t)) {
+            if (bfree_next(t) == b) {
+                bfree_set_next(t, bfree_next(b));
+                return;
+            }
+        }
     }
 }
 
@@ -164,8 +172,15 @@ static block_t *split(block_t *b, size_t want) {
 static block_t *alloc_from_class(size_t n) {
     int ci = class_for(n);
     if (ci < NUM_CLASSES) {
-        for (int i = ci; i < NUM_CLASSES; i++)
-            if (buckets[i]) return bucket_pop(i);
+        for (int i = ci; i < NUM_CLASSES; i++) {
+            while (buckets[i]) {
+                block_t *b = bucket_pop(i);
+                if (b->size >= n) return b;
+                /* undersized: reclass into its real bucket, keep looking */
+                bucket_push(b, class_for(b->size));
+                break;
+            }
+        }
         /* small request but no small free block: try the huge bucket too */
         for (block_t *b = buckets[HUGE_CLASS], *pr = NULL; b; ) {
             block_t *nx = bfree_next(b);

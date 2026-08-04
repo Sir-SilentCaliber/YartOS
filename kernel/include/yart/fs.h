@@ -47,6 +47,11 @@ typedef struct vnode {
 void vnode_ref(vnode_t *v);
 void vnode_unref(vnode_t *v);
 
+/* Coarse VFS tree lock (recursive, IRQ-safe).  Every public vfs_* entry
+ * takes it; syscall paths may nest (e.g. blkfs_sync -> vfs_path_of). */
+void vfs_lock(void);
+void vfs_unlock(void);
+
 void     vfs_init(void *initrd, size_t size);
 vnode_t *vfs_root(void);
 vnode_t *vfs_lookup(const char *path);

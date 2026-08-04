@@ -40,6 +40,7 @@
 #include <yart/hal.h>
 #include <yart/watchdog.h>      /* watchdog_tick from the BSP timer */
 #include <yart/syscall.h>       /* wm_surface_owner_died */
+#include <yart/syscall.h>       /* wm_surface_owner_died */
 extern void lapic_send_ipi(u32 dest_apic, u8 vector);
 #define AP_WAKE_VEC 62
 
@@ -259,6 +260,12 @@ static void rq_remove(cpu_local_t *c, task_t *t) {
 /* helpers                                                            */
 /* ------------------------------------------------------------------ */
 
+/* The user-space sigreturn trampoline: a tiny RX page mapped into every
+ * user process at SIGRETURN_TRAMP_VA.  A signal handler returns into it
+ * and it syscalls SYS_SIGRETURN so the kernel restores the interrupted
+ * frame. */
+#define SIGRETURN_TRAMP_VA 0x6F000000UL
+
 static u64 deliver_pending_signal(task_t *t, u64 current_rsp) {
     for (u32 sig = 1; sig < 32; sig++) {
         if (!(t->sig_pending & (1ULL << sig))) continue;
@@ -270,27 +277,70 @@ static u64 deliver_pending_signal(task_t *t, u64 current_rsp) {
             sched_exit(128 + (int)sig);
             return current_rsp;            /* will be switched away      */
         }
-        /* build a handler frame: we are inside the syscall ISR, so the
-         * cpu_regs_t at current_rsp is the interrupted user state. */
+        /* Handler installed: write the interrupted frame onto the USER
+         * stack and return into the handler.  Layout (below the user RSP):
+         *   [frame_va]                  saved cpu_regs_t (sigreturn reads)
+         *   [frame_va + sizeof + HSCRATCH - 8]  frame pointer slot
+         *   [ret_va = fp_slot + 8]      trampoline return address
+         * The handler's RSP points AT the trampoline address and its
+         * pushes grow DOWN into the HSCRATCH gap - the saved frame below
+         * it is NEVER touched.  After `ret`, rsp == ret_va+8 and the
+         * trampoline loads the frame pointer from [rsp-16] (the slot). */
+        #define HSCRATCH 512
         cpu_regs_t *f = (cpu_regs_t *)current_rsp;
-        cpu_regs_t *hf = (cpu_regs_t *)(current_rsp - sizeof(cpu_regs_t));
-        memcpy(hf, f, sizeof *hf);
-        hf->rax = sig;                      /* handler arg0 = signal #   */
-        hf->rip = h;                        /* jump to the handler      */
-        return (u64)hf;
+        u64 usp = f->rsp & ~7ULL;
+        u64 ret_va   = usp - 8;
+        u64 fp_slot  = ret_va - 8;
+        u64 frame_va = fp_slot - sizeof(cpu_regs_t) - HSCRATCH;
+        if (frame_va < USER_VBASE ||
+            frame_va + sizeof(cpu_regs_t) + HSCRATCH + 16 > USER_STACK_TOP) {
+            kprintf("sched: task %u signal %u: bad user stack %p - killing\n",
+                    t->pid, sig, (void *)usp);
+            sched_exit(128 + (int)sig);
+            return current_rsp;
+        }
+        stac();
+        memcpy((void *)frame_va, f, sizeof *f);     /* save interrupted state */
+        *(u64 *)fp_slot = frame_va;                 /* for the trampoline     */
+        *(u64 *)ret_va  = SIGRETURN_TRAMP_VA;       /* handler `ret` target   */
+        clac();
+        f->rax = sig;                      /* handler arg0 = signal #   */
+        f->rip = h;                        /* jump to the handler      */
+        f->rsp = ret_va;                   /* handler stack above frame */
+        return current_rsp;
+        #undef HSCRATCH
     }
     return current_rsp;
 }
 
+/* Kernel stack protection: a GUARD PAGE below every kernel stack plus a
+ * canary at the stack's bottom.  The guard frame is allocated but its
+ * HHDM direct-map PTE is cleared, so a ring-0 overflow faults immediately
+ * instead of silently corrupting the heap; the canary is a second line of
+ * defense.  The guard mapping MUST be restored before the page goes back
+ * to the PMM (zero-on-free would fault on the unmapped VA). */
+#define KSTACK_CANARY 0x5941525453544143ULL   /* "YARTSTAC" */
+#define KSTACK_GUARD_PAGES 1
+
 static u64 alloc_kstack(void) {
-    paddr_t p = pmm_alloc_pages(KSTACK_SIZE / PAGE_SIZE);
-    return (u64)phys_to_virt(p) + KSTACK_SIZE;
+    u32 npages = KSTACK_SIZE / PAGE_SIZE + KSTACK_GUARD_PAGES;
+    paddr_t p = pmm_alloc_pages(npages);
+    paddr_t guard = p;                          /* lowest page           */
+    u64 top = (u64)phys_to_virt(p) + (u64)npages * PAGE_SIZE;
+    vmm_unmap_direct_page(guard);               /* guard: any access #PF */
+    *(volatile u64 *)(top - KSTACK_SIZE) =
+        KSTACK_CANARY ^ (u64)top;              /* position-dependent */
+    return top;
 }
 static void free_kstack(u64 top) {
     if (!top) return;
-    /* alloc_kstack returned a *virtual* top; convert back to physical. */
-    paddr_t phys = (paddr_t)(top - KSTACK_SIZE) - g_hhdm_offset;
-    pmm_free_pages(phys, KSTACK_SIZE / PAGE_SIZE);
+    u64 *canary = (u64 *)(top - KSTACK_SIZE);
+    if (*canary != (KSTACK_CANARY ^ top))
+        kprintf("sched: !! KERNEL STACK OVERFLOW detected on stack %p "
+                "(canary smashed)\n", (void *)top);
+    paddr_t guard = (paddr_t)(top - KSTACK_SIZE) - g_hhdm_offset - PAGE_SIZE;
+    vmm_remap_direct_page(guard);               /* restore before freeing */
+    pmm_free_pages(guard, KSTACK_SIZE / PAGE_SIZE + KSTACK_GUARD_PAGES);
 }
 
 static void task_append(task_t *t) {
@@ -447,10 +497,25 @@ task_t *sched_fork(task_t *parent, cpu_regs_t *frame) {
     child->region_count = parent->region_count;
 
     memcpy(child->fds, parent->fds, sizeof parent->fds);
-    for (int i = 3; i < MAX_FD; i++)
-        if (child->fds[i].in_use) vnode_ref(child->fds[i].vn);
+    for (int i = 3; i < MAX_FD; i++) {
+        if (!child->fds[i].in_use) continue;
+        if (child->fds[i].is_pipe && child->fds[i].pipe) {
+            /* pipe fds are shared across fork: bump refs + end counts */
+            yart_pipe_t *p = child->fds[i].pipe;
+            p->refs++;
+            if (child->fds[i].pipe_is_read_end) p->read_ends++;
+            else                                p->write_ends++;
+        } else {
+            vnode_ref(child->fds[i].vn);
+        }
+    }
     child->cwd = parent->cwd;
     if (child->cwd) vnode_ref(child->cwd);
+    /* POSIX: handlers are preserved across fork (reset only on exec) */
+    memcpy(child->sig_handlers, parent->sig_handlers,
+           sizeof child->sig_handlers);
+    child->sig_pending = 0;
+    child->sig_blocked = parent->sig_blocked;
 
     child->kstack_top = alloc_kstack();
     cpu_regs_t *f = (cpu_regs_t *)(child->kstack_top - sizeof(cpu_regs_t));
@@ -743,11 +808,20 @@ u64 sched_tick(u64 current_rsp) {
     }
     if (cur->is_user) {
         if (cur->sig_pending) {
-            u64 nrsp = deliver_pending_signal(cur, current_rsp);
-            if (nrsp != current_rsp) return nrsp;
+            /* Only deliver when the interrupted frame is a USER frame.
+             * If the tick landed mid-syscall (kernel frame: cs=0x08), the
+             * saved state is kernel state - running the user handler on
+             * top of it and sigreturning would resume kernel code with
+             * user registers.  Leave the signal pending; it is delivered
+             * on the next user-mode interrupt. */
+            cpu_regs_t *fr = (cpu_regs_t *)current_rsp;
+            if ((fr->cs & 3) == 3) {
+                u64 nrsp = deliver_pending_signal(cur, current_rsp);
+                if (nrsp != current_rsp) return nrsp;
+            }
             if (cur->state != TASK_RUNNING)
-                return sched_switch_after(cur, nrsp);
-            return nrsp;
+                return sched_switch_after(cur, current_rsp);
+            return current_rsp;
         }
         if (cur->state != TASK_RUNNING)
             return sched_switch_after(cur, current_rsp);  /* exited/killed */
@@ -768,11 +842,15 @@ u64 sched_after_isr(u64 current_rsp) {
     task_t *cur = c->ap_current;
     if (!cur) return current_rsp;
     if (cur->is_user && cur->sig_pending) {
-        u64 nrsp = deliver_pending_signal(cur, current_rsp);
-        if (nrsp != current_rsp) return nrsp;
+        /* deliver only from a user frame (see sched_tick for why) */
+        cpu_regs_t *fr = (cpu_regs_t *)current_rsp;
+        if ((fr->cs & 3) == 3) {
+            u64 nrsp = deliver_pending_signal(cur, current_rsp);
+            if (nrsp != current_rsp) return nrsp;
+        }
         if (cur->state != TASK_RUNNING)
-            return sched_switch_after(cur, nrsp);
-        return nrsp;
+            return sched_switch_after(cur, current_rsp);
+        return current_rsp;
     }
     if (cur->state == TASK_RUNNING) return current_rsp;
     return sched_switch_after(cur, current_rsp);
@@ -806,13 +884,23 @@ void sched_yield(void) {
     lapic_send_ipi(my_id, 62);   /* vector 62 = AP_WAKE_VEC (reschedule) */
 }
 
+/* Find a task in the global list.  LOCKED variant: the caller must hold
+ * g_tasks_lock (wake_waiting_parent uses it - sched_find() itself takes
+ * the lock, and calling it from under the lock would self-deadlock, the
+ * non-recursive spinlock spins forever on the same CPU). */
+static task_t *find_pid_unlocked(u32 pid) {
+    for (task_t *t = g_tasks; t; t = t->next)
+        if (t->pid == pid) return t;
+    return NULL;
+}
+
 /* Wake a parent that is blocked in waitpid() for this child.  Must be
  * called with g_tasks_lock held: the parent sets waiting+BLOCKED inside
  * the same lock, so if we see waiting=true here the parent is guaranteed
  * to be asleep (not running) and safe to requeue. */
 static void wake_waiting_parent(task_t *child) {
     if (child->ppid == 0) return;
-    task_t *p = sched_find(child->ppid);
+    task_t *p = find_pid_unlocked(child->ppid);
     if (p && p->waiting && p->state == TASK_BLOCKED) {
         p->waiting = false;
         cpu_local_t *target = smp_least_loaded();
@@ -838,6 +926,9 @@ void sched_exit(int status) {
     wake_waiting_parent(cur);          /* blocked parent: wake + requeue */
     spin_unlock(&g_tasks_lock);
     vmm_user_teardown_all();           /* free this task's user memory */
+    /* free any window surfaces the task owned IMMEDIATELY (not on reap):
+     * the compositor sees the window vanish the moment the app exits */
+    wm_surface_owner_died(cur->pid);
     irq_restore(fl);
     kprintf("sched: task [%u] '%s' exited status %d\n",
             cur->pid, cur->name, status);
@@ -946,7 +1037,8 @@ int sched_kill(u32 pid) {
  * The zombie-flag read and the waiting flag are set under g_tasks_lock,
  * the same lock sched_exit/sched_kill use to wake us, so there is no
  * lost-wakeup race. */
-int sched_waitpid(u32 pid, int *status_out) {
+#define WNOHANG 1
+int sched_waitpid(u32 pid, int *status_out, int flags) {
     task_t *cur = sched_current();
     if (!cur) return -1;
 
@@ -961,6 +1053,11 @@ int sched_waitpid(u32 pid, int *status_out) {
         return -1;                        /* ECHILD */
     }
     if (c->state != TASK_ZOMBIE) {
+        if (flags & WNOHANG) {            /* non-blocking probe */
+            spin_unlock(&g_tasks_lock);
+            irq_restore(fl);
+            return 0;
+        }
         /* child alive: register as waiting and block */
         cur->waiting = true;
         cur->wait_pid = pid;

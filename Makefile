@@ -177,14 +177,17 @@ build/settings.elf: build/start.o build/settings.o build/cursors_lib.o build/gfx
 initrd_root/bin/init: $(USER_ELF)
 	@mkdir -p initrd_root/bin
 	cp $(USER_ELF) initrd_root/bin/init
+	@chmod 755 initrd_root/bin/init
 
 initrd_root/bin/hello: build/hello.elf
 	@mkdir -p initrd_root/bin
 	cp build/hello.elf initrd_root/bin/hello
+	@chmod 755 initrd_root/bin/hello
 
 initrd_root/bin/settings: build/settings.elf
 	@mkdir -p initrd_root/bin
 	cp build/settings.elf initrd_root/bin/settings
+	@chmod 755 initrd_root/bin/settings
 
 initrd_root/etc/motd:
 	@mkdir -p initrd_root/etc

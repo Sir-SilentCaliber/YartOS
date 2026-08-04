@@ -22,6 +22,9 @@ paddr_t pmm_alloc_page(void);
 paddr_t pmm_alloc_pages(size_t n);
 void    pmm_free_page(paddr_t p);          /* == pmm_unref_page           */
 void    pmm_mark_page_used(paddr_t p);     /* reserve a specific frame      */
+void    pmm_mark_range_used(paddr_t base, size_t npages); /* reserve N frames */
+bool    pmm_page_used(paddr_t p);          /* is this frame allocated?       */
+u32     pmm_page_refs(paddr_t p);          /* refcount of a frame            */
 void    pmm_free_pages(paddr_t p, size_t n);
 void    pmm_ref_page(paddr_t p);           /* +1 ref (shared mapping)     */
 void    pmm_unref_page(paddr_t p);         /* -1 ref; free at 0           */
@@ -52,6 +55,19 @@ void   vmm_init(void);
 void   vmm_map(vaddr_t v, paddr_t p, u64 flags);
 void   vmm_unmap(vaddr_t v);
 void   vmm_unmap_in(u64 *pml4, vaddr_t v);   /* unmap in an explicit pml4 */
+
+/* Mark the whole HHDM direct map NX (heap, kernel stacks, fb, initrd,
+ * DMA buffers).  Call AFTER the APs are online - Limine's SMP trampoline
+ * runs from the direct map and would triple-fault otherwise. */
+void   vmm_nx_direct_map(void);
+
+/* Unmap/remap a single physical page IN THE DIRECT MAP without touching
+ * its refcount.  Used for kernel-stack guard pages: the guard frame stays
+ * allocated but any access through phys_to_virt faults instead of
+ * silently walking into the adjacent heap.  The mapping MUST be restored
+ * (vmm_remap_direct_page) before the page is returned to the PMM. */
+void   vmm_unmap_direct_page(paddr_t p);
+void   vmm_remap_direct_page(paddr_t p);
 paddr_t vmm_translate(vaddr_t v);
 void   vmm_invlpg(vaddr_t v);
 /* Re-set the flags of an already-mapped page (keeps the physical frame). */

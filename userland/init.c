@@ -17,6 +17,13 @@
 
 void wm_run(void);
 
+/* A REAL signal handler: prints, then returns - the kernel's trampoline
+ * (SYS_SIGRETURN) restores the interrupted state.  The address is taken
+ * and passed to sigaction, so it cannot be inlined away. */
+static void sigterm_handler(void) {
+    klog("sig3: HANDLER RAN (SIGTERM caught)\n");
+}
+
 static int my_atoi(const char *s) {
     int v = 0;
     while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s++; }
@@ -458,35 +465,28 @@ int main_entry(int argc, char **argv, char **envp) {
     }
 
     /* ---- signals: install a SIGTERM handler, child raises it ---- */
-    klog("sig2: testing real signal delivery...\n");
+    /* ---- REAL signal handlers: handler runs, returns via the kernel
+     * trampoline (SYS_SIGRETURN), and the process resumes where it was
+     * interrupted - then exits 42 so the parent can verify. ---- */
+    klog("sig3: testing REAL signal handler + sigreturn...\n");
     {
         long spid = fork();
         if (spid == 0) {
-            /* child: install a handler that just exits 7 */
-            sigaction(15, 0);                 /* SIGTERM: default (die)   */
-            /* instead, install a real handler: exit(7) via a label is not
-             * possible; we use an unhandled SIGTERM -> dies with 128+15 */
-            for (volatile long i = 0; i < 100; i++) yield();
-            klog("sig2: child slept without signal (BUG)\n");
-            exit(0);
+            sigaction(15, (long)sigterm_handler);   /* catch SIGTERM */
+            klog("sig3: child raising SIGTERM on itself\n");
+            raise(getpid(), 15);
+            /* the handler ran above and returned via sigreturn; if we
+             * get here, the interrupted state was restored correctly */
+            klog("sig3: child resumed after handler (sigreturn worked)\n");
+            exit(42);
         } else if (spid > 0) {
-            /* parent: let it start, then SIGTERM it */
-            for (volatile long i = 0; i < 30; i++) yield();
-            if (raise(spid, 15) == 0) klog("sig2: parent raised SIGTERM\n");
             int status = 0;
             long r;
-            while ((r = waitpid(spid, &status)) == 0) yield();
-            if (r == spid) {
-                char num[16]; my_itoa(status, num);
-                char msg[60]; int i = 0;
-                const char *a = "sig2: child died with status ";
-                const char *c = " (128+15 = SIGTERM default)\n";
-                while (*a) msg[i++] = *a++;
-                for (char *p = num; *p;) msg[i++] = *p++;
-                while (*c) msg[i++] = *c++;
-                msg[i] = 0;
-                klog(msg);
-            }
+            while ((r = waitpid(spid, &status)) == 0);
+            if (r == spid && status == 42)
+                klog("sig3: handler + sigreturn + resume WORK (status 42)\n");
+            else
+                klog("sig3: FAILED (handler/sigreturn broken)\n");
         }
     }
 
@@ -571,6 +571,49 @@ int main_entry(int argc, char **argv, char **envp) {
                      : "exec: child exited but with a wrong status\n");
             } else {
                 klog("exec: waitpid failed\n");
+            }
+        }
+    }
+
+    /* ---- pipes: fork, child writes, parent reads back ---- */
+    klog("pipe: testing in-kernel pipes...\n");
+    {
+        int fds[2];
+        if (pipe(fds) != 0) {
+            klog("pipe: pipe() FAILED\n");
+        } else {
+            long ppid = fork();
+            if (ppid == 0) {
+                /* child: write end */
+                close(fds[0]);
+                const char *msg = "hello-through-pipe-123";
+                for (int i = 0; i < 22; ) {          /* len(msg) == 22 */
+                    long r = write(fds[1], msg + i, 22 - i);
+                    if (r == PIPE_WOULD_BLOCK) { sleep(10); continue; }
+                    if (r < 0) break;
+                    i += (int)r;
+                }
+                close(fds[1]);
+                exit(0);
+            } else if (ppid > 0) {
+                /* parent: read end (blocking-ish: -2 -> sleep + retry) */
+                close(fds[1]);
+                char buf[32];
+                long got = 0;
+                while (got < 22) {
+                    long r = read(fds[0], buf + got, 22 - got);
+                    if (r == PIPE_WOULD_BLOCK) { sleep(10); continue; }
+                    if (r <= 0) break;               /* 0 = EOF (writer closed) */
+                    got += r;
+                }
+                close(fds[0]);
+                int status = 0;
+                while ((waitpid(ppid, &status)) == 0);
+                buf[22] = 0;
+                int ok = (got == 22) && buf[0]=='h' && buf[6]=='t' &&
+                         buf[21]=='3' && status == 0;
+                klog(ok ? "pipe: 22 bytes through a pipe, EOF on close - WORK\n"
+                        : "pipe: FAILED (got wrong bytes/status)\n");
             }
         }
     }

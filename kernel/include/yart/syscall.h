@@ -58,6 +58,9 @@ enum {
     SYS_WM_SCAN   = 48,   /* wm:  list surfaces + clear dirty flags                */
     SYS_WM_FOCUS  = 49,   /* wm:  route keyboard to a task (0 = none)              */
     SYS_WM_DESTROY = 50,  /* app/wm: destroy a surface                              */
+    SYS_SIGRETURN  = 51,  /* restore a frame saved by signal delivery               */
+    SYS_WM_TITLE   = 52,  /* app: set the window title (drawn by the compositor)    */
+    SYS_PIPE       = 53,  /* pipe(fds[2]): create an in-kernel byte pipe             */
     SYS_MAX
 };
 
@@ -99,6 +102,7 @@ typedef struct {
     u64  app_va;           /* mapped canvas address (side depends)      */
     u32  owner_pid;
     u32  dirty;
+    char title[32];        /* window title (drawn by the compositor)    */
 } wm_surf_info_t;
 
 void doas_init(void);          /* seed the salted-SHA-256 user database */

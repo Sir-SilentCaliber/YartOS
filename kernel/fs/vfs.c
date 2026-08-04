@@ -12,6 +12,33 @@
 #include <yart/console.h>
 #include <yart/hal.h>
 #include <yart/sched.h>   /* sched_current_euid() for file ownership */
+#include <yart/spinlock.h>
+
+/* Coarse VFS tree lock (recursive, IRQ-safe).  Every public vfs_* entry
+ * takes it; syscall paths may nest (e.g. blkfs_sync -> vfs_path_of). */
+static spinlock_t g_vfs_lock;
+static u32  g_vfs_owner;      /* cpu id holding the lock, or ~0           */
+static int  g_vfs_depth;
+static u64  g_vfs_flags[8];   /* saved IRQ flags per cpu                  */
+
+void vfs_lock(void) {
+    cpu_local_t *c = get_cpu_local();
+    u32 me = c ? c->cpu_id : 0;
+    if (g_vfs_owner == me && g_vfs_depth > 0) { g_vfs_depth++; return; }
+    g_vfs_flags[me] = irq_save();            /* no preemption while held  */
+    spin_lock(&g_vfs_lock);
+    g_vfs_owner = me;
+    g_vfs_depth = 1;
+}
+void vfs_unlock(void) {
+    cpu_local_t *c = get_cpu_local();
+    u32 me = c ? c->cpu_id : 0;
+    if (--g_vfs_depth == 0) {
+        g_vfs_owner = 0xFFFFFFFFu;
+        spin_unlock(&g_vfs_lock);
+        irq_restore(g_vfs_flags[me]);
+    }
+}
 
 typedef struct PACKED {
     char name[100];
@@ -87,11 +114,13 @@ bool vfs_check_perm(vnode_t *v, u32 euid, const u32 *groups, int ngroups, int wa
     return (bits & want) == want;
 }
 
-void vnode_ref(vnode_t *v) { if (v) v->refs++; }
+void vnode_ref(vnode_t *v) {
+    if (v) __atomic_add_fetch(&v->refs, 1, __ATOMIC_RELAXED);
+}
 
 void vnode_unref(vnode_t *v) {
     if (!v || v->refs == 0) return;
-    if (--v->refs == 0) {
+    if (__atomic_sub_fetch(&v->refs, 1, __ATOMIC_RELAXED) == 0) {
         if (v->data) kfree(v->data);
         kfree(v);
     }
@@ -125,18 +154,19 @@ static vnode_t *find_or_make_dir(vnode_t *p, const char *name) {
 }
 
 vnode_t *vfs_create(vnode_t *parent, const char *name, vnode_type_t t) {
-    if (!parent || parent->type != VN_DIR) return NULL;
-    if (find_child(parent, name)) return NULL;
+    vfs_lock();
+    if (!parent || parent->type != VN_DIR) { vfs_unlock(); return NULL; }
+    if (find_child(parent, name)) { vfs_unlock(); return NULL; }
     vnode_t *n = mknode(name, t);
     n->dirty = true;                       /* needs persisting to disk     */
     n->dirty_b0 = 0;
     n->dirty_b1 = 0xFFFFFFFFu;             /* new file: every block dirty  */
     attach(parent, n);
-    return n;
+    vfs_unlock(); return n;
 }
 
 static void insert_path(const char *path, vnode_type_t type,
-                        const void *data, size_t size) {
+                        const void *data, size_t size, u16 mode) {
     vnode_t *cur = root_node;
     char part[VFS_MAX_NAME];
     const char *s = path;
@@ -158,6 +188,9 @@ static void insert_path(const char *path, vnode_type_t type,
         } else {
             vnode_t *f = find_child(cur, part);
             if (!f) { f = mknode(part, VN_FILE); attach(cur, f); }
+            /* honor the initrd's permission bits: the exec() permission
+             * check needs the +x bit on /bin binaries to work for non-root */
+            if (mode) { f->mode = mode & 0777u; f->dirty = false; }
             if (size) {
                 f->data = kmalloc(size);
                 f->cap  = size;
@@ -202,7 +235,7 @@ void vfs_init(void *initrd, size_t total) {
         }
         vnode_type_t t = (h->type == '5' || path[strlen(path) - 1] == '/')
                          ? VN_DIR : VN_FILE;
-        insert_path(path, t, p + 512, sz);
+        insert_path(path, t, p + 512, sz, (u16)oct(h->mode, sizeof h->mode));
         count++;
         u64 blocks = (sz + 511) / 512;
         p += 512 + blocks * 512;
@@ -213,8 +246,9 @@ void vfs_init(void *initrd, size_t total) {
 vnode_t *vfs_root(void) { return root_node; }
 
 vnode_t *vfs_lookup_at(vnode_t *cwd, const char *path) {
+    vfs_lock();
     vnode_t *cur = (path && path[0] == '/') ? root_node : (cwd ? cwd : root_node);
-    if (!path || !*path || (path[0] == '/' && path[1] == 0)) return cur;
+    if (!path || !*path || (path[0] == '/' && path[1] == 0)) { vfs_unlock(); return cur; }
     char part[VFS_MAX_NAME];
     const char *s = path;
     if (*s == '/') s++;
@@ -230,20 +264,21 @@ vnode_t *vfs_lookup_at(vnode_t *cwd, const char *path) {
             continue;
         }
         vnode_t *next = find_child(cur, part);
-        if (!next) return NULL;
+        if (!next) { vfs_unlock(); return NULL; }
         cur = next;
     }
-    return cur;
+    vfs_unlock(); return cur;
 }
 
 vnode_t *vfs_lookup(const char *path) { return vfs_lookup_at(NULL, path); }
 
 int vfs_read(vnode_t *v, void *buf, size_t off, size_t n) {
-    if (!v || v->type != VN_FILE) return -1;
-    if (off >= v->size) return 0;
+    vfs_lock();
+    if (!v || v->type != VN_FILE) { vfs_unlock(); return -1; }
+    if (off >= v->size) { vfs_unlock(); return 0; }
     if (off + n > v->size) n = v->size - off;
     if (n) memcpy(buf, (u8 *)v->data + off, n);
-    return (int)n;
+    vfs_unlock(); return (int)n;
 }
 
 static int ensure_cap(vnode_t *v, size_t need) {
@@ -260,8 +295,9 @@ static int ensure_cap(vnode_t *v, size_t need) {
 }
 
 int vfs_write(vnode_t *v, const void *buf, size_t off, size_t n) {
-    if (!v || v->type != VN_FILE) return -1;
-    if (ensure_cap(v, off + n) < 0) return -1;
+    vfs_lock();
+    if (!v || v->type != VN_FILE) { vfs_unlock(); return -1; }
+    if (ensure_cap(v, off + n) < 0) { vfs_unlock(); return -1; }
     if (off > v->size) memset((u8 *)v->data + v->size, 0, off - v->size);
     memcpy((u8 *)v->data + off, buf, n);
     if (off + n > v->size) v->size = off + n;
@@ -276,13 +312,14 @@ int vfs_write(vnode_t *v, const void *buf, size_t off, size_t n) {
         if (b0 < v->dirty_b0) v->dirty_b0 = b0;
         if (b1 > v->dirty_b1) v->dirty_b1 = b1;
     }
-    return (int)n;
+    vfs_unlock(); return (int)n;
 }
 
 int vfs_truncate(vnode_t *v, size_t n) {
-    if (!v || v->type != VN_FILE) return -1;
+    vfs_lock();
+    if (!v || v->type != VN_FILE) { vfs_unlock(); return -1; }
     if (n > v->size) {
-        if (ensure_cap(v, n) < 0) return -1;
+        if (ensure_cap(v, n) < 0) { vfs_unlock(); return -1; }
         memset((u8 *)v->data + v->size, 0, n - v->size);
     }
     v->size = n;
@@ -290,13 +327,14 @@ int vfs_truncate(vnode_t *v, size_t n) {
     v->dirty = true;
     v->dirty_b0 = 0;
     v->dirty_b1 = 0xFFFFFFFFu;   /* truncate: rewrite every block */
-    return 0;
+    vfs_unlock(); return 0;
 }
 
 int vfs_unlink(vnode_t *v) {
-    if (!v || !v->parent) return -1;
+    vfs_lock();
+    if (!v || !v->parent) { vfs_unlock(); return -1; }
     /* don't allow non-empty dir delete */
-    if (v->type == VN_DIR && v->child) return -1;
+    if (v->type == VN_DIR && v->child) { vfs_unlock(); return -1; }
     {
         char pth[VFS_MAX_PATH];
         if (vfs_path_of(v, pth, sizeof pth) > 0)
@@ -312,10 +350,11 @@ int vfs_unlink(vnode_t *v) {
     v->parent  = NULL;          /* detached: no longer reachable by lookup */
     vnode_unref(v);             /* drop the tree's reference; freed only
                                    when the last open fd closes it too */
-    return 0;
+    vfs_unlock(); return 0;
 }
 
 int vfs_mkdir_p(const char *path) {
+    vfs_lock();
     vnode_t *cur = root_node;
     const char *s = path;
     if (*s == '/') s++;
@@ -331,35 +370,37 @@ int vfs_mkdir_p(const char *path) {
         else if (e->type != VN_DIR) return -1;
         cur = e;
     }
-    return 0;
+    vfs_unlock(); return 0;
 }
 
 int vfs_path_of(vnode_t *v, char *out, size_t cap) {
-    if (!v) return -1;
+    vfs_lock();
+    if (!v) { vfs_unlock(); return -1; }
     if (v == root_node) { strncpy(out, "/", cap); return 1; }
     char tmp[VFS_MAX_PATH] = {0};
     int pos = sizeof tmp - 1;
     tmp[pos] = 0;
     for (vnode_t *c = v; c && c != root_node; c = c->parent) {
         size_t l = strlen(c->name);
-        if (pos - (int)l - 1 < 0) return -1;
+        if (pos - (int)l - 1 < 0) { vfs_unlock(); return -1; }
         pos -= l;
         memcpy(&tmp[pos], c->name, l);
         pos--;
         tmp[pos] = '/';
     }
     size_t len = sizeof tmp - 1 - pos;
-    if (len + 1 > cap) return -1;
+    if (len + 1 > cap) { vfs_unlock(); return -1; }
     memcpy(out, &tmp[pos], len);
     out[len] = 0;
-    return (int)len;
+    vfs_unlock(); return (int)len;
 }
 
 size_t vfs_count_children(vnode_t *dir) {
-    if (!dir || dir->type != VN_DIR) return 0;
+    vfs_lock();
+    if (!dir || dir->type != VN_DIR) { vfs_unlock(); return 0; }
     size_t n = 0;
     for (vnode_t *c = dir->child; c; c = c->sibling) n++;
-    return n;
+    vfs_unlock(); return n;
 }
 
 static void dump_rec(vnode_t *v, int depth) {

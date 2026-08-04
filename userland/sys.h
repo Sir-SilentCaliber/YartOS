@@ -79,6 +79,9 @@ enum {
     SYS_WM_SCAN   = 48,
     SYS_WM_FOCUS  = 49,
     SYS_WM_DESTROY = 50,
+    SYS_SIGRETURN  = 51,
+    SYS_WM_TITLE   = 52,
+    SYS_PIPE       = 53,
 };
 
 #define O_RDONLY 0x0
@@ -129,6 +132,15 @@ static inline int yield(void) { return _sc(SYS_YIELD, 0, 0, 0); }
 static inline long getpid(void) { return _sc(SYS_GETPID, 0, 0, 0); }
 static inline long fork(void) { return _sc(SYS_FORK, 0, 0, 0); }
 static inline long waitpid(long pid, int *status) { return _sc(SYS_WAITPID, pid, (long)status, 0); }
+/* waitpid with WNOHANG: returns 0 immediately if the child is alive */
+static inline long waitpid_nohang(long pid, int *status) {
+    return _sc4(SYS_WAITPID, pid, (long)status, 0, 1);
+}
+/* pipe(fds): fds[0]=read end, fds[1]=write end.  0 = ok, -1 = fail. */
+static inline long pipe(int *fds) { return _sc(SYS_PIPE, (long)fds, 0, 0); }
+/* read/write on a pipe return -2 when it would block (buffer empty/full);
+ * userland should sleep briefly and retry. */
+#define PIPE_WOULD_BLOCK (-2)
 static inline long doas(const char *password) { return _sc(SYS_DOAS, (long)password, 0, 0); }
 static inline long chmod(const char *path, long mode) { return _sc(SYS_CHMOD, (long)path, mode, 0); }
 static inline long drop_priv(void) { return _sc(SYS_DROP, 0, 0, 0); }
@@ -209,5 +221,8 @@ static inline long wm_scan(wm_surf_info_t *o, unsigned max) {
 }
 static inline long wm_focus(unsigned pid) { return _sc(SYS_WM_FOCUS, pid, 0, 0); }
 static inline long wm_destroy(unsigned id) { return _sc(SYS_WM_DESTROY, id, 0, 0); }
+static inline long wm_title(unsigned id, const char *t) {
+    return _sc(SYS_WM_TITLE, id, (long)t, 0);
+}
 
 #endif

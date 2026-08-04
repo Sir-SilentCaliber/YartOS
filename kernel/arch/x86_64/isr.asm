@@ -62,6 +62,12 @@ isr_common:
     cli                         ; close the swapgs/iretq race for IRQs
     test byte [rsp+8], 3        ; CS.RPL after popping vector+err
     jz   .to_kernel
+    ; Resuming to ring 3: FORCE the frame's SS to USER_DS (0x23).  A frame
+    ; whose SS.RPL is 0 (0x20) iretq's to user with SS.RPL < CPL and #GPs
+    ; with err = the SS selector (0x20) - a real crash observed on some
+    ; CPUs/environments where SYSRET leaves the user SS as 0x20.  The
+    ; frame layout here is [rip+0, cs+8, rflags+16, rsp+24, ss+32].
+    mov qword [rsp+32], 0x23
     swapgs
 .to_kernel:
     iretq

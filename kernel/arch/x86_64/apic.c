@@ -85,7 +85,14 @@ static inline void lapic_write(u32 reg, u32 val) { lapic_mmio[reg / 4] = val; }
 #define LAPIC_ICR 0x300
 #define ICR_INIT        (0x500u)      /* INIT, edge, physical           */
 #define ICR_STARTUP     (0x600u)      /* STARTUP, edge, physical        */
-#define ICR_DEST_FIXED  (0x400u)      /* fixed delivery                 */
+/* CRITICAL FIX: ICR bits [10:8] are the DELIVERY MODE.  Fixed = 000,
+ * NMI = 100, INIT = 101, STARTUP = 110.  This was 0x400 (bit 10) - i.e.
+ * EVERY cross-CPU IPI this kernel ever sent was an NMI: the vector field
+ * is ignored, the receiver's NMI handler (which only counts) ran, and
+ * real interrupt delivery (reschedule wake, TLB shootdown) silently
+ * never happened.  The system only worked because APs also wake on their
+ * own timer ticks. */
+#define ICR_DEST_FIXED  (0x000u)      /* fixed delivery (mode 000)        */
 
 static void lapic_send_icr(u32 dest_apic, u32 icr_lo) {
     /* wait for previous IPI to clear (with a timeout so a stuck delivery

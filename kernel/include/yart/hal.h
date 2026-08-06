@@ -11,6 +11,16 @@ void tss_set_rsp0(u64 rsp0);   /* sets THIS CPU's TSS RSP0 (per-CPU) */
 u64  tss_get_rsp0(void);
 cpu_local_t *bsp_cpu_local(void); /* the BSP's per-CPU area (id 0) */
 
+/* TLB shootdown (SMP): invalidate a VA - or flush the whole TLB - on every
+ * online CPU (self included) and wait until all have acked.  Needed
+ * whenever shared kernel page tables (the direct map / kstack guard pages)
+ * or a PML4 that may be loaded on another CPU right now (wm surfaces) are
+ * modified.  Callers must NOT hold a spinlock an AP could be spinning on
+ * with IRQs off, and must not be in an interrupt handler. */
+void smp_tlb_shootdown(u64 va);       /* single-page invalidate, all CPUs */
+void smp_tlb_shootdown_all(void);     /* full flush, all CPUs             */
+bool smp_tlb_selftest(void);          /* boot selftest (needs APs online) */
+
 /* IDT / interrupts */
 typedef struct PACKED {
     u64 r15, r14, r13, r12, r11, r10, r9, r8;

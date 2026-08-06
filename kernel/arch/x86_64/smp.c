@@ -22,6 +22,12 @@
 #include <yart/string.h>
 #include <yart/mm.h>
 #include <yart/hal.h>
+#include <yart/io.h>    /* invlpg / write_cr3 / irq_save (TLB shootdown) */
+#include <yart/spinlock.h>   /* g_tlb_lock (serialize shootdowns)       */
+
+/* forward decl: the AP-entry + smp_start_aps paths register the vec-63
+ * handler before its definition below */
+void smp_tlb_ipi_handler(cpu_regs_t *r);
 #include <yart/cpu.h>
 #include <yart/limine.h>
 #include <yart/sched.h>
@@ -29,6 +35,7 @@
 #include <yart/acpi.h>   /* g_madt.lapic_addr */
 #define IA32_APIC_BASE_MSR 0x1B
 #define AP_WAKE_VEC 62
+#define TLB_FLUSH_VEC 63            /* TLB shootdown IPI (see below)       */
 
 __attribute__((used, section(".limine_requests")))
 static volatile struct limine_smp_request smp_request = {
@@ -185,6 +192,7 @@ int smp_start_aps(void) {
         cpu++;
     }
     g_smp_ready = true;
+    irq_register(TLB_FLUSH_VEC, smp_tlb_ipi_handler);
     /* Limine starts the APs once we return from the bootloader entry point
      * with the requests processed - they come up asynchronously after this
      * function, so give them a moment and report what we see. */
@@ -193,4 +201,119 @@ int smp_start_aps(void) {
     kprintf("smp: %d/%d AP(s) online, %lu total CPUs\n",
             g_ap_online, g_ap_count, (unsigned long)(r->cpu_count));
     return g_ap_online;
+}
+
+/* =====================================================================
+ * TLB SHOOTDOWN (SMP correctness)
+ *
+ * invlpg() and CR3 reloads are per-CPU.  When one CPU modifies SHARED
+ * kernel page tables - the HHDM direct map (kstack guard pages are
+ * unmapped/remapped there, and vmm_nx_direct_map re-stamps every PTE) -
+ * or a PML4 that another CPU may have loaded right now (wm surface
+ * mappings installed from the app's syscall), the other CPUs' TLBs keep
+ * stale entries: a freed/guarded page stays reachable, a freshly mapped
+ * surface stays invisible (and can be demand-fault-shadowed by a stale
+ * "not present" entry).  This is the textbook TLB-shootdown protocol:
+ * request -> IPI -> flush -> ack, serialized so req/gen pairing stays
+ * unambiguous.
+ *
+ * DEADLOCK RULES for callers: must not be in an interrupt handler, and
+ * must not hold a spinlock that another CPU could be spinning on with
+ * IRQs disabled (that CPU would never reach its IPI handler).  All
+ * current call sites (kstack guard map/unmap, the NX pass, wm surface
+ * map/unmap) satisfy this.  The sender runs with local IRQs off while
+ * waiting so it cannot be preempted mid-shootdown.
+ * ===================================================================== */
+static spinlock_t g_tlb_lock;
+/* Monotonic request sequence: every shootdown gets a fresh, unique number
+ * so an AP's ack (tlb_gen == tlb_req) is unambiguous even when requests
+ * are batched.  (The sender's own tlb_gen must NOT be used - it only
+ * advances when the sender ITSELF receives a shootdown IPI, which never
+ * happens because self is flushed locally.) */
+static volatile u64 g_tlb_seq;
+
+void smp_tlb_ipi_handler(cpu_regs_t *r) {
+    (void)r;
+    cpu_local_t *c = get_cpu_local();
+    /* Flush until caught up.  Only one shootdown is in flight at a time
+     * (global lock), so this terminates; the loop also covers a request
+     * that arrived while this IPI was already pending. */
+    while (c->tlb_req != c->tlb_gen) {
+        if (c->tlb_full) write_cr3(read_cr3());
+        else             invlpg(c->tlb_va);
+        c->tlb_full = 0;
+        c->tlb_gen  = c->tlb_req;   /* ack */
+    }
+}
+
+static void smp_tlb_flush_others(bool full, u64 va) {
+    if (!g_smp_ready) return;       /* single-CPU / boot: local flush only */
+    u64 fl = irq_save();
+    spin_lock(&g_tlb_lock);
+    cpu_local_t *me = get_cpu_local();
+    u64 req = __atomic_add_fetch(&g_tlb_seq, 1, __ATOMIC_RELAXED);
+    for (u32 i = 0; i < 8; i++) {
+        cpu_local_t *c = (i == 0) ? bsp_cpu_local() : smp_get_ap_area(i);
+        if (!c || !c->ap_up || c == me) continue;
+        c->tlb_va   = va;
+        c->tlb_full = full ? 1 : 0;
+        __atomic_store_n(&c->tlb_req, req, __ATOMIC_RELEASE);
+        lapic_send_ipi(c->ap_lapic_id, TLB_FLUSH_VEC);
+    }
+    /* wait for every ack (generous timeout: TCG APs can be slow) */
+    for (u32 i = 0; i < 8; i++) {
+        cpu_local_t *c = (i == 0) ? bsp_cpu_local() : smp_get_ap_area(i);
+        if (!c || !c->ap_up || c == me) continue;
+        u64 spins = 0;
+        while (__atomic_load_n(&c->tlb_gen, __ATOMIC_ACQUIRE) < req) {
+            __asm__ volatile("pause");
+            if (++spins > 400000000ULL) {
+                kprintf("smp: !! TLB shootdown TIMEOUT waiting for CPU %u "
+                        "(req=%llu gen=%llu) - stale TLB entries possible\n",
+                        i, (unsigned long long)req,
+                        (unsigned long long)c->tlb_gen);
+                break;
+            }
+        }
+    }
+    spin_unlock(&g_tlb_lock);
+    irq_restore(fl);
+}
+
+void smp_tlb_shootdown(u64 va) {
+    invlpg(va);                     /* self */
+    smp_tlb_flush_others(false, va);
+}
+
+void smp_tlb_shootdown_all(void) {
+    write_cr3(read_cr3());          /* self: full flush */
+    smp_tlb_flush_others(true, 0);
+}
+
+bool smp_tlb_selftest(void) {
+    if (g_ap_count == 0) {
+        kprintf("smp: TLB shootdown selftest skipped (single CPU)\n");
+        return true;
+    }
+    u64 before[8] = {0};
+    for (u32 i = 1; i < 8; i++) {
+        cpu_local_t *c = smp_get_ap_area(i);
+        before[i] = (c && c->ap_up) ? __atomic_load_n(&c->tlb_gen, __ATOMIC_ACQUIRE) : 0;
+    }
+    u64 t0 = pit_ticks();
+    const int ROUNDS = 64;
+    for (int i = 0; i < ROUNDS; i++)
+        smp_tlb_shootdown(0xffff8000000f0000ULL + (u64)(i % 16) * PAGE_SIZE);
+    smp_tlb_shootdown_all();
+    u64 dt = pit_ticks() - t0;
+    bool ok = true;
+    for (u32 i = 1; i < 8; i++) {
+        cpu_local_t *c = smp_get_ap_area(i);
+        if (!c || !c->ap_up) continue;
+        if (__atomic_load_n(&c->tlb_gen, __ATOMIC_ACQUIRE) != before[i] + ROUNDS + 1)
+            ok = false;
+    }
+    kprintf("smp: TLB shootdown selftest %s (%d single + 1 full flush, %u APs, %lu ticks)\n",
+            ok ? "PASS" : "FAIL", ROUNDS, (unsigned)g_ap_count, (unsigned long)dt);
+    return ok;
 }

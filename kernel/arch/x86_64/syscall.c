@@ -1349,7 +1349,12 @@ static i64 sys_wm_create(u32 w, u32 h, wm_surf_info_t *out) {
     }
     s->app_mapped = true;
     /* map into the wm (same no-CoW/no-swap treatment: the wm forks on
-     * every app launch and must keep drawing to the same frames) */
+     * every app launch and must keep drawing to the same frames).
+     * TLB SHOOTDOWN: this syscall runs on the APP's CPU - the wm may be
+     * executing RIGHT NOW on another core with its pml4 in CR3; without a
+     * cross-CPU flush its TLB keeps a stale "not present" entry and the
+     * first draw faults (demand-fault would even shadow the real frame
+     * with a fresh zero page). */
     if (g_wm_task && g_wm_task->pml4) {
         for (u32 i = 0; i < npages; i++) {
             vmm_map_in(g_wm_task->pml4, s->wm_va + i * PAGE_SIZE, s->pages[i],
@@ -1357,6 +1362,8 @@ static i64 sys_wm_create(u32 w, u32 h, wm_surf_info_t *out) {
             pmm_ref_page(s->pages[i]);
         }
         s->wm_mapped = true;
+        if (g_wm_task != cur())
+            smp_tlb_shootdown_all();   /* wm's pml4 may be live on its CPU */
     }
     sched_charge_pages((i64)npages);
 
@@ -1393,6 +1400,11 @@ static void wm_surface_teardown(wm_surface_t *s, bool unmap_app) {
         for (u32 i = 0; i < s->npages; i++)
             vmm_unmap_in(g_wm_task->pml4, s->wm_va + i * PAGE_SIZE);
         s->wm_mapped = false;
+        /* shoot down the wm's stale TLB entries before the frames below
+         * are freed - otherwise the wm's CPU could keep painting from a
+         * freed surface (use-after-free on the screen). */
+        if (g_wm_task != cur())
+            smp_tlb_shootdown_all();
     }
     /* table refs: free the frames for real */
     for (u32 i = 0; i < s->npages; i++)

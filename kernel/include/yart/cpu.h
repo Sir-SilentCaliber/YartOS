@@ -152,6 +152,18 @@ typedef struct cpu_local_s {
                                  before switching to the kernel stack. */
     volatile u8 ap_yield_pending;   /* sched_yield() set: force immediate
                                        reschedule via self-IPI */
+    /* TLB shootdown (vector 63): a CPU that mutates SHARED kernel page
+     * tables (direct map, kstack guards) or a live foreign PML4 (wm
+     * surface maps) raises this IPI on every other CPU.  The handler
+     * flushes (full CR3 reload, or one VA) until gen catches up with req;
+     * the sender waits for gen >= req.  A global lock serializes
+     * shootdowns so the req/gen pairing stays unambiguous.  Appended at
+     * the END on purpose: the fast-syscall asm pins ap_krsp0 /
+     * ap_syscall_rsp offsets, which must not move. */
+    volatile u64 tlb_req;           /* flush request generation           */
+    volatile u64 tlb_gen;           /* completed-flush generation (ack)   */
+    volatile u64 tlb_va;            /* VA to invalidate (single flush)    */
+    volatile u8  tlb_full;          /* 1 = full flush (CR3 reload)        */
 } cpu_local_t;
 
 /* The fast syscall/sysret assembly entry must touch two per-CPU slots by

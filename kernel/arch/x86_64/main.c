@@ -152,6 +152,7 @@ void kmain(void) {
     /* APs are up: Limine's SMP trampoline is no longer needed, so the
      * whole direct map (heap/stacks/fb/initrd/DMA buffers) can be NX. */
     vmm_nx_direct_map();
+    smp_tlb_selftest();     /* IPI round-trip + ack check on every AP */
     kbd_init();
     mouse_init();
 

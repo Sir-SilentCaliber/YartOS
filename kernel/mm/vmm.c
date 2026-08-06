@@ -18,6 +18,7 @@
 #include <yart/user.h>     /* USER_VBASE / USER_STACK_TOP */
 #include <yart/sched.h>    /* sched_current() for per-task regions */
 #include <yart/cpu.h>      /* rdmsr64/wrmsr64 for EFER.NXE */
+#include <yart/hal.h>      /* smp_tlb_shootdown() for shared-table edits */
 #include <yart/spinlock.h> /* g_swap_lock */
 #include <yart/blk.h>      /* disk-backed swap tier (virtio-blk)      */
 
@@ -216,6 +217,38 @@ int vmm_reserve_in(u64 *pml4, user_region_t *rs, int *count,
 
 int vmm_user_reserve(u64 va, u64 npages, u64 flags, u32 opts) {
     if (npages == 0) return -1;
+    /* CHARGE-AFTER-CHECKS FIX: validate everything first, charge only on
+     * success.  The old order charged BEFORE the range/count/overlap
+     * checks, so every failed reserve LEAKED its pages into the task's
+     * memory accounting - a poisoned region list (or a full region table)
+     * turned one failed mmap() into ~240 phantom MiBs of charge and then
+     * a boot-long "over memory cap" storm. */
+    u64 start = PAGE_ALIGN_DOWN(va);
+    u64 end   = start + npages * PAGE_SIZE;
+    if (end < start) return -1;
+    if (start < USER_VBASE || end > USER_STACK_TOP) {
+        if (sched_current() && sched_current()->pid == 4)
+            kprintf("vmm: reserve FAIL va=0x%lx npages=%lu: out of user range\n",
+                    (unsigned long)va, (unsigned long)npages);
+        return -1;
+    }
+    int n; user_region_t *rs = active_regions(&n);
+    for (int i = 0; i < n; i++) {
+        u64 r_end = rs[i].start + rs[i].npages * PAGE_SIZE;
+        if (start < r_end && end > rs[i].start) {
+            if (sched_current() && sched_current()->pid == 4)
+                kprintf("vmm: reserve FAIL va=0x%lx npages=%lu: overlaps region %d va=0x%lx npages=%lu (count=%d)\n",
+                        (unsigned long)va, (unsigned long)npages, i,
+                        (unsigned long)rs[i].start, (unsigned long)rs[i].npages, n);
+            return -1;   /* overlap */
+        }
+    }
+    if (n >= MAX_USER_REGIONS) {
+        if (sched_current() && sched_current()->pid == 4)
+            kprintf("vmm: reserve FAIL va=0x%lx npages=%lu: region table full (%d)\n",
+                    (unsigned long)va, (unsigned long)npages, n);
+        return -1;
+    }
     /* per-task memory cap: charging happens even for lazy (demand) regions,
      * because the pages WILL be faulted in later */
     if (sched_current_is_user() && sched_mem_used() + npages > sched_mem_limit()) {
@@ -226,16 +259,6 @@ int vmm_user_reserve(u64 va, u64 npages, u64 flags, u32 opts) {
         return -1;
     }
     sched_charge_pages((i64)npages);
-    u64 start = PAGE_ALIGN_DOWN(va);
-    u64 end   = start + npages * PAGE_SIZE;
-    if (end < start) return -1;
-    if (start < USER_VBASE || end > USER_STACK_TOP) return -1;
-    int n; user_region_t *rs = active_regions(&n);
-    for (int i = 0; i < n; i++) {
-        u64 r_end = rs[i].start + rs[i].npages * PAGE_SIZE;
-        if (start < r_end && end > rs[i].start) return -1;   /* overlap */
-    }
-    if (n >= MAX_USER_REGIONS) return -1;
     user_region_t *r = &rs[n];
     r->start  = start;
     r->npages = npages;
@@ -754,8 +777,10 @@ void vmm_nx_direct_map(void) {
         }
     }
 done:
-    /* full TLB flush so the new NX bits take effect everywhere */
-    write_cr3(read_cr3());
+    /* full TLB flush so the new NX bits take effect on EVERY CPU - a
+     * local-only CR3 reload left the APs with executable direct-map
+     * entries (heap code-exec on the other cores). */
+    smp_tlb_shootdown_all();
     kprintf("vmm: HHDM direct map marked NX (heap/stacks/fb cannot execute)\n");
 }
 
@@ -818,14 +843,17 @@ void vmm_unmap_direct_page(paddr_t p) {
     u64 *pte = direct_pte_splitting(p);
     if (!pte || !(*pte & PTE_PRESENT)) return;
     *pte = 0;
-    invlpg((u64)phys_to_virt(p));
+    /* Shoot down: the direct map is SHARED kernel page tables - another
+     * CPU's TLB may still hold this page (kstack guard).  Local-only
+     * invlpg left stale entries on the other cores. */
+    smp_tlb_shootdown((u64)phys_to_virt(p));
 }
 
 void vmm_remap_direct_page(paddr_t p) {
     u64 *pte = direct_pte_splitting(p);
     if (!pte) return;
     *pte = (p & ~0xFFFULL) | PTE_PRESENT | PTE_RW | PTE_NX;
-    invlpg((u64)phys_to_virt(p));
+    smp_tlb_shootdown((u64)phys_to_virt(p));
 }
 
 void vmm_init(void) {

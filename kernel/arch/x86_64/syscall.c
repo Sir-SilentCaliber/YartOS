@@ -708,6 +708,17 @@ static i64 sys_udp_recv(u8 *buf, u16 cap) {
     return (i64)n;
 }
 
+static i64 sys_dns_resolve(const char *name, u32 *out) {
+    if (!g_sys_from_user) return -1;
+    char k[256];
+    if (!copy_user_str((u64)name, k, sizeof k)) return -1;
+    if (!uptr((u64)out, 4)) return -1;
+    u32 ip;
+    if (net_dns_resolve(k, &ip) != 0) return -1;
+    stac(); *(u32 *)out = ip; clac();
+    return 0;
+}
+
 /* ---- TCP sockets ---- */
 static i64 sys_tcp_connect(u32 ip, u16 port) {
     if (!g_sys_from_user) return -1;
@@ -1087,6 +1098,7 @@ static void syscall_handler(cpu_regs_t *r) {
     case SYS_TCP_CLOSE:   r->rax = (u64)sys_tcp_close((i64)a0); break;
     case SYS_TCP_LISTEN:  r->rax = (u64)sys_tcp_listen((u16)a0); break;
     case SYS_TCP_ACCEPT:  r->rax = (u64)sys_tcp_accept((i64)a0); break;
+    case SYS_DNS_RESOLVE: r->rax = (u64)sys_dns_resolve((const char *)a0, (u32 *)a1); break;
     default:
         kprintf("syscall: bad #%lu\n", r->rax);
         r->rax = (u64)-1;

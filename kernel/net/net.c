@@ -13,6 +13,8 @@
 #include <yart/hal.h>
 #include <yart/mm.h>
 
+static void net_pump(void);   /* RX pump (defined with net_service) */
+
 /* ---- state ---- */
 static u8  g_mac[6];
 static u32 g_ip, g_mask, g_gw, g_dns;     /* host order */
@@ -39,6 +41,108 @@ static u32  g_server_id;
 #define UDP_RXBUF 2048
 static u8   g_udp_rx[UDP_RXBUF];
 static u16  g_udp_rx_len;
+
+/* DNS client state: one outstanding transaction at a time.  The response
+ * is demuxed in process_udp on its own client port. */
+#define DNS_CLIENT_PORT 5353
+#define DNS_RXBUF 512
+static u8   g_dns_rx[DNS_RXBUF];
+static u16  g_dns_rx_len;
+static u16  g_dns_id;
+
+static int udp_raw_send(u32 src_ip, u32 dst_ip, u16 sport, u16 dport,
+                        const u8 *buf, u16 len);   /* defined below */
+
+/* ---- DNS (RFC 1035): encode "www.example.com" -> 3www7example3com0 ---- */
+static int dns_encode_name(const char *host, u8 *out) {
+    int o = 0;
+    const char *p = host;
+    if (!p || !*p) return -1;
+    while (*p) {
+        const char *d = p;
+        while (*d && *d != '.') d++;
+        int l = (int)(d - p);
+        if (l <= 0 || l > 63 || o + l + 2 > 250) return -1;
+        out[o++] = (u8)l;
+        memcpy(out + o, p, (size_t)l);
+        o += l;
+        p = (*d) ? d + 1 : d;
+    }
+    out[o++] = 0;
+    return o;
+}
+
+/* Resolve a hostname to an IPv4 address (blocking, ~1 s worst case).
+ * Sends the query via the normal UDP path, drives inbound processing
+ * while waiting, then parses the answer (handles compression pointers
+ * and CNAME chains).  Returns 0 + *out_ip on success. */
+int net_dns_resolve(const char *host, u32 *out_ip) {
+    if (!g_ip || !g_dns || !host || !out_ip) return -1;
+    u8 q[300]; memset(q, 0, sizeof q);
+    g_dns_id = (u16)(pit_ticks() ^ (host[0] << 8) ^ (u16)(u64)g_mac);
+    q[0] = (u8)(g_dns_id >> 8); q[1] = (u8)(g_dns_id & 0xFF);
+    q[2] = 0x01; q[3] = 0x00;              /* RD */
+    q[5] = 0x01;                           /* QDCOUNT = 1 */
+    int o = dns_encode_name(host, q + 12);
+    if (o < 0) return -1;
+    o += 12;
+    q[o++] = 0; q[o++] = 1;                /* QTYPE = A   */
+    q[o++] = 0; q[o++] = 1;                /* QCLASS = IN */
+
+    g_dns_rx_len = 0;
+    for (int attempt = 0; attempt < 2 && !g_dns_rx_len; attempt++) {
+        if (udp_raw_send(g_ip, g_dns, DNS_CLIENT_PORT, UDP_DNS, q, (u16)o) != 0)
+            break;
+        u64 t0 = pit_ticks();
+        while (pit_ticks() - t0 < 40 && !g_dns_rx_len) {
+            net_pump();                    /* process the reply */
+            __asm__ volatile("pause");
+        }
+    }
+    if (!g_dns_rx_len) return -1;
+    const u8 *r = g_dns_rx;
+    int len = g_dns_rx_len;
+    if (len < 12) return -1;
+    if (r[0] != (u8)(g_dns_id >> 8) || r[1] != (u8)(g_dns_id & 0xFF)) return -1;
+    if (!(r[2] & 0x80)) return -1;         /* QR (response) */
+    if ((r[3] & 0x0F) != 0) return -1;     /* RCODE != 0 (NXDOMAIN etc) */
+    u16 qd = (u16)((r[4] << 8) | r[5]);
+    u16 an = (u16)((r[6] << 8) | r[7]);
+    int off = 12;
+    /* skip the question section */
+    for (int i = 0; i < qd; i++) {
+        while (off < len && r[off]) {
+            if ((r[off] & 0xC0) == 0xC0) { off += 2; break; }
+            off += r[off] + 1;
+        }
+        off += 1 + 4;
+        if (off > len) return -1;
+    }
+    /* walk answers: follow CNAMEs, take the first A record */
+    for (int i = 0; i < an; i++) {
+        if (off >= len) return -1;
+        if ((r[off] & 0xC0) == 0xC0) off += 2;      /* name = pointer */
+        else {
+            while (off < len && r[off]) {
+                if ((r[off] & 0xC0) == 0xC0) { off += 2; break; }
+                off += r[off] + 1;
+            }
+            off += 1;
+        }
+        if (off + 10 > len) return -1;
+        u16 type  = (u16)((r[off] << 8) | r[off + 1]);
+        u16 cls   = (u16)((r[off + 2] << 8) | r[off + 3]);
+        u16 rdlen = (u16)((r[off + 8] << 8) | r[off + 9]);
+        off += 10;
+        if (off + rdlen > len) return -1;
+        if (type == 1 && cls == 1 && rdlen == 4) {  /* A record */
+            memcpy(out_ip, r + off, 4);
+            return 0;
+        }
+        off += rdlen;                      /* skip CNAME/other */
+    }
+    return -1;
+}
 
 extern void nic_poll(void);
 
@@ -140,8 +244,6 @@ static int ip_send(u32 dst, u8 proto, const u8 *payload, u16 plen) {
 /* Raw UDP send used internally (does NOT require an address; DHCP uses it
  * before the host has an IP).  src_ip is the IP to put in the header (0
  * during DHCP).  Broadcasts skip ARP. */
-static void net_pump(void);   /* forward decl (defined with net_service) */
-
 /* Resolve the next hop's MAC for `ip` (ARP request + wait for the reply,
  * driving the stack while we wait).  0 = resolved / broadcast / no route
  * needed; -1 = ARP timeout.  Shared by UDP and TCP so both can transmit
@@ -307,6 +409,13 @@ static void process_udp(const u8 *p, u16 len, u32 src) {
     if (len < 8) return;
     u16 dport = (u16)((p[2] << 8) | p[3]);
     if (dport == UDP_DHCP_CLIENT) { dhcp_handle(p + 8, len - 8); return; }
+    if (dport == DNS_CLIENT_PORT) {      /* DNS response */
+        u16 dlen = len - 8;
+        if (dlen > DNS_RXBUF) dlen = DNS_RXBUF;
+        memcpy(g_dns_rx, p + 8, dlen);
+        g_dns_rx_len = dlen;
+        return;
+    }
     if (dport == g_udp_src_port) {       /* demo socket */
         u16 dlen = len - 8;
         if (dlen > UDP_RXBUF) dlen = UDP_RXBUF;

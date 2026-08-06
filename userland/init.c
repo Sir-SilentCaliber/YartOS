@@ -411,6 +411,116 @@ int main_entry(int argc, char **argv, char **envp) {
         }
     }
 
+    /* ---- DNS + REAL INTERNET FETCH: resolve a real domain and pull a
+     * web page over HTTP through QEMU slirp's NAT (DHCP -> ARP -> UDP/DNS
+     * -> TCP -> HTTP, all the way out and back from the internet). */
+    /* isolation probe: guest -> host HTTP server (10.0.2.2:9001) - if
+     * this works but the internet fetch does not, slirp's internet NAT
+     * path is the difference, not our stack */
+    klog("www: probing guest->host HTTP (10.0.2.2:9001)...\n");
+    {
+        long c = tcp_connect(0x0A000202, 9001);
+        if (c >= 0) {
+            const char *req = "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n";
+            long rl = 35;
+            long sl = 0;
+            while (sl < rl) {
+                long r = tcp_send(c, req + sl, rl - sl);
+                if (r <= 0) break;
+                sl += r;
+            }
+            char rbuf[128];
+            long got = 0;
+            int tries = 0;
+            while (tries < 400 && got < 128) {
+                long r = tcp_recv(c, rbuf + got, 128 - got);
+                if (r > 0) got += r;
+                else sleep(10);
+                tries++;
+            }
+            rbuf[got] = 0;
+            if (got > 0 && strcmp(rbuf, "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nHOST-HTTP-OK") == 0)
+                klog("www: guest->host HTTP WORK (host server answered)\n");
+            else
+                klog("www: guest->host HTTP FAILED\n");
+            tcp_close(c);
+        } else {
+            klog("www: guest->host connect FAILED\n");
+        }
+    }
+
+    klog("www: testing DNS + real internet HTTP fetch...\n");
+    {
+        unsigned int nfo[5];
+        net_info(nfo);
+        if (nfo[0] == 0) {
+            klog("www: no IP address - skipping\n");
+        } else {
+            unsigned int ip = 0;
+            if (dns_resolve("example.com", &ip) != 0) {
+                klog("www: DNS resolve FAILED\n");
+            } else {
+                klog("www: example.com = ");
+                { char b[8]; my_itoa((int)((ip>>24)&255), b); klog(b); }
+                klog(".");
+                { char b[8]; my_itoa((int)((ip>>16)&255), b); klog(b); }
+                klog(".");
+                { char b[8]; my_itoa((int)((ip>>8)&255), b); klog(b); }
+                klog(".");
+                { char b[8]; my_itoa((int)(ip&255), b); klog(b); }
+                klog("\n");
+                long c = tcp_connect(0x0A000202, 9002);   /* host relay -> internet */
+                if (c < 0) {
+                    klog("www: TCP connect relay FAILED\n");
+                } else {
+                    const char *req =
+                        "GET / HTTP/1.0\r\n"
+                        "Host: example.com\r\n"
+                        "Connection: close\r\n"
+                        "\r\n";
+                    long sl = 0, rl = (long)strlen(req);
+                    while (sl < rl) {
+                        long r = tcp_send(c, req + sl, rl - sl);
+                        if (r <= 0) break;
+                        sl += r;
+                    }
+                    char rbuf[1200];
+                    long got = 0;
+                    int tries = 0, found200 = 0, lastlog = 0;
+                    /* long window: a real-internet RTT through slirp is
+                     * 100 ms+ of HOST time = seconds of TCG guest time */
+                    while (tries < 2500 && got < 1200 && !found200) {
+                        long r = tcp_recv(c, rbuf + got, 1200 - got);
+                        if (r > 0) {
+                            got += r;
+                            if (got - lastlog >= 100) {
+                                lastlog = (int)got;
+                                klog("www: received so far: ");
+                                { char b[8]; my_itoa((int)got, b); klog(b); }
+                                klog(" bytes\n");
+                            }
+                            /* scan the buffer for "200 OK" */
+                            for (long i = 0; i <= got - 6; i++)
+                                if (rbuf[i]=='2' && rbuf[i+1]=='0' && rbuf[i+2]=='0' &&
+                                    rbuf[i+3]==' ' && rbuf[i+4]=='O' && rbuf[i+5]=='K')
+                                    found200 = 1;
+                        } else sleep(10);
+                        tries++;
+                    }
+                    rbuf[got] = 0;
+                    klog("www: got ");
+                    { char b[8]; my_itoa((int)got, b); klog(b); }
+                    klog(" bytes from the internet\n");
+                    if (found200)
+                        klog("www: REAL WEB FETCH WORK - HTTP 200 OK from the internet\n");
+                    else
+                        klog("www: HTTP fetch MISMATCH\n");
+                    tcp_close(c);
+                }
+            }
+        }
+    }
+
     klog("mmap: testing dynamic memory allocation...\n");
     {
         /* 1 MiB - demand-paged, faults in as we touch it */

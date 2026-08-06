@@ -67,6 +67,7 @@ enum {
     SYS_TCP_CLOSE   = 57, /* TCP: graceful close (FIN/ACK)                             */
     SYS_TCP_LISTEN  = 58, /* TCP: listen on a port (server)                            */
     SYS_TCP_ACCEPT  = 59, /* TCP: accept a completed connection (-2 = not yet)         */
+    SYS_DNS_RESOLVE = 60, /* DNS: resolve a hostname to an IPv4 (blocking)               */
     SYS_MAX
 };
 

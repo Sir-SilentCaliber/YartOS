@@ -30,7 +30,7 @@
 
 #define TCP_RETRANS_TICKS 25          /* 250 ms @ 100 Hz                  */
 #define TCP_MAX_RETRIES   8
-#define TCP_CONNECT_TIMEOUT 400       /* 4 s                              */
+#define TCP_CONNECT_TIMEOUT 800       /* 8 s                              */
 #define TCP_CLOSE_TIMEOUT   250       /* 2.5 s                            */
 
 /* TCP flags */

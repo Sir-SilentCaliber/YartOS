@@ -88,6 +88,7 @@ enum {
     SYS_TCP_CLOSE   = 57,
     SYS_TCP_LISTEN  = 58,
     SYS_TCP_ACCEPT  = 59,
+    SYS_DNS_RESOLVE = 60,
 };
 
 #define O_RDONLY 0x0
@@ -169,6 +170,8 @@ static inline long tcp_recv(long c, char *buf, long cap)
 static inline long tcp_close(long c) { return _sc(SYS_TCP_CLOSE, c, 0, 0); }
 static inline long tcp_listen(unsigned short port) { return _sc(SYS_TCP_LISTEN, port, 0, 0); }
 static inline long tcp_accept(long l) { return _sc(SYS_TCP_ACCEPT, l, 0, 0); }
+static inline long dns_resolve(const char *name, unsigned int *out)
+    { return _sc(SYS_DNS_RESOLVE, (long)name, (long)out, 0); }
 static inline long mmap(long len) { return _sc(SYS_MMAP, len, 0, 0); }
 static inline long munmap(long addr) { return _sc(SYS_MUNMAP, addr, 0, 0); }
 static inline long setuid(long uid) { return _sc(SYS_SETUID, uid, 0, 0); }

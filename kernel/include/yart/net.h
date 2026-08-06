@@ -31,6 +31,7 @@ void   net_get_addrs(u32 *ip, u32 *gw, u32 *dns, u32 *mask);  /* host order */
 
 /* UDP userland-facing API (minimal sockets) */
 int    net_udp_send(u32 dst_ip, u16 dport, const u8 *buf, u16 len);
+int    net_dns_resolve(const char *hostname, u32 *out_ip);  /* 0 = found */
 int    net_udp_recv(u8 *buf, u16 cap);   /* 0 = nothing yet, >0 = datagram */
 
 /* ---- TCP (net/tcp.c) ---- */

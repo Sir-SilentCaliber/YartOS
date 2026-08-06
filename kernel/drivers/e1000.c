@@ -69,6 +69,12 @@ static void pci_wr8(u8 bus, u8 dev, u8 fn, u8 off, u8 val) {
 #define CTRL_SLU   (1u << 6)
 #define RCTL_EN    (1u << 1)
 #define RCTL_SBP   (1u << 2)
+#define RCTL_UPE   (1u << 3)   /* unicast promiscuous (off)   */
+#define RCTL_MPE   (1u << 4)   /* multicast promiscuous: accept ALL mcast -
+                                  needed for IPv6 NDP (33:33:.. frames); the
+                                  MTA is zeroed at reset, so without MPE every
+                                  ICMPv6/NDP frame is silently dropped by the
+                                  NIC's multicast filter */
 #define RCTL_BAM   (1u << 15)
 #define RCTL_SECRC (1u << 26)
 #define RCTL_BSIZE_2048 (0u << 16)
@@ -280,8 +286,13 @@ void nic_init(void) {
     reg_wr(REG_RDLEN, sizeof(e1000_rx_desc) * NUM_RX);
     reg_wr(REG_RDH, 0);
     reg_wr(REG_RDT, NUM_RX - 1);
-    /* accept broadcast + multicast + unicast */
-    reg_wr(REG_RCTL, RCTL_EN | RCTL_SBP | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2048);
+    /* accept broadcast + ALL multicast (MPE + all-ones MTA): IPv6 NDP/RA
+     * frames go to 33:33:.. multicast groups; without this every RA/NS/NA
+     * is silently dropped by the NIC's multicast filter. */
+    for (int i = 0; i < 128; i++)
+        reg_wr(REG_MTA + (u32)i, 0xFFFFFFFFu);
+    reg_wr(REG_RCTL, RCTL_EN | RCTL_SBP | RCTL_MPE | RCTL_BAM | RCTL_SECRC |
+                     RCTL_BSIZE_2048);
     /* program our MAC as the receive address */
     reg_wr(REG_RAL, ral);
     reg_wr(REG_RAH, (rah & 0xFFFF) | 0x80000000u);   /* AV bit */

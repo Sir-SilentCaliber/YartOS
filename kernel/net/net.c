@@ -429,7 +429,9 @@ static int udp_raw_send(u32 src_ip, u32 dst_ip, u16 sport, u16 dport,
 
 /* ---- public UDP socket-ish API ---- */
 int net_udp_send(u32 dst_ip, u16 dport, const u8 *buf, u16 len) {
-    if (!g_ip) return -1;                 /* no address yet */
+    /* loopback needs no address (real-OS semantics: UDP to 127.0.0.1
+     * works with zero network config) */
+    if (!g_ip && (dst_ip & 0xFF000000u) != 0x7F000000u) return -1;
     return udp_raw_send(g_ip, dst_ip, g_udp_src_port, dport, buf, len);
 }
 
@@ -478,6 +480,8 @@ int net_udp_bind(u16 port) {
 }
 
 u32 net_own_ip(void) { return g_ip; }
+
+
 
 void net_get_addrs(u32 *ip, u32 *gw, u32 *dns, u32 *mask) {
     if (ip)   *ip   = g_ip;
@@ -670,6 +674,7 @@ static void process_eth(const u8 *f, u16 len) {
     (void)src;
     if (type == ETH_ARP) process_arp(f + 14, len - 14);
     else if (type == ETH_IPV4) process_ip(f + 14, len - 14);
+    else if (type == ETH_IPV6) net_ipv6_deliver(f + 14, len - 14);
 }
 
 /* ---- RX pump: drain the NIC + process inbound frames.  Split out of
@@ -726,6 +731,8 @@ void net_service(void) {
 
     /* drive TCP retransmission / timeouts */
     tcp_poll();
+    /* drive IPv6 SLAAC (RS until RA) */
+    net_ipv6_poll();
 }
 
 void net_init(void) {
@@ -739,6 +746,7 @@ void net_init(void) {
     g_fw_dropped = 0;
     g_lo_head = g_lo_tail = g_lo_count = 0;
     route_add(0x7F000000, 0xFF000000, 0, RT_LOCAL);   /* 127.0.0.0/8 lo */
+    net_ipv6_init(g_mac);
     tcp_init();
     kprintf("net: stack up (e1000), starting DHCP\n");
 }

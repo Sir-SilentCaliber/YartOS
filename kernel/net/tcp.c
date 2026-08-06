@@ -87,18 +87,28 @@ static int tcp_send_seg(tcp_conn_t *c, u8 flags, u32 seq, u32 ack,
                         const u8 *data, u16 dlen) {
     if (!net_own_ip() && !tcp_is_loopback(c)) return -1;
     u8 seg[TCP_MAX_DATA + 40];
-    u16 tlen = (u16)(20 + dlen);
+    /* MSS OPTION (kind 2): real stacks always negotiate it.  A bare
+     * SYN (no options, hlen=5) makes some peers/NAT proxies assume a
+     * zero or tiny MSS and can stall data delivery after the handshake
+     * (the slirp direct-NAT fetch stall).  SYN/SYN-ACK carry
+     * MSS=1460 (standard Ethernet), hlen=6. */
+    u8 hlen = (flags & TF_SYN) ? 24 : 20;
+    u16 tlen = (u16)(hlen + dlen);
     seg[0] = (u8)(c->lport >> 8);  seg[1] = (u8)(c->lport & 0xFF);
     seg[2] = (u8)(c->rport >> 8);  seg[3] = (u8)(c->rport & 0xFF);
     u32 s = hton32(seq); memcpy(seg + 4, &s, 4);
     u32 a = hton32(ack); memcpy(seg + 8, &a, 4);
-    seg[12] = 0x50;                                /* data offset 5 */
+    seg[12] = (u8)(hlen / 4) << 4;                 /* data offset */
     seg[13] = flags;
     seg[14] = (u8)(TCP_RXBUF >> 8);                /* window 4096    */
     seg[15] = (u8)(TCP_RXBUF & 0xFF);
     seg[16] = 0; seg[17] = 0;                      /* checksum below */
     seg[18] = 0; seg[19] = 0;                      /* urgent ptr     */
-    if (dlen) memcpy(seg + 20, data, dlen);
+    if (flags & TF_SYN) {
+        seg[20] = 2; seg[21] = 4;                  /* MSS option      */
+        seg[22] = 0x05; seg[23] = 0xB4;            /* 1460            */
+    }
+    if (dlen) memcpy(seg + hlen, data, dlen);
     /* checksum over the pseudo header + segment */
     u8 ph[12 + TCP_MAX_DATA + 40];
     memset(ph, 0, 12);

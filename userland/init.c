@@ -627,7 +627,7 @@ int main_entry(int argc, char **argv, char **envp) {
         udp_send(0x7F000001, 7777, m, 8);
         for (int w = 0; w < 40 && got == 0; w++) {
             got = udp_recv(rbuf, 16);
-            if (!got) yield();
+            if (!got) sleep(10);
         }
         rbuf[got] = 0;
         if (got == 8 && strcmp(rbuf, "FW-PROBE") == 0)
@@ -643,7 +643,7 @@ int main_entry(int argc, char **argv, char **envp) {
         udp_send(0x7F000001, 7777, m, 8);
         for (int w = 0; w < 40 && got == 0; w++) {
             got = udp_recv(rbuf, 16);
-            if (!got) yield();
+            if (!got) sleep(10);
         }
         if (got == 0)
             klog("fw: UDP blocked by firewall - WORK\n");
@@ -657,7 +657,7 @@ int main_entry(int argc, char **argv, char **envp) {
         udp_send(0x7F000001, 7777, m, 8);
         for (int w = 0; w < 40 && got == 0; w++) {
             got = udp_recv(rbuf, 16);
-            if (!got) yield();
+            if (!got) sleep(10);
         }
         if (got == 8)
             klog("fw: UDP loop after clear - WORK\n");
@@ -665,6 +665,39 @@ int main_entry(int argc, char **argv, char **envp) {
             klog("fw: UDP after clear FAILED (got ");
             { char b[8]; my_itoa((int)got, b); klog(b); }
             klog(")\n");
+        }
+    }
+
+    /* ---- IPv6: SLAAC (RS -> RA -> address) + ping6 ---- */
+    klog("ipv6: waiting for SLAAC (router advertisement)...\n");
+    {
+        unsigned char a[16], r[16];
+        int w = 0;
+        while (ipv6_info(a, r) != 0 && w < 800) { sleep(25); w++; }
+        if (w >= 800) {
+            klog("ipv6: no RA received - IPv6 test skipped\n");
+        } else {
+            klog("ipv6: address configured: ");
+            for (int i = 0; i < 16; i += 2) {
+                char h[6]; int k = 0;
+                h[k++]="0123456789abcdef"[(a[i]>>4)&15];
+                h[k++]="0123456789abcdef"[a[i]&15];
+                h[k++]="0123456789abcdef"[(a[i+1]>>4)&15];
+                h[k++]="0123456789abcdef"[a[i+1]&15];
+                h[k]=0;
+                klog(h);
+                if (i < 14) klog(":");
+            }
+            klog("\n");
+            unsigned long rtt = 0;
+            if (icmp6_ping(a, &rtt) == 0)
+                klog("ipv6: ping6 our own address OK\n");
+            else
+                klog("ipv6: ping6 self FAILED\n");
+            if (icmp6_ping(r, &rtt) == 0)
+                klog("ipv6: ping6 the ROUTER OK (real ICMPv6 round trip)\n");
+            else
+                klog("ipv6: ping6 router FAILED (router did not answer)\n");
         }
     }
 

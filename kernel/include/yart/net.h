@@ -67,6 +67,16 @@ static inline u32 hton32(u32 x) { return ntoh32(x); }
 /* ethertypes */
 #define ETH_IPV4 0x0800
 #define ETH_ARP  0x0806
+#define ETH_IPV6 0x86DD
+
+/* ---- IPv6 (net/ipv6.c): ICMPv6 + NDP + SLAAC ---- */
+void   net_ipv6_init(const u8 mac[6]);
+void   net_ipv6_poll(void);                 /* RS until SLAAC completes   */
+void   net_ipv6_deliver(const u8 *hdr, u16 len);  /* inbound IPv6 frame   */
+void   net_pump_ipv6(void);                 /* RX pump wrapper for ping6  */
+int    net_icmp6_ping(const u8 addr[16], u64 *rtt_ticks);  /* 0 = reply  */
+bool   net_ipv6_ready(void);                /* got an address via SLAAC?  */
+void   net_ipv6_addrs(u8 addr[16], u8 router[16]);
 
 /* UDP service ports */
 #define UDP_DHCP_CLIENT 68

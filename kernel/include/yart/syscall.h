@@ -72,6 +72,8 @@ enum {
     SYS_NET_FW_CLEAR = 62,/* firewall: clear all rules                                     */
     SYS_UDP_BIND    = 63, /* UDP: bind the socket to a local port                          */
     SYS_ICMP_PING   = 64, /* ICMP: echo request, blocking; RTT in ticks out                */
+    SYS_ICMP6_PING  = 65, /* ICMPv6: ping an IPv6 address (16 bytes), blocking             */
+    SYS_IPV6_INFO   = 66, /* IPv6: copy our address + router (16 bytes each)               */
     SYS_MAX
 };
 

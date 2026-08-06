@@ -730,6 +730,28 @@ static i64 sys_icmp_ping(u32 ip, u64 *rtt) {
     return 0;
 }
 
+static i64 sys_icmp6_ping(const u8 *addr, u64 *rtt) {
+    if (!g_sys_from_user) return -1;
+    if (!uptr((u64)addr, 16) || !uptr((u64)rtt, 8)) return -1;
+    u8 a[16]; stac(); memcpy(a, addr, 16); clac();
+    u64 t = 0;
+    if (net_icmp6_ping(a, &t) != 0) return -1;
+    stac(); *(u64 *)rtt = t; clac();
+    return 0;
+}
+static i64 sys_ipv6_info(u8 *addr, u8 *router) {
+    if (!g_sys_from_user) return -1;
+    if (addr && !uptr((u64)addr, 16)) return -1;
+    if (router && !uptr((u64)router, 16)) return -1;
+    u8 a[16], r[16];
+    net_ipv6_addrs(a, r);
+    stac();
+    if (addr) memcpy(addr, a, 16);
+    if (router) memcpy(router, r, 16);
+    clac();
+    return net_ipv6_ready() ? 0 : -1;
+}
+
 static i64 sys_dns_resolve(const char *name, u32 *out) {
     if (!g_sys_from_user) return -1;
     char k[256];
@@ -1125,6 +1147,8 @@ static void syscall_handler(cpu_regs_t *r) {
     case SYS_NET_FW_CLEAR: r->rax = (u64)sys_net_fw_clear(); break;
     case SYS_UDP_BIND:    r->rax = (u64)sys_udp_bind((u16)a0); break;
     case SYS_ICMP_PING:   r->rax = (u64)sys_icmp_ping((u32)a0, (u64 *)a1); break;
+    case SYS_ICMP6_PING:  r->rax = (u64)sys_icmp6_ping((const u8 *)a0, (u64 *)a1); break;
+    case SYS_IPV6_INFO:   r->rax = (u64)sys_ipv6_info((u8 *)a0, (u8 *)a1); break;
     default:
         kprintf("syscall: bad #%lu\n", r->rax);
         r->rax = (u64)-1;

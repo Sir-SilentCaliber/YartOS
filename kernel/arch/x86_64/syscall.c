@@ -708,6 +708,28 @@ static i64 sys_udp_recv(u8 *buf, u16 cap) {
     return (i64)n;
 }
 
+static i64 sys_net_fw_add(u32 proto, u32 dip, u32 dport, u32 drop) {
+    if (!g_sys_from_user) return -1;
+    if (proto > 255 || dip == 0xFFFFFFFFu || dport > 65535) return -1;
+    return (i64)net_fw_add((u8)proto, dip, (u16)dport, drop != 0);
+}
+static i64 sys_net_fw_clear(void) {
+    if (!g_sys_from_user) return -1;
+    return (i64)net_fw_clear();
+}
+static i64 sys_udp_bind(u16 port) {
+    if (!g_sys_from_user) return -1;
+    return (i64)net_udp_bind(port);
+}
+static i64 sys_icmp_ping(u32 ip, u64 *rtt) {
+    if (!g_sys_from_user) return -1;
+    if (!uptr((u64)rtt, 8)) return -1;
+    u64 t = 0;
+    if (net_icmp_ping(ip, &t) != 0) return -1;
+    stac(); *(u64 *)rtt = t; clac();
+    return 0;
+}
+
 static i64 sys_dns_resolve(const char *name, u32 *out) {
     if (!g_sys_from_user) return -1;
     char k[256];
@@ -1099,6 +1121,10 @@ static void syscall_handler(cpu_regs_t *r) {
     case SYS_TCP_LISTEN:  r->rax = (u64)sys_tcp_listen((u16)a0); break;
     case SYS_TCP_ACCEPT:  r->rax = (u64)sys_tcp_accept((i64)a0); break;
     case SYS_DNS_RESOLVE: r->rax = (u64)sys_dns_resolve((const char *)a0, (u32 *)a1); break;
+    case SYS_NET_FW_ADD:  r->rax = (u64)sys_net_fw_add((u32)a0, (u32)a1, (u32)a2, (u32)r->r10); break;
+    case SYS_NET_FW_CLEAR: r->rax = (u64)sys_net_fw_clear(); break;
+    case SYS_UDP_BIND:    r->rax = (u64)sys_udp_bind((u16)a0); break;
+    case SYS_ICMP_PING:   r->rax = (u64)sys_icmp_ping((u32)a0, (u64 *)a1); break;
     default:
         kprintf("syscall: bad #%lu\n", r->rax);
         r->rax = (u64)-1;

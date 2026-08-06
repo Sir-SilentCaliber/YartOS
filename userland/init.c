@@ -432,7 +432,7 @@ int main_entry(int argc, char **argv, char **envp) {
             char rbuf[128];
             long got = 0;
             int tries = 0;
-            while (tries < 400 && got < 128) {
+            while (tries < 400 && got < 90) {   /* response is 90 bytes */
                 long r = tcp_recv(c, rbuf + got, 128 - got);
                 if (r > 0) got += r;
                 else sleep(10);
@@ -518,6 +518,153 @@ int main_entry(int argc, char **argv, char **envp) {
                     tcp_close(c);
                 }
             }
+        }
+    }
+
+    /* ---- LOOPBACK: ping 127.0.0.1 (self-delivery at the IP layer) ---- */
+    klog("lo: pinging 127.0.0.1...\n");
+    {
+        unsigned long rtt = 0;
+        if (icmp_ping(0x7F000001, &rtt) == 0)
+            klog("lo: ping 127.0.0.1 OK (loopback)\n");
+        else
+            klog("lo: ping 127.0.0.1 FAILED\n");
+    }
+
+    /* ---- ping the gateway: a REAL ICMP round trip through slirp ---- */
+    klog("net: pinging gateway 10.0.2.2...\n");
+    {
+        unsigned int nfo[5];
+        net_info(nfo);
+        unsigned long rtt = 0;
+        if (nfo[0] != 0 && icmp_ping(nfo[2], &rtt) == 0)
+            klog("net: ping gateway OK (real ICMP round trip)\n");
+        else
+            klog("net: ping gateway FAILED\n");
+    }
+
+    /* ---- LOOPBACK TCP: a server and a client, both in this OS,
+     * connected through 127.0.0.1:9999 - proves loopback + the full
+     * server path without any external peer ---- */
+    klog("lo: testing loopback TCP (127.0.0.1:9999)...\n");
+    {
+        long spid = fork();
+        if (spid == 0) {
+            long lid = tcp_listen(9999);
+            if (lid < 0) { klog("lo: listen FAILED\n"); exit(1); }
+            long c;
+            int w = 0;
+            while ((c = tcp_accept(lid)) == -2 && w < 300) { sleep(20); w++; }
+            if (c < 0) { klog("lo: child accept FAILED\n"); exit(1); }
+            klog("lo: child accepted conn\n");
+            char buf[64]; long got = 0; int t = 0;
+            while (got < 7 && t < 300) {
+                long r = tcp_recv(c, buf + got, 64 - got);
+                if (r > 0) got += r; else sleep(10); t++;
+            }
+            buf[got] = 0;
+            klog("lo: child got ");
+            { char b[8]; my_itoa((int)got, b); klog(b); }
+            klog(" bytes\n");
+            long n = 0;
+            const char *ack = "LO-BACK-OK";
+            while (n < 10) {
+                long r = tcp_send(c, ack + n, 10 - n);
+                if (r <= 0) break;
+                n += r;
+            }
+            klog("lo: child sent ");
+            { char b[8]; my_itoa((int)n, b); klog(b); }
+            klog(" bytes\n");
+            tcp_close(c);
+            tcp_close(lid);            /* free the listener slot */
+            exit(0);
+        } else if (spid > 0) {
+            sleep(50);                 /* let the child bind + listen */
+            long c = tcp_connect(0x7F000001, 9999);
+            if (c < 0) {
+                klog("lo: self-connect FAILED\n");
+            } else {
+                const char *m = "LO-BACK";
+                long sl = 0;
+                while (sl < 7) {
+                    long r = tcp_send(c, m + sl, 7 - sl);
+                    if (r <= 0) break;
+                    sl += r;
+                }
+                char rbuf[16]; long got = 0; int t = 0;
+                while (got < 10 && t < 300) {
+                    long r = tcp_recv(c, rbuf + got, 16 - got);
+                    if (r > 0) got += r; else sleep(10); t++;
+                }
+                rbuf[got] = 0;
+                if (got == 10 && strcmp(rbuf, "LO-BACK-OK") == 0)
+                    klog("lo: loopback TCP round trip WORK (127.0.0.1:9999)\n");
+                else {
+                    klog("lo: loopback TCP MISMATCH (got ");
+                    { char b[8]; my_itoa((int)got, b); klog(b); }
+                    klog(" bytes: [");
+                    for (long i = 0; i < got && i < 12; i++) {
+                        char h[3]; h[0]="0123456789ABCDEF"[(rbuf[i]>>4)&15];
+                        h[1]="0123456789ABCDEF"[rbuf[i]&15]; h[2]=0; klog(h);
+                    }
+                    klog("])\n");
+                }
+                tcp_close(c);
+                int st;
+                while (waitpid(spid, &st) == 0);
+            }
+        }
+    }
+
+    /* ---- FIREWALL: block a port, watch traffic die, unblock ---- */
+    klog("fw: testing the packet firewall (UDP 127.0.0.1:7777)...\n");
+    {
+        udp_bind(7777);
+        const char *m = "FW-PROBE";
+        char rbuf[16];
+        long got = 0;
+        udp_send(0x7F000001, 7777, m, 8);
+        for (int w = 0; w < 40 && got == 0; w++) {
+            got = udp_recv(rbuf, 16);
+            if (!got) yield();
+        }
+        rbuf[got] = 0;
+        if (got == 8 && strcmp(rbuf, "FW-PROBE") == 0)
+            klog("fw: UDP loop before rule - WORK\n");
+        else {
+            klog("fw: UDP loop before rule FAILED (got ");
+            { char b[8]; my_itoa((int)got, b); klog(b); }
+            klog(")\n");
+        }
+        fw_add(17, 0x7F000001, 7777, 1);   /* DROP udp -> 127.0.0.1:7777 */
+        klog("fw: rule added (drop udp 127.0.0.1:7777)\n");
+        got = 0;
+        udp_send(0x7F000001, 7777, m, 8);
+        for (int w = 0; w < 40 && got == 0; w++) {
+            got = udp_recv(rbuf, 16);
+            if (!got) yield();
+        }
+        if (got == 0)
+            klog("fw: UDP blocked by firewall - WORK\n");
+        else {
+            klog("fw: firewall did NOT block (got ");
+            { char b[8]; my_itoa((int)got, b); klog(b); }
+            klog(")\n");
+        }
+        fw_clear();
+        got = 0;
+        udp_send(0x7F000001, 7777, m, 8);
+        for (int w = 0; w < 40 && got == 0; w++) {
+            got = udp_recv(rbuf, 16);
+            if (!got) yield();
+        }
+        if (got == 8)
+            klog("fw: UDP loop after clear - WORK\n");
+        else {
+            klog("fw: UDP after clear FAILED (got ");
+            { char b[8]; my_itoa((int)got, b); klog(b); }
+            klog(")\n");
         }
     }
 
@@ -839,7 +986,8 @@ int main_entry(int argc, char **argv, char **envp) {
         long spid = fork();
         if (spid == 0) {
             klog("tcp: starting HTTP server on :8080 (curl it from the host!)\n");
-            if (tcp_listen(8080) != 0) {
+            long lid = tcp_listen(8080);
+            if (lid < 0) {
                 klog("tcp: listen FAILED\n");
                 exit(1);
             }
@@ -853,7 +1001,7 @@ int main_entry(int argc, char **argv, char **envp) {
                 "<html><body><h1>YartOS says hello over TCP!</h1>"
                 "<p>served by the Yart kernel</p></body></html>\r\n";
             for (;;) {
-                long c = tcp_accept(0);
+                long c = tcp_accept(lid);
                 if (c == -2) { sleep(50); continue; }
                 if (c < 0) { sleep(100); continue; }
                 /* wait for the request header, then answer */

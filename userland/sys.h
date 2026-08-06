@@ -89,6 +89,10 @@ enum {
     SYS_TCP_LISTEN  = 58,
     SYS_TCP_ACCEPT  = 59,
     SYS_DNS_RESOLVE = 60,
+    SYS_NET_FW_ADD  = 61,
+    SYS_NET_FW_CLEAR = 62,
+    SYS_UDP_BIND    = 63,
+    SYS_ICMP_PING   = 64,
 };
 
 #define O_RDONLY 0x0
@@ -172,6 +176,12 @@ static inline long tcp_listen(unsigned short port) { return _sc(SYS_TCP_LISTEN, 
 static inline long tcp_accept(long l) { return _sc(SYS_TCP_ACCEPT, l, 0, 0); }
 static inline long dns_resolve(const char *name, unsigned int *out)
     { return _sc(SYS_DNS_RESOLVE, (long)name, (long)out, 0); }
+static inline long fw_add(long proto, unsigned int dip, unsigned short dport, long drop)
+    { return _sc4(SYS_NET_FW_ADD, proto, (long)dip, dport, drop); }
+static inline long fw_clear(void) { return _sc(SYS_NET_FW_CLEAR, 0, 0, 0); }
+static inline long udp_bind(unsigned short port) { return _sc(SYS_UDP_BIND, port, 0, 0); }
+static inline long icmp_ping(unsigned int ip, unsigned long *rtt)
+    { return _sc(SYS_ICMP_PING, (long)ip, (long)rtt, 0); }
 static inline long mmap(long len) { return _sc(SYS_MMAP, len, 0, 0); }
 static inline long munmap(long addr) { return _sc(SYS_MUNMAP, addr, 0, 0); }
 static inline long setuid(long uid) { return _sc(SYS_SETUID, uid, 0, 0); }

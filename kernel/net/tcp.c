@@ -42,7 +42,7 @@
 
 typedef enum {
     TCP_CLOSED = 0, TCP_LISTEN, TCP_SYN_SENT, TCP_ESTABLISHED,
-    TCP_FIN_WAIT1, TCP_FIN_WAIT2, TCP_LAST_ACK
+    TCP_FIN_WAIT1, TCP_FIN_WAIT2, TCP_LAST_ACK, TCP_CLOSING
 } tcp_state_t;
 
 typedef struct {
@@ -79,9 +79,13 @@ static u32 tcp_seq(void) {
 
 /* Build + send one TCP segment.  Takes the lock-free path (caller holds
  * the lock or is single-threaded in the RX path). */
+static bool tcp_is_loopback(const tcp_conn_t *c) {
+    return (c->rip & 0xFF000000u) == 0x7F000000u;
+}
+
 static int tcp_send_seg(tcp_conn_t *c, u8 flags, u32 seq, u32 ack,
                         const u8 *data, u16 dlen) {
-    if (!net_own_ip()) return -1;
+    if (!net_own_ip() && !tcp_is_loopback(c)) return -1;
     u8 seg[TCP_MAX_DATA + 40];
     u16 tlen = (u16)(20 + dlen);
     seg[0] = (u8)(c->lport >> 8);  seg[1] = (u8)(c->lport & 0xFF);
@@ -98,7 +102,7 @@ static int tcp_send_seg(tcp_conn_t *c, u8 flags, u32 seq, u32 ack,
     /* checksum over the pseudo header + segment */
     u8 ph[12 + TCP_MAX_DATA + 40];
     memset(ph, 0, 12);
-    u32 sip = hton32(net_own_ip());
+    u32 sip = hton32(tcp_is_loopback(c) ? 0x7F000001u : net_own_ip());
     u32 dip = hton32(c->rip);
     memcpy(ph, &sip, 4);
     memcpy(ph + 4, &dip, 4);
@@ -114,7 +118,8 @@ static int tcp_send_seg(tcp_conn_t *c, u8 flags, u32 seq, u32 ack,
      * while we hold g_tcp_lock - net_service/tcp_poll would self-deadlock
      * on the non-reentrant lock).  -1 here = no ARP entry yet; callers
      * treat it as "try again on the next retransmit". */
-    return net_ip_send(net_own_ip(), c->rip, 6, seg, tlen);
+    return net_ip_send(tcp_is_loopback(c) ? 0x7F000001u : net_own_ip(),
+                       c->rip, 6, seg, tlen);
 }
 
 /* Per-connection retransmission / timeout logic (caller holds lock). */
@@ -297,9 +302,19 @@ void net_tcp_deliver(const u8 *seg, u16 len, u32 src) {
             c->st = TCP_FIN_WAIT2;
         }
         if (c->st == TCP_LAST_ACK && acked >= 1) {
-            memset(c, 0, sizeof *c);            /* fully closed */
-            spin_unlock(&g_tcp_lock); irq_restore(fl);
-            return;
+            /* DATA-AFTER-CLOSE FIX: the peer's FIN completes the close,
+             * but if data is still buffered (it arrived just before the
+             * FIN), freeing the conn HERE destroys it - the userland recv
+             * then hits a dead socket and silently loses the payload.
+             * Stay in TCP_CLOSING until recv drains the buffer; recv
+             * frees the conn when it empties (EOF semantics). */
+            if (c->rx_len > 0)
+                c->st = TCP_CLOSING;
+            else {
+                memset(c, 0, sizeof *c);        /* fully closed */
+                spin_unlock(&g_tcp_lock); irq_restore(fl);
+                return;
+            }
         }
     }
 
@@ -346,7 +361,7 @@ void net_tcp_deliver(const u8 *seg, u16 len, u32 src) {
 /* ---- userland-facing API ---- */
 
 int net_tcp_connect(u32 ip, u16 port) {
-    if (!net_own_ip()) return -1;
+    if (!net_own_ip() && (ip & 0xFF000000u) != 0x7F000000u) return -1;
     /* resolve the peer's MAC OUTSIDE the lock (drives inbound RX) */
     if (net_arp_resolve(ip) != 0) {
         kprintf("tcp: ARP resolution for %u.%u.%u.%u failed\n",
@@ -430,7 +445,10 @@ int net_tcp_recv(int id, u8 *buf, int cap) {
     u64 fl = irq_save();
     spin_lock(&g_tcp_lock);
     tcp_conn_t *c = &g_tcp[id];
-    if (!c->used || c->st == TCP_LISTEN || c->st == TCP_SYN_SENT) {
+    if (!c->used) {                         /* EOF: 0, not -1            */
+        spin_unlock(&g_tcp_lock); irq_restore(fl); return 0;
+    }
+    if (c->st == TCP_LISTEN || c->st == TCP_SYN_SENT) {
         spin_unlock(&g_tcp_lock); irq_restore(fl); return -1;
     }
     int n = c->rx_len;
@@ -440,6 +458,9 @@ int net_tcp_recv(int id, u8 *buf, int cap) {
         memmove(c->rx, c->rx + n, (size_t)(c->rx_len - n));
         c->rx_len -= (u16)n;
     }
+    /* closing conn whose buffer is now empty: the close is complete */
+    if (c->rx_len == 0 && c->st == TCP_CLOSING)
+        memset(c, 0, sizeof *c);
     spin_unlock(&g_tcp_lock);
     irq_restore(fl);
     return n;
@@ -451,6 +472,10 @@ int net_tcp_close(int id) {
     tcp_conn_t *c = &g_tcp[id];
     if (!c->used) { spin_unlock(&g_tcp_lock); irq_restore(fl); return -1; }
     if (c->st == TCP_LISTEN) {
+        memset(c, 0, sizeof *c);
+        spin_unlock(&g_tcp_lock); irq_restore(fl); return 0;
+    }
+    if (c->st == TCP_CLOSING) {            /* already closing: drop it */
         memset(c, 0, sizeof *c);
         spin_unlock(&g_tcp_lock); irq_restore(fl); return 0;
     }
@@ -489,7 +514,6 @@ int net_tcp_close(int id) {
 }
 
 int net_tcp_listen(u16 port) {
-    if (!net_own_ip()) return -1;
     u64 fl = irq_save();
     spin_lock(&g_tcp_lock);
     for (int i = 0; i < TCP_MAX_CONN; i++)
@@ -502,9 +526,11 @@ int net_tcp_listen(u16 port) {
             g_tcp[i].used = true;
             g_tcp[i].st = TCP_LISTEN;
             g_tcp[i].lport = port;
-            kprintf("tcp: listening on :%u\n", (unsigned)port);
+            kprintf("tcp: listening on :%u (listener id %d)\n", (unsigned)port, i);
             spin_unlock(&g_tcp_lock); irq_restore(fl);
-            return 0;
+            return i;                 /* return the LISTENER ID - callers
+                                         must not assume slot 0 (a leftover
+                                         listener or conn can occupy it) */
         }
     }
     spin_unlock(&g_tcp_lock);

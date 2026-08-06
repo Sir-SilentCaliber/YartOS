@@ -33,6 +33,10 @@ void   net_get_addrs(u32 *ip, u32 *gw, u32 *dns, u32 *mask);  /* host order */
 int    net_udp_send(u32 dst_ip, u16 dport, const u8 *buf, u16 len);
 int    net_dns_resolve(const char *hostname, u32 *out_ip);  /* 0 = found */
 int    net_udp_recv(u8 *buf, u16 cap);   /* 0 = nothing yet, >0 = datagram */
+int    net_udp_bind(u16 port);           /* choose the UDP socket port    */
+int    net_icmp_ping(u32 ip, u64 *rtt_ticks);  /* 0 = reply received      */
+int    net_fw_add(u8 proto, u32 dip, u16 dport, bool drop);  /* 0 = added */
+int    net_fw_clear(void);
 
 /* ---- TCP (net/tcp.c) ---- */
 void   tcp_init(void);

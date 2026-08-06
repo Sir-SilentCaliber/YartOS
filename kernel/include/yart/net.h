@@ -33,6 +33,23 @@ void   net_get_addrs(u32 *ip, u32 *gw, u32 *dns, u32 *mask);  /* host order */
 int    net_udp_send(u32 dst_ip, u16 dport, const u8 *buf, u16 len);
 int    net_udp_recv(u8 *buf, u16 cap);   /* 0 = nothing yet, >0 = datagram */
 
+/* ---- TCP (net/tcp.c) ---- */
+void   tcp_init(void);
+void   tcp_poll(void);                /* retransmission/timeouts (net_service) */
+void   net_tcp_deliver(const u8 *seg, u16 len, u32 src);  /* inbound segment  */
+int    net_tcp_connect(u32 ip, u16 port);                 /* blocking handshake */
+int    net_tcp_send(int conn, const u8 *buf, int len);    /* buffered TX        */
+int    net_tcp_recv(int conn, u8 *buf, int cap);          /* 0 = none yet       */
+int    net_tcp_close(int conn);                            /* graceful FIN/ACK  */
+int    net_tcp_listen(u16 port);                           /* 0 = OK             */
+int    net_tcp_accept(int listener);   /* child conn id, -2 = not yet          */
+
+/* internal helpers shared with tcp.c */
+u16    net_csum(const u8 *data, int len);
+int    net_arp_resolve(u32 ip);         /* ARP lookup + wait (0 = ready) */
+int    net_ip_send(u32 src, u32 dst, u8 proto, const u8 *payload, u16 plen);
+u32    net_own_ip(void);               /* our IPv4 (0 = no address yet) */
+
 /* ---- byte-order helpers (little-endian host) ---- */
 static inline u16 ntoh16(u16 x) { return (u16)((x >> 8) | (x << 8)); }
 static inline u16 hton16(u16 x) { return ntoh16(x); }

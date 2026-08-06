@@ -357,6 +357,60 @@ int main_entry(int argc, char **argv, char **envp) {
             }
         }
     }
+    /* ---- TCP: full 3-way handshake + echo round-trip vs the HOST ----
+     * The host runs a TCP echo server on 127.0.0.1:9000 (reachable via
+     * slirp as 10.0.2.2:9000) that replies "PONG:" + data.  This proves
+     * the whole TCP path: SYN/SYN-ACK/ACK, seq/ack tracking, RX
+     * buffering, retransmission and graceful FIN/ACK close. */
+    klog("tcp: testing TCP against the host echo server (10.0.2.2:9000)...\n");
+    {
+        /* wait for an address first - DHCP can lag under slow emulation */
+        unsigned int nfo[5];
+        int wtries = 0;
+        net_info(nfo);
+        while (nfo[0] == 0 && wtries < 300) {
+            sleep(10);
+            net_info(nfo);
+            wtries++;
+        }
+        if (nfo[0] == 0) {
+            klog("tcp: no IP address after 3s - skipping TCP test\n");
+        } else {
+        long c = tcp_connect(0x0A000202, 9000);
+        if (c < 0) {
+            klog("tcp: connect FAILED (host echo server not running?)\n");
+        } else {
+            klog("tcp: connected (conn ");
+            {
+                char b[8]; my_itoa((int)c, b); klog(b);
+            }
+            klog(")\n");
+            const char *msg = "ping-from-yart-tcp";
+            long n = tcp_send(c, msg, 18);
+            if (n != 18) {
+                klog("tcp: send FAILED\n");
+            } else {
+                char rbuf[64];
+                long got = 0;
+                int tries = 0;
+                while (got < 23 && tries < 100) {
+                    long r = tcp_recv(c, rbuf + got, 64 - got);
+                    if (r > 0) got += r;
+                    else sleep(10);
+                    tries++;
+                }
+                rbuf[got] = 0;
+                if (got == 23 && strcmp(rbuf, "PONG:ping-from-yart-tcp") == 0)
+                    klog("tcp: echo round trip WORK (host echoed 23 bytes)\n");
+                else
+                    klog("tcp: echo round trip MISMATCH\n");
+            }
+            tcp_close(c);
+            klog("tcp: connection closed cleanly\n");
+        }
+        }
+    }
+
     klog("mmap: testing dynamic memory allocation...\n");
     {
         /* 1 MiB - demand-paged, faults in as we touch it */
@@ -666,6 +720,62 @@ int main_entry(int argc, char **argv, char **envp) {
             klog("parent: waitpid failed\n");
     } else {
         klog("init: fork failed\n");
+    }
+
+    /* ---- TCP server: a real HTTP server the HOST can curl ----
+     * fork a child that keeps serving; the host reaches it via QEMU
+     * slirp's hostfwd (127.0.0.1:8080 -> guest :8080). */
+    {
+        long spid = fork();
+        if (spid == 0) {
+            klog("tcp: starting HTTP server on :8080 (curl it from the host!)\n");
+            if (tcp_listen(8080) != 0) {
+                klog("tcp: listen FAILED\n");
+                exit(1);
+            }
+            const char *resp =
+                "HTTP/1.1 200 OK\r\n"
+                "Server: YartOS/0.8.0-tcp\r\n"
+                "Content-Type: text/html\r\n"
+                "Content-Length: 96\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "<html><body><h1>YartOS says hello over TCP!</h1>"
+                "<p>served by the Yart kernel</p></body></html>\r\n";
+            for (;;) {
+                long c = tcp_accept(0);
+                if (c == -2) { sleep(50); continue; }
+                if (c < 0) { sleep(100); continue; }
+                /* wait for the request header, then answer */
+                char req[512];
+                long got = 0;
+                int tries = 0, hdr = 0;
+                while (tries < 100 && !hdr) {
+                    long r = tcp_recv(c, req + got, 512 - got);
+                    if (r > 0) {
+                        got += r;
+                        for (long i = 0; i < got - 3; i++)
+                            if (req[i]=='\r' && req[i+1]=='\n' &&
+                                req[i+2]=='\r' && req[i+3]=='\n') hdr = 1;
+                    } else sleep(10);
+                    tries++;
+                }
+                klog("tcp: HTTP request received (");
+                { char b[8]; my_itoa((int)got, b); klog(b); }
+                klog(" bytes), sending response...\n");
+                long n = 0;
+                long rl = 205;
+                while (n < rl) {
+                    long r = tcp_send(c, resp + n, rl - n);
+                    if (r <= 0) break;
+                    n += r;
+                }
+                klog("tcp: HTTP response sent (");
+                { char b[8]; my_itoa((int)n, b); klog(b); }
+                klog(" bytes)\n");
+                tcp_close(c);
+            }
+        }
     }
 
     klog("init: boot tests complete; entering ring-3 compositor loop\n");

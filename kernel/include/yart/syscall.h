@@ -61,6 +61,12 @@ enum {
     SYS_SIGRETURN  = 51,  /* restore a frame saved by signal delivery               */
     SYS_WM_TITLE   = 52,  /* app: set the window title (drawn by the compositor)    */
     SYS_PIPE       = 53,  /* pipe(fds[2]): create an in-kernel byte pipe             */
+    SYS_TCP_CONNECT = 54, /* TCP: connect (blocking handshake) to ip:port             */
+    SYS_TCP_SEND    = 55, /* TCP: send bytes on a connection                           */
+    SYS_TCP_RECV    = 56, /* TCP: receive available bytes (0 = none)                   */
+    SYS_TCP_CLOSE   = 57, /* TCP: graceful close (FIN/ACK)                             */
+    SYS_TCP_LISTEN  = 58, /* TCP: listen on a port (server)                            */
+    SYS_TCP_ACCEPT  = 59, /* TCP: accept a completed connection (-2 = not yet)         */
     SYS_MAX
 };
 

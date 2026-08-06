@@ -82,6 +82,12 @@ enum {
     SYS_SIGRETURN  = 51,
     SYS_WM_TITLE   = 52,
     SYS_PIPE       = 53,
+    SYS_TCP_CONNECT = 54,
+    SYS_TCP_SEND    = 55,
+    SYS_TCP_RECV    = 56,
+    SYS_TCP_CLOSE   = 57,
+    SYS_TCP_LISTEN  = 58,
+    SYS_TCP_ACCEPT  = 59,
 };
 
 #define O_RDONLY 0x0
@@ -152,6 +158,17 @@ static inline long net_info(unsigned int *out) { return _sc(SYS_NET_INFO, (long)
 static inline long udp_send(unsigned int ip, unsigned short port, const char *buf, long len)
     { return _sc4(SYS_UDP_SEND, (long)ip, port, (long)buf, len); }
 static inline long udp_recv(char *buf, long cap) { return _sc(SYS_UDP_RECV, (long)buf, cap, 0); }
+
+/* ---- TCP sockets ---- */
+static inline long tcp_connect(unsigned int ip, unsigned short port)
+    { return _sc(SYS_TCP_CONNECT, (long)ip, port, 0); }
+static inline long tcp_send(long c, const char *buf, long len)
+    { return _sc(SYS_TCP_SEND, c, (long)buf, len); }
+static inline long tcp_recv(long c, char *buf, long cap)
+    { return _sc(SYS_TCP_RECV, c, (long)buf, cap); }
+static inline long tcp_close(long c) { return _sc(SYS_TCP_CLOSE, c, 0, 0); }
+static inline long tcp_listen(unsigned short port) { return _sc(SYS_TCP_LISTEN, port, 0, 0); }
+static inline long tcp_accept(long l) { return _sc(SYS_TCP_ACCEPT, l, 0, 0); }
 static inline long mmap(long len) { return _sc(SYS_MMAP, len, 0, 0); }
 static inline long munmap(long addr) { return _sc(SYS_MUNMAP, addr, 0, 0); }
 static inline long setuid(long uid) { return _sc(SYS_SETUID, uid, 0, 0); }

@@ -43,7 +43,7 @@ static u16  g_udp_rx_len;
 extern void nic_poll(void);
 
 /* ---- internet checksum (RFC 1071), over big-endian words ---- */
-static u16 csum(const u8 *data, int len) {
+u16 net_csum(const u8 *data, int len) {
     u32 sum = 0;
     for (int i = 0; i < len; i += 2) {
         u16 w = (i + 1 < len) ? (u16)((data[i] << 8) | data[i + 1])
@@ -106,7 +106,7 @@ static u32 next_hop(u32 dst) {
     return g_gw;
 }
 
-static int ip_send_src(u32 src, u32 dst, u8 proto, const u8 *payload, u16 plen) {
+int net_ip_send(u32 src, u32 dst, u8 proto, const u8 *payload, u16 plen) {
     u8 *mac;
     u32 nh = next_hop(dst);
     if (nh == 0xFFFFFFFFu) {
@@ -128,31 +128,44 @@ static int ip_send_src(u32 src, u32 dst, u8 proto, const u8 *payload, u16 plen) 
     ip[9] = proto;
     u32 s = hton32(src); memcpy(ip + 12, &s, 4);
     u32 d = hton32(dst);  memcpy(ip + 16, &d, 4);
-    u16 chk = csum(ip, 20);
+    u16 chk = net_csum(ip, 20);
     ip[10] = chk >> 8; ip[11] = chk & 0xFF;
     memcpy(f + 34, payload, plen);
     return send_frame(f, 14 + total);
 }
 static int ip_send(u32 dst, u8 proto, const u8 *payload, u16 plen) {
-    return ip_send_src(g_ip, dst, proto, payload, plen);
+    return net_ip_send(g_ip, dst, proto, payload, plen);
 }
 
 /* Raw UDP send used internally (does NOT require an address; DHCP uses it
  * before the host has an IP).  src_ip is the IP to put in the header (0
  * during DHCP).  Broadcasts skip ARP. */
+static void net_pump(void);   /* forward decl (defined with net_service) */
+
+/* Resolve the next hop's MAC for `ip` (ARP request + wait for the reply,
+ * driving the stack while we wait).  0 = resolved / broadcast / no route
+ * needed; -1 = ARP timeout.  Shared by UDP and TCP so both can transmit
+ * to a fresh peer. */
+int net_arp_resolve(u32 ip) {
+    u32 nh = next_hop(ip);
+    if (nh == 0 || nh == 0xFFFFFFFFu) return 0;   /* no route / broadcast */
+    if (arp_lookup(nh)) return 0;
+    arp_send(1, g_ip, nh, BROADCAST);
+    u64 t0 = pit_ticks();
+    while (!arp_lookup(nh)) {
+        net_pump();                      /* process the ARP reply */
+        if (pit_ticks() - t0 > 50) return -1;      /* timeout */
+        __asm__ volatile("pause");
+    }
+    return 0;
+}
+
 static int udp_raw_send(u32 src_ip, u32 dst_ip, u16 sport, u16 dport,
                         const u8 *buf, u16 len) {
     u32 nh = next_hop(dst_ip);
     if (nh == 0) return -1;              /* no route */
-    if (nh != 0xFFFFFFFFu && !arp_lookup(nh)) {
-        arp_send(1, src_ip ? src_ip : g_ip, nh, BROADCAST);
-        u64 t0 = pit_ticks();
-        while (!arp_lookup(nh)) {
-            net_service();               /* process the ARP reply */
-            if (pit_ticks() - t0 > 50) return -1;   /* timeout */
-            __asm__ volatile("pause");
-        }
-    }
+    if (nh != 0xFFFFFFFFu && net_arp_resolve(dst_ip) != 0)
+        return -1;                       /* ARP timeout */
     u8 udp[8 + len]; memset(udp, 0, sizeof udp);
     udp[0] = sport >> 8; udp[1] = sport & 0xFF;
     udp[2] = dport >> 8; udp[3] = dport & 0xFF;
@@ -160,7 +173,7 @@ static int udp_raw_send(u32 src_ip, u32 dst_ip, u16 sport, u16 dport,
     udp[4] = tl >> 8; udp[5] = tl & 0xFF;
     udp[6] = 0; udp[7] = 0;              /* checksum 0 (allowed on IPv4) */
     memcpy(udp + 8, buf, len);
-    return ip_send_src(src_ip, dst_ip, 17, udp, tl);
+    return net_ip_send(src_ip, dst_ip, 17, udp, tl);
 }
 
 /* ---- public UDP socket-ish API ---- */
@@ -177,6 +190,8 @@ int net_udp_recv(u8 *buf, u16 cap) {
     g_udp_rx_len = 0;
     return n;
 }
+
+u32 net_own_ip(void) { return g_ip; }
 
 void net_get_addrs(u32 *ip, u32 *gw, u32 *dns, u32 *mask) {
     if (ip)   *ip   = g_ip;
@@ -282,7 +297,7 @@ static void process_icmp(const u8 *p, u16 len, u32 src) {
         u16 dlen = len > 4 ? len - 4 : 0;
         if (dlen > 56) dlen = 56;
         memcpy(r + 8, p + 8, dlen);
-        u16 chk = csum(r, 8 + dlen);
+        u16 chk = net_csum(r, 8 + dlen);
         r[2] = chk >> 8; r[3] = chk & 0xFF;
         ip_send(src, 1, r, 8 + dlen);
     }
@@ -313,6 +328,7 @@ static void process_ip(const u8 *ip, u16 len) {
     u16 plen = total - ihl;
     if (proto == 1) process_icmp(payload, plen, src);
     else if (proto == 17) process_udp(payload, plen, src);
+    else if (proto == 6) net_tcp_deliver(payload, plen, src);
 }
 
 static void process_eth(const u8 *f, u16 len) {
@@ -325,13 +341,23 @@ static void process_eth(const u8 *f, u16 len) {
     else if (type == ETH_IPV4) process_ip(f + 14, len - 14);
 }
 
-/* ---- public entry: drain NIC + drive DHCP ---- */
-void net_service(void) {
+/* ---- RX pump: drain the NIC + process inbound frames.  Split out of
+ * net_service so ARP resolution can drive inbound processing WITHOUT the
+ * DHCP/TCP-timer machinery (net_arp_resolve may be called from inside a
+ * TCP path that already holds the TCP lock - recursion through tcp_poll
+ * would self-deadlock).  Safe to call recursively: each call drains the
+ * driver FIFO completely. ---- */
+static void net_pump(void) {
     nic_poll();
     u8 frame[2048];
     int n;
     while ((n = nic_rx(frame, sizeof frame)) > 0)
         process_eth(frame, (u16)n);
+}
+
+/* ---- public entry: drain NIC + drive DHCP ---- */
+void net_service(void) {
+    net_pump();
 
     /* drive DHCP until we have an address */
     if (g_dhcp_state != DHCP_DONE) {
@@ -348,6 +374,9 @@ void net_service(void) {
                 dhcp_send(DHCP_REQUEST, g_offer_ip, g_server_id);
         }
     }
+
+    /* drive TCP retransmission / timeouts */
+    tcp_poll();
 }
 
 void net_init(void) {
@@ -356,5 +385,6 @@ void net_init(void) {
     g_dhcp_state = 0;
     g_udp_rx_len = 0;
     memset(g_arp, 0, sizeof g_arp);
+    tcp_init();
     kprintf("net: stack up (e1000), starting DHCP\n");
 }

@@ -708,6 +708,39 @@ static i64 sys_udp_recv(u8 *buf, u16 cap) {
     return (i64)n;
 }
 
+/* ---- TCP sockets ---- */
+static i64 sys_tcp_connect(u32 ip, u16 port) {
+    if (!g_sys_from_user) return -1;
+    return (i64)net_tcp_connect(ip, port);
+}
+static i64 sys_tcp_send(i64 conn, const u8 *buf, u64 len) {
+    if (!g_sys_from_user) return -1;
+    if (len > 1400) return -1;
+    if (!uptr((u64)buf, len)) return -1;
+    u8 k[1400]; stac(); memcpy(k, buf, len); clac();
+    return (i64)net_tcp_send((int)conn, k, (int)len);
+}
+static i64 sys_tcp_recv(i64 conn, u8 *buf, u64 cap) {
+    if (!g_sys_from_user) return -1;
+    if (cap > 4096) cap = 4096;
+    if (!uptr((u64)buf, cap)) return -1;
+    u8 k[4096]; int n = net_tcp_recv((int)conn, k, (int)cap);
+    if (n > 0) { stac(); memcpy(buf, k, (size_t)n); clac(); }
+    return (i64)n;
+}
+static i64 sys_tcp_close(i64 conn) {
+    if (!g_sys_from_user) return -1;
+    return (i64)net_tcp_close((int)conn);
+}
+static i64 sys_tcp_listen(u16 port) {
+    if (!g_sys_from_user) return -1;
+    return (i64)net_tcp_listen(port);
+}
+static i64 sys_tcp_accept(i64 listener) {
+    if (!g_sys_from_user) return -1;
+    return (i64)net_tcp_accept((int)listener);
+}
+
 /* sigreturn: restore a frame that signal delivery saved on the user
  * stack.  The user handler returned into the vdso-style trampoline,
  * which called this with rdi = the saved frame's address.  We copy it
@@ -1048,6 +1081,12 @@ static void syscall_handler(cpu_regs_t *r) {
     case SYS_SIGRETURN:  sys_sigreturn(r); break;
     case SYS_WM_TITLE:   r->rax = (u64)sys_wm_title((u32)a0, (const char *)a1); break;
     case SYS_PIPE:       r->rax = (u64)sys_pipe((int *)a0); break;
+    case SYS_TCP_CONNECT: r->rax = (u64)sys_tcp_connect((u32)a0, (u16)a1); break;
+    case SYS_TCP_SEND:    r->rax = (u64)sys_tcp_send((i64)a0, (const u8 *)a1, (u64)a2); break;
+    case SYS_TCP_RECV:    r->rax = (u64)sys_tcp_recv((i64)a0, (u8 *)a1, (u64)a2); break;
+    case SYS_TCP_CLOSE:   r->rax = (u64)sys_tcp_close((i64)a0); break;
+    case SYS_TCP_LISTEN:  r->rax = (u64)sys_tcp_listen((u16)a0); break;
+    case SYS_TCP_ACCEPT:  r->rax = (u64)sys_tcp_accept((i64)a0); break;
     default:
         kprintf("syscall: bad #%lu\n", r->rax);
         r->rax = (u64)-1;

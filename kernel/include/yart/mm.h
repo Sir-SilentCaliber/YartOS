@@ -49,6 +49,9 @@ void    pmm_oom_test_force(bool on);
 #define PTE_GLOBAL   (1ULL << 8)
 #define PTE_COW      (1ULL << 9)   /* software: copy-on-write marker      */
 #define PTE_SWAP     (1ULL << 10)  /* software: page is in the swap pool  */
+#define PTE_NOSHR    (1ULL << 11)  /* software: kernel-shared page - never CoW'd,
+                                      never swapped; fork() keeps the SAME frame
+                                      (fb back-buffer, wm surface pages)      */
 #define PTE_NX       (1ULL << 63)
 
 void   vmm_init(void);

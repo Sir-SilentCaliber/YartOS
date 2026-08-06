@@ -577,6 +577,11 @@ static void format(void) {
     memcpy(sb, &g_super, sizeof g_super);
     io_write(0, 1, sb);
     flush_bitmaps();
+    /* FRESH-FORMAT FIX: the caller does `return g_active ? 0 : -1;`, so a
+     * successful format must arm the filesystem here - otherwise every
+     * fresh-disk boot ran with blkfs disabled (fsync() and all blkfs file
+     * ops failed all session). */
+    g_active = true;
     kprintf("blkfs: formatted %u sectors (data %u @%u, crc %u @%u, "
             "journal 128 @%u, inodes %u)\n",
             (u32)blkfs_disk_total(), g_super.data_sectors, g_super.data_start_sector,

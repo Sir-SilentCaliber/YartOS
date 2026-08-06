@@ -282,6 +282,33 @@ void sf_blit(surface_t *dst, int dx, int dy, surface_t *src, int sx, int sy, int
     }
 }
 
+/* Alpha-aware blit: blends src over dst.  Transparent (a==0) pixels are
+ * skipped entirely, partial alpha blends.  This is what the dock icon
+ * cache needs: the cached sprites are mmap'd (zeroed = 0x00000000), so a
+ * raw sf_blit turns every transparent pixel around the icon into OPAQUE
+ * BLACK - the black boxes behind dock icons. */
+void sf_blit_alpha(surface_t *dst, int dx, int dy, surface_t *src,
+                   int sx, int sy, int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    if (sx < 0) { dx -= sx; w += sx; sx = 0; }
+    if (sy < 0) { dy -= sy; h += sy; sy = 0; }
+    if (sx + w > src->w) w = src->w - sx;
+    if (sy + h > src->h) h = src->h - sy;
+    if (dx < 0) { sx -= dx; w += dx; dx = 0; }
+    if (dy < 0) { sy -= dy; h += dy; dy = 0; }
+    if (dx + w > dst->w) w = dst->w - dx;
+    if (dy + h > dst->h) h = dst->h - dy;
+    if (w <= 0 || h <= 0) return;
+    for (int j = 0; j < h; j++) {
+        const u32 *sp = src->px + (long)(sy+j)*src->pitch + sx;
+        for (int i = 0; i < w; i++) {
+            u32 c = sp[i];
+            if (!A(c)) continue;
+            sf_putpx_blend(dst, dx+i, dy+j, c);
+        }
+    }
+}
+
 /* In-place box blur (separable: horizontal then vertical, 'passes' times).
  * Operates on the rectangle [x,y) x [x+w,y+h), reading/writing surface pixels.
  * Caller should ensure the rectangle is surrounded by valid (wallpaper) pixels

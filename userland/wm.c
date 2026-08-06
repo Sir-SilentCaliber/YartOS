@@ -49,6 +49,7 @@ typedef struct {
     u64  va;            /* wm-side mapping of the surface (from scan)     */
     bool dirty;
     char title[32];     /* window title (set by the app via SYS_WM_TITLE) */
+    int  misses;        /* consecutive scans without this window           */
 } win_t;
 static win_t G_wins[WM_MAX_WIN];
 static int  G_app_pid;      /* pid of the launched real app (settings)   */
@@ -373,8 +374,9 @@ static void restore_rect_win(surface_t *fb, int x0, int y0, int w, int h) {
         int ty = win->y - 24;
         if (ty < PANEL_H) ty = PANEL_H;
         if (x0 < win->x + win->w && x0 + w > win->x &&
-            y0 < ty + 24 + win->h && y0 + h > ty)
+            y0 < ty + 24 + win->h && y0 + h > ty) {
             draw_one_window(win);
+        }
     }
 }
 
@@ -658,8 +660,8 @@ static void draw_dock_content(surface_t *s, long now_ms, int pressed) {
         int cx=slot_pos[i], cy=G_dock_y+G_dock_h/2-1-G_slot_lift[i];
         int sc=G_slot_size[i];
         if (sc == ICON_SZ && G_icon_cache_ok && G_icon_cache[i].px) {
-            sf_blit(s, cx-ICON_SZ/2, cy-ICON_SZ/2, &G_icon_cache[i],
-                    0, 0, ICON_SZ, ICON_SZ);
+            sf_blit_alpha(s, cx-ICON_SZ/2, cy-ICON_SZ/2, &G_icon_cache[i],
+                          0, 0, ICON_SZ, ICON_SZ);
             continue;
         }
         icon_t ico = icon_get(G_dock[i].icon);
@@ -869,14 +871,18 @@ static void wm_scan_windows(void) {
             { char b[8]; itoa0((int)si->owner_pid,b,0); klog(b); klog("\n"); }
         }
         w->seen = true;
+        w->misses = 0;
         w->x = (int)si->win_x; w->y = (int)si->win_y;
         w->w = (int)si->w;     w->h = (int)si->h;
         w->va = si->app_va;                 /* wm-side mapping           */
         if (si->dirty) { w->dirty = true; G_win_dirty = 1; }
     }
-    /* windows that vanished: the app exited - clear state */
+    /* windows that vanished: the app exited - clear state.  Require two
+     * consecutive misses so a single empty/failed scan cannot nuke a live
+     * window and trigger a full repaint that erases it. */
     for (int i=0;i<WM_MAX_WIN;i++) {
         if (G_wins[i].active && !G_wins[i].seen) {
+            if (++G_wins[i].misses < 2) continue;
             if (G_app_pid == (int)G_wins[i].owner) G_app_pid = 0;
             G_wins[i].active = false;
             G_wins[i].dirty = false;
@@ -1138,6 +1144,17 @@ void wm_run(void) {
 
     klog("wm: ring-3 compositor up [cached chrome, single-icon tween, cursors, tray clicks]\n");
 
+    /* Auto-launch hook: if /home/yart/autolaunch exists, open the Settings
+     * app immediately (used by the boot test / headless verification). */
+    {
+        int af = open("/home/yart/autolaunch", 0);   /* O_RDONLY */
+        if (af >= 0) {
+            close(af);
+            klog("wm: autolaunch file present - launching Settings\n");
+            launch_settings();
+        }
+    }
+
     unsigned long frames=0;
     long fps_start=G_start_ms;
     for (;;) {
@@ -1195,11 +1212,14 @@ void wm_run(void) {
                 /* Wallpaper switched: blit the entire wallpaper back */
                 sf_blit(&G_fb, 0, 0, &G_wp, 0, 0, G_fb.w, G_fb.h);
                 G_full_repaint = 0;
-                /* rebuild cached chrome so it re-samples the new wallpaper */
                 build_panel_sprite();
                 build_dock_sprite();
-                G_win_dirty = 1;   /* windows must be redrawn over the
-                                      new wallpaper */
+                /* erase-without-redraw fix: mark every active window dirty */
+                for (int i=0;i<WM_MAX_WIN;i++)
+                    if (G_wins[i].active) {
+                        G_wins[i].dirty = true;
+                        G_win_dirty = 1;
+                    }
             } else {
                 /* 1. Restore wallpaper under dirty regions */
                 restore_cursor(&G_fb);

@@ -1138,7 +1138,7 @@ static u64 sys_fb_info(fb_info_t *out) {
          *      fb_phys + i*PAGE, taking an extra ref on the frame.
          */
         if (vmm_user_reserve(va, pages,
-                             PTE_PRESENT | PTE_RW | PTE_US | PTE_NX,
+                             PTE_PRESENT | PTE_RW | PTE_US | PTE_NX | PTE_NOSHR,
                              VMM_USER_LAZY) != 0) {
             kprintf("wm: failed to reserve fb region\n");
             return 0;
@@ -1146,7 +1146,7 @@ static u64 sys_fb_info(fb_info_t *out) {
         for (u32 i = 0; i < pages; i++) {
             vmm_map_in(t->pml4, va + i * (u64)PAGE_SIZE,
                        fb_phys + i * (u64)PAGE_SIZE,
-                       PTE_PRESENT | PTE_RW | PTE_US | PTE_NX);
+                       PTE_PRESENT | PTE_RW | PTE_US | PTE_NX | PTE_NOSHR);
             pmm_ref_page(fb_phys + i * PAGE_SIZE);
         }
         g_wm_uaddr = (void *)va;
@@ -1339,18 +1339,21 @@ static i64 sys_wm_create(u32 w, u32 h, wm_surf_info_t *out) {
             return -1;
         }
     }
-    /* map into the app (its pml4 is current during this syscall) */
+    /* map into the app (its pml4 is current during this syscall).
+     * PTE_NOSHR: these frames are shared with the kernel (blit source) and
+     * the wm; never CoW them on fork, never swap them out. */
     for (u32 i = 0; i < npages; i++) {
         vmm_map_in(vmm_current_pml4(), s->app_va + i * PAGE_SIZE, s->pages[i],
-                   PTE_PRESENT | PTE_RW | PTE_US | PTE_NX);
+                   PTE_PRESENT | PTE_RW | PTE_US | PTE_NX | PTE_NOSHR);
         pmm_ref_page(s->pages[i]);
     }
     s->app_mapped = true;
-    /* map into the wm */
+    /* map into the wm (same no-CoW/no-swap treatment: the wm forks on
+     * every app launch and must keep drawing to the same frames) */
     if (g_wm_task && g_wm_task->pml4) {
         for (u32 i = 0; i < npages; i++) {
             vmm_map_in(g_wm_task->pml4, s->wm_va + i * PAGE_SIZE, s->pages[i],
-                       PTE_PRESENT | PTE_RW | PTE_US | PTE_NX);
+                       PTE_PRESENT | PTE_RW | PTE_US | PTE_NX | PTE_NOSHR);
             pmm_ref_page(s->pages[i]);
         }
         s->wm_mapped = true;

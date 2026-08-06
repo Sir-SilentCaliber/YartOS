@@ -223,26 +223,39 @@ static u64 load_user_elf_into(vnode_t *v, u64 bias, u64 *pml4,
      *   - allocate + zero it,
      *   - copy in the file bytes of every segment that intersects it,
      *   - set the UNION of permissions: executable if any covering segment
-     *     is executable, writable if any is writable, NX otherwise. */
+     *     is executable, writable if any is writable, NX otherwise.
+     *
+     * BSS-TAIL FIX: permissions come from the segment's MEMORY range
+     * (memsz), not just its file bytes.  A page fully past filesz (e.g.
+     * the first pure .bss page after a huge .data blob) intersects no
+     * FILE bytes, so the old code left want_write=false and mapped it
+     * read-only - the app SIGSEGV'd on its first write to .bss (settings
+     * crashed in cursors_init writing G_count).  Pages covered by no
+     * segment memory range at all default to RW|NX (safe data). */
     for (u64 a = span_first; a < span_last; a += PAGE_SIZE) {
         paddr_t p = pmm_alloc_page();              /* zeroed by the PMM    */
         vmm_map_in(pml4, a, p, PTE_RW | PTE_US);   /* writable during copy */
         bool want_exec = false, want_write = false;
+        bool covered = false;
         for (int i = 0; i < eh->phnum; i++) {
             if (ph[i].type != PT_LOAD) continue;
             u64 sva = bias + ph[i].vaddr;
+            u64 smem = ph[i].memsz;
+            if (a + PAGE_SIZE <= sva || a >= sva + smem) continue;
+            covered = true;                        /* memory-range coverage */
+            if (ph[i].flags & PF_X) want_exec = true;
+            if (ph[i].flags & PF_W) want_write = true;
+            /* copy the file-byte intersection, if any */
             u64 sfile = ph[i].filesz;
             if (a + PAGE_SIZE <= sva || a >= sva + sfile) continue;
-            /* copy the intersection of [a, a+4096) and [sva, sva+sfile) */
             u64 src_off = (a > sva ? a : sva) - sva;
             u64 dst = (a > sva ? a : sva);
             u64 n = (a + PAGE_SIZE < sva + sfile ? a + PAGE_SIZE : sva + sfile) - dst;
             stac();   /* writing into user pages while SMAP is on */
             memcpy((void *)dst, (u8 *)v->data + ph[i].offset + src_off, n);
             clac();
-            if (ph[i].flags & PF_X) want_exec = true;
-            if (ph[i].flags & PF_W) want_write = true;
         }
+        if (!covered) want_write = true;           /* gap page: RW data  */
         u64 flags = PTE_US;
         if (want_write) flags |= PTE_RW;
         if (!want_exec) flags |= PTE_NX;

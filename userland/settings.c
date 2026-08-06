@@ -112,7 +112,20 @@ static int hit_row(int y) {
 }
 
 int main_entry(int argc, char **argv, char **envp) {
-    (void)argc; (void)argv; (void)envp;
+    (void)argc; (void)argv;
+    /* Test mode: when launched with YART_TEST_EXIT=1 (from the boot
+     * suite), create the window, draw + flip once, then close cleanly and
+     * exit 0 - an end-to-end window-surface round trip without a user. */
+    int test_exit = 0;
+    if (envp) {
+        for (int i = 0; envp[i]; i++) {
+            const char *e = envp[i];
+            if (e[0]=='Y'&&e[1]=='A'&&e[2]=='R'&&e[3]=='T'&&e[4]=='_'&&
+                e[5]=='T'&&e[6]=='E'&&e[7]=='S'&&e[8]=='T'&&e[9]=='_'&&
+                e[10]=='E'&&e[11]=='X'&&e[12]=='I'&&e[13]=='T'&&e[14]=='='&&
+                e[15]=='1') test_exit = 1;
+        }
+    }
 
     if (cursors_init() <= 0) {
         klog("settings: no cursor themes loaded\n");
@@ -178,6 +191,13 @@ int main_entry(int argc, char **argv, char **envp) {
     klog("x");
     put_dec((long)G_info.h);
     klog(")\n");
+
+    if (test_exit) {
+        sleep(500);                 /* let the compositor scan + draw it */
+        wm_destroy((unsigned)id);
+        klog("settings: test mode - window round trip OK, exiting\n");
+        return 0;
+    }
 
     /* POLL_MOUSE delivers DELTAS; the app tracks its own absolute
      * position (seeded at the window center - where the compositor puts

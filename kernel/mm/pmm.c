@@ -83,6 +83,23 @@ void pmm_init(struct limine_memmap_response *mm) {
             BIT_CLR(a / PAGE_SIZE);
     }
 
+    /* LOW-MEMORY RESERVATION: hold the whole first 1 MiB out of the free
+     * pool.  This region (the memmap's low usable entry) was a shared
+     * first-fit free-for-all between the virtio-blk vq, the AP cpu_local
+     * areas + AP kstacks, the idle task's kstack, the OOM-selftest hogs,
+     * and later heap growth.  When the interleaving shifted, the heap
+     * could grow a run over a live kstack's guard page (guard PTE cleared,
+     * page still handed out) - the kernel page fault in heap split()
+     * during the SMP demo, then a CPU halt and a wedged boot.  Nothing
+     * in the kernel needs to allocate below 1 MiB after pmm_init (Limine's
+     * own SMP trampoline lives in reclaimable memory, and all DMA devices
+     * use 64-bit addressing), so keep 0x0-0x100000 permanently used. */
+    for (size_t i = 0; i < 0x100; i++) {
+        if (BIT_TST(i)) continue;
+        BIT_SET(i);
+        refs[i] = 1;
+    }
+
     /* count used */
     used_pages = 0;
     for (size_t i = 0; i < total_pages; i++) if (BIT_TST(i)) used_pages++;

@@ -219,8 +219,10 @@ int vmm_user_reserve(u64 va, u64 npages, u64 flags, u32 opts) {
     /* per-task memory cap: charging happens even for lazy (demand) regions,
      * because the pages WILL be faulted in later */
     if (sched_current_is_user() && sched_mem_used() + npages > sched_mem_limit()) {
-        kprintf("vmm: pid %d over memory cap (%llu pages)\n", sched_current()->pid,
-                (unsigned long long)sched_mem_limit());
+        kprintf("vmm: pid %d over memory cap: used=%llu want=%llu limit=%llu va=0x%lx\n",
+                sched_current()->pid, (unsigned long long)sched_mem_used(),
+                (unsigned long long)npages, (unsigned long long)sched_mem_limit(),
+                (unsigned long)va);
         return -1;
     }
     sched_charge_pages((i64)npages);
@@ -360,6 +362,13 @@ void vmm_cow_fork(u64 *child_pml4) {
             paddr_t phys = *p & ~0xFFFULL & ~PTE_NX;
             if (*p & PTE_SWAP) continue;
             pmm_ref_page(phys);                  /* one ref per mapping    */
+            /* Kernel-shared buffers (fb back-buffer, wm surfaces) must stay
+             * on the SAME frame in parent AND child: the kernel blits from
+             * g_fb.pixels / g_wm_surfs[].pages, so a CoW copy would make
+             * the compositor draw into a frame nobody ever displays.
+             * vmm_clone_pml4() already copied the PTE verbatim (RW|NOSHR),
+             * so just take the child's ref and leave both mappings alone. */
+            if (*p & PTE_NOSHR) continue;
             u64 entry = (phys & ~0xFFFULL) | PTE_PRESENT | PTE_US | PTE_COW;
             *p = entry;                          /* parent -> RO           */
             u64 *cp = walk(child_pml4, a, true, PTE_US);
@@ -640,6 +649,9 @@ int vmm_evict_some(int max) {
             u64 *pte = walk(cur_pml4(), a, false, 0);
             if (!pte || !(*pte & PTE_PRESENT) || (*pte & PTE_SWAP)) continue;
             if (*pte & PTE_COW) continue;        /* shared: don't evict    */
+            if (*pte & PTE_NOSHR) continue;      /* kernel-shared buffer: swapping
+                                                    would break the kernel/user
+                                                    frame identity (fb, wm surfs) */
             if (!(*pte & PTE_NX)) continue;      /* executable (code): don't
                                                     evict - a task must be
                                                     able to keep running while

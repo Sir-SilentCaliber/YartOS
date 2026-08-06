@@ -45,6 +45,9 @@ static inline void sf_putpx_blend(surface_t *s, int x, int y, u32 c) {
 
 /* copy rect from src->dst */
 void sf_blit(surface_t *dst, int dx, int dy, surface_t *src, int sx, int sy, int w, int h);
+/* alpha-blend src over dst (skips transparent pixels) */
+void sf_blit_alpha(surface_t *dst, int dx, int dy, surface_t *src,
+                   int sx, int sy, int w, int h);
 /* In-place box blur (for frosted-glass dock). Radius is in pixels. */
 void sf_blur_rect(surface_t *s, int x, int y, int w, int h, int radius, int passes);
 void sf_fill(surface_t *s, u32 c);

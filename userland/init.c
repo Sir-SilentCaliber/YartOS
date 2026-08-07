@@ -701,6 +701,101 @@ int main_entry(int argc, char **argv, char **envp) {
         }
     }
 
+    /* ---- TLS 1.2: a real encrypted HTTPS-style fetch against the
+     * host's OpenSSL (RSA-AES128-CBC-SHA256).  If this works, the
+     * kernel's own AES + HMAC-SHA256 + RSA-2048 + X.509 + handshake
+     * all interoperate with a real TLS peer. ---- */
+    klog("tls: testing TLS 1.2 against the host (10.0.2.2:9443)...\n");
+    {
+        unsigned int nfo[5];
+        net_info(nfo);
+        if (nfo[0] == 0) {
+            klog("tls: no IP address - skipping\n");
+        } else {
+            long h = tls_connect(0x0A000202, 9443);
+            if (h < 0) {
+                klog("tls: connect FAILED (host TLS server not running?)\n");
+            } else {
+                const char *req = "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n";
+                long sl = 0, rl = (long)strlen(req);
+                while (sl < rl) {
+                    long r = tls_send(h, req + sl, rl - sl);
+                    if (r <= 0) break;
+                    sl += r;
+                }
+                char rbuf[512];
+                long got = 0;
+                int tries = 0;
+                while (tries < 400 && got < 512) {
+                    long r = tls_recv(h, rbuf + got, 512 - got);
+                    if (r > 0) {
+                        got += r;
+                        if (got >= 18 && strncmp(rbuf + got - 18, "TLS-FROM-YART-HOST", 18) == 0) break;
+                    } else sleep(10);
+                    tries++;
+                }
+                rbuf[got] = 0;
+                if (got >= 15 && strncmp(rbuf, "HTTP/1.1 200 OK", 15) == 0)
+                    klog("tls: HTTPS-style fetch WORK - encrypted HTTP 200 from OpenSSL\n");
+                else
+                    klog("tls: fetch MISMATCH\n");
+                tls_close(h);
+                klog("tls: connection closed cleanly (close_notify sent)\n");
+            }
+        }
+    }
+
+    /* ---- TLS SERVER: YartOS hosts a real HTTPS site.  The host curls
+     * it with OpenSSL: curl -k https://127.0.0.1:9444/ ---- */
+    {
+        long spid = fork();
+        if (spid == 0) {
+            klog("tls-srv: SRVBUILD-2 starting HTTPS server on :9444 (curl -k it!)\n");
+            long lid = tls_listen(9444);
+            if (lid < 0) { klog("tls-srv: listen FAILED\n"); exit(1); }
+            for (;;) {
+                long h = tls_accept(lid);
+                if (h == -2) { sleep(50); continue; }
+                if (h < 0) { sleep(100); continue; }
+                klog("tls-srv: client connected, handshake done\n");
+                char req[512];
+                long got = 0;
+                int tries = 0, hdr = 0;
+                while (tries < 200 && !hdr) {
+                    long r = tls_recv(h, req + got, 512 - got);
+                    if (r > 0) {
+                        got += r;
+                        for (long i = 0; i < got - 3; i++)
+                            if (req[i]=='\r' && req[i+1]=='\n' &&
+                                req[i+2]=='\r' && req[i+3]=='\n') hdr = 1;
+                    } else sleep(10);
+                    tries++;
+                }
+                klog("tls-srv: encrypted request received (");
+                { char b[8]; my_itoa((int)got, b); klog(b); }
+                klog(" bytes), sending encrypted response...\n");
+                const char *resp =
+                    "HTTP/1.1 200 OK\r\n"
+                    "Server: YartOS-TLS/1.2\r\n"
+                    "Content-Length: 30\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    "YART-HTTPS-IS-ALIVE-OVER-TLS!!";
+                long rl = (long)strlen(resp);
+                long n = 0;
+                while (n < rl) {
+                    long r = tls_send(h, resp + n, rl - n);
+                    if (r <= 0) break;
+                    n += r;
+                }
+                klog("tls-srv: encrypted response sent (");
+                { char b[8]; my_itoa((int)n, b); klog(b); }
+                klog(" bytes)\n");
+                tls_close(h);
+            }
+        }
+    }
+
     klog("mmap: testing dynamic memory allocation...\n");
     {
         /* 1 MiB - demand-paged, faults in as we touch it */

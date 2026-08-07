@@ -752,6 +752,41 @@ static i64 sys_ipv6_info(u8 *addr, u8 *router) {
     return net_ipv6_ready() ? 0 : -1;
 }
 
+static i64 sys_tls_connect(u32 ip, u16 port) {
+    if (!g_sys_from_user) return -1;
+    return (i64)tls_connect(ip, port);
+}
+static i64 sys_tls_send(i64 h, const u8 *buf, u64 len) {
+    if (!g_sys_from_user) return -1;
+    if (len > 16000) return -1;
+    if (!uptr((u64)buf, len)) return -1;
+    static u8 k[16000];   /* too big for the 16K kstack */
+    stac(); memcpy(k, buf, len); clac();
+    return (i64)tls_send((int)h, k, (int)len);
+}
+static i64 sys_tls_recv(i64 h, u8 *buf, u64 cap) {
+    if (!g_sys_from_user) return -1;
+    if (cap > 4096) cap = 4096;
+    if (!uptr((u64)buf, cap)) return -1;
+    static u8 k[4096];
+    int n = tls_recv((int)h, k, (int)cap);
+    if (n > 0) { stac(); memcpy(buf, k, (size_t)n); clac(); }
+    return (i64)n;
+}
+static i64 sys_tls_close(i64 h) {
+    if (!g_sys_from_user) return -1;
+    return (i64)tls_close((int)h);
+}
+
+static i64 sys_tls_listen(u16 port) {
+    if (!g_sys_from_user) return -1;
+    return (i64)tls_server_listen(port);
+}
+static i64 sys_tls_accept(i64 listener) {
+    if (!g_sys_from_user) return -1;
+    return (i64)tls_server_accept((int)listener);
+}
+
 static i64 sys_dns_resolve(const char *name, u32 *out) {
     if (!g_sys_from_user) return -1;
     char k[256];
@@ -1149,6 +1184,12 @@ static void syscall_handler(cpu_regs_t *r) {
     case SYS_ICMP_PING:   r->rax = (u64)sys_icmp_ping((u32)a0, (u64 *)a1); break;
     case SYS_ICMP6_PING:  r->rax = (u64)sys_icmp6_ping((const u8 *)a0, (u64 *)a1); break;
     case SYS_IPV6_INFO:   r->rax = (u64)sys_ipv6_info((u8 *)a0, (u8 *)a1); break;
+    case SYS_TLS_CONNECT: r->rax = (u64)sys_tls_connect((u32)a0, (u16)a1); break;
+    case SYS_TLS_SEND:    r->rax = (u64)sys_tls_send((i64)a0, (const u8 *)a1, (u64)a2); break;
+    case SYS_TLS_RECV:    r->rax = (u64)sys_tls_recv((i64)a0, (u8 *)a1, (u64)a2); break;
+    case SYS_TLS_CLOSE:   r->rax = (u64)sys_tls_close((i64)a0); break;
+    case SYS_TLS_LISTEN:  r->rax = (u64)sys_tls_listen((u16)a0); break;
+    case SYS_TLS_ACCEPT:  r->rax = (u64)sys_tls_accept((i64)a0); break;
     default:
         kprintf("syscall: bad #%lu\n", r->rax);
         r->rax = (u64)-1;

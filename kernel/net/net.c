@@ -342,7 +342,7 @@ int net_ip_send(u32 src, u32 dst, u8 proto, const u8 *payload, u16 plen) {
      * The source is forced to 127.0.0.1 (RFC 1122). */
     if ((dst & 0xFF000000u) == 0x7F000000u) {
         u16 total = (u16)(20 + plen);
-        u8 ip[1528]; memset(ip, 0, sizeof ip);
+        static u8 ip[1528]; memset(ip, 0, sizeof ip);   /* kstack is 16K */
         ip[0] = 0x45;
         ip[2] = (u8)(total >> 8); ip[3] = (u8)(total & 0xFF);
         ip[8] = 64;                            /* TTL */
@@ -369,7 +369,7 @@ int net_ip_send(u32 src, u32 dst, u8 proto, const u8 *payload, u16 plen) {
         return -1;   /* need ARP first */
     }
     u16 total = 20 + plen;
-    u8 f[1518]; memset(f, 0, sizeof f);
+    static u8 f[1518]; memset(f, 0, sizeof f);          /* kstack is 16K */
     memcpy(f, mac, 6);
     memcpy(f + 6, g_mac, 6);
     f[12] = 0x08; f[13] = 0x00;
@@ -405,7 +405,9 @@ int net_arp_resolve(u32 ip) {
     u64 t0 = pit_ticks();
     while (!arp_lookup(nh)) {
         net_pump();                      /* process the ARP reply */
-        if (pit_ticks() - t0 > 50) return -1;      /* timeout */
+        /* 1.5 s timeout: 0.5 s was too tight under emulation and after
+         * the 3 s ARP-TTL expiry (the reply was still in flight). */
+        if (pit_ticks() - t0 > 150) return -1;
         __asm__ volatile("pause");
     }
     return 0;
@@ -748,5 +750,6 @@ void net_init(void) {
     route_add(0x7F000000, 0xFF000000, 0, RT_LOCAL);   /* 127.0.0.0/8 lo */
     net_ipv6_init(g_mac);
     tcp_init();
+    tls_init();
     kprintf("net: stack up (e1000), starting DHCP\n");
 }

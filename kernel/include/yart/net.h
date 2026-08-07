@@ -29,6 +29,16 @@ void   net_init(void);                /* after nic_init; starts DHCP        */
 void   net_service(void);             /* called from the main loop           */
 void   net_get_addrs(u32 *ip, u32 *gw, u32 *dns, u32 *mask);  /* host order */
 
+/* ---- TLS 1.2 client (net/tls.c) ---- */
+void   tls_init(void);
+int    tls_connect(u32 ip, u16 port);     /* blocking handshake; conn id */
+int    tls_send(int h, const u8 *buf, int len);
+int    tls_recv(int h, u8 *buf, int cap);
+int    tls_close(int h);
+int    tls_server_listen(u16 port);         /* TCP listener (returns id) */
+int    tls_server_accept(int listener);     /* accept + server handshake,
+                                               -2 = not yet, -1 = fail   */
+
 /* UDP userland-facing API (minimal sockets) */
 int    net_udp_send(u32 dst_ip, u16 dport, const u8 *buf, u16 len);
 int    net_dns_resolve(const char *hostname, u32 *out_ip);  /* 0 = found */

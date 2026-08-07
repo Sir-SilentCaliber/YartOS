@@ -74,6 +74,12 @@ enum {
     SYS_ICMP_PING   = 64, /* ICMP: echo request, blocking; RTT in ticks out                */
     SYS_ICMP6_PING  = 65, /* ICMPv6: ping an IPv6 address (16 bytes), blocking             */
     SYS_IPV6_INFO   = 66, /* IPv6: copy our address + router (16 bytes each)               */
+    SYS_TLS_CONNECT = 67, /* TLS 1.2: connect (handshake) to ip:port, return conn id        */
+    SYS_TLS_SEND    = 68, /* TLS: send plaintext over the encrypted stream                   */
+    SYS_TLS_RECV    = 69, /* TLS: receive plaintext                                          */
+    SYS_TLS_CLOSE   = 70, /* TLS: close_notify + close the connection                        */
+    SYS_TLS_LISTEN  = 71, /* TLS server: listen on a port                                       */
+    SYS_TLS_ACCEPT  = 72, /* TLS server: accept + server-side handshake (-2 = not yet)          */
     SYS_MAX
 };
 

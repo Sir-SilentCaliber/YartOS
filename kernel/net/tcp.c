@@ -86,7 +86,8 @@ static bool tcp_is_loopback(const tcp_conn_t *c) {
 static int tcp_send_seg(tcp_conn_t *c, u8 flags, u32 seq, u32 ack,
                         const u8 *data, u16 dlen) {
     if (!net_own_ip() && !tcp_is_loopback(c)) return -1;
-    u8 seg[TCP_MAX_DATA + 40];
+    static u8 seg[TCP_MAX_DATA + 40];   /* kstack is 16K - the TLS->TCP->IP
+                                           chain would overflow it */
     /* MSS OPTION (kind 2): real stacks always negotiate it.  A bare
      * SYN (no options, hlen=5) makes some peers/NAT proxies assume a
      * zero or tiny MSS and can stall data delivery after the handshake
@@ -110,7 +111,7 @@ static int tcp_send_seg(tcp_conn_t *c, u8 flags, u32 seq, u32 ack,
     }
     if (dlen) memcpy(seg + hlen, data, dlen);
     /* checksum over the pseudo header + segment */
-    u8 ph[12 + TCP_MAX_DATA + 40];
+    static u8 ph[12 + TCP_MAX_DATA + 40];
     memset(ph, 0, 12);
     u32 sip = hton32(tcp_is_loopback(c) ? 0x7F000001u : net_own_ip());
     u32 dip = hton32(c->rip);

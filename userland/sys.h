@@ -95,6 +95,12 @@ enum {
     SYS_ICMP_PING   = 64,
     SYS_ICMP6_PING  = 65,
     SYS_IPV6_INFO   = 66,
+    SYS_TLS_CONNECT = 67,
+    SYS_TLS_SEND    = 68,
+    SYS_TLS_RECV    = 69,
+    SYS_TLS_CLOSE   = 70,
+    SYS_TLS_LISTEN  = 71,
+    SYS_TLS_ACCEPT  = 72,
 };
 
 #define O_RDONLY 0x0
@@ -188,6 +194,15 @@ static inline long icmp6_ping(const unsigned char *addr, unsigned long *rtt)
     { return _sc(SYS_ICMP6_PING, (long)addr, (long)rtt, 0); }
 static inline long ipv6_info(unsigned char *addr, unsigned char *router)
     { return _sc(SYS_IPV6_INFO, (long)addr, (long)router, 0); }
+static inline long tls_connect(unsigned int ip, unsigned short port)
+    { return _sc(SYS_TLS_CONNECT, (long)ip, port, 0); }
+static inline long tls_send(long h, const char *buf, long len)
+    { return _sc(SYS_TLS_SEND, h, (long)buf, len); }
+static inline long tls_recv(long h, char *buf, long cap)
+    { return _sc(SYS_TLS_RECV, h, (long)buf, cap); }
+static inline long tls_close(long h) { return _sc(SYS_TLS_CLOSE, h, 0, 0); }
+static inline long tls_listen(unsigned short port) { return _sc(SYS_TLS_LISTEN, port, 0, 0); }
+static inline long tls_accept(long l) { return _sc(SYS_TLS_ACCEPT, l, 0, 0); }
 static inline long mmap(long len) { return _sc(SYS_MMAP, len, 0, 0); }
 static inline long munmap(long addr) { return _sc(SYS_MUNMAP, addr, 0, 0); }
 static inline long setuid(long uid) { return _sc(SYS_SETUID, uid, 0, 0); }
@@ -202,6 +217,10 @@ static inline long acl(const char *p, long uid, long mask) { return _sc(SYS_ACL,
 static inline void exit(int n) { _sc(SYS_EXIT, n, 0, 0); for(;;); }
 
 static inline size_t strlen(const char *s) { size_t n=0; while(s[n]) n++; return n; }
+static inline int strncmp(const char *a, const char *b, size_t n) {
+    while (n && *a && *a == *b) { a++; b++; n--; }
+    return n ? (int)(unsigned char)*a - (int)(unsigned char)*b : 0;
+}
 static inline int strcmp(const char *a, const char *b) {
     while (*a && *a == *b) { a++; b++; }
     return (int)(unsigned char)*a - (int)(unsigned char)*b;

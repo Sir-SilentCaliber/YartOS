@@ -1,5 +1,5 @@
 # =============================================================================
-#  Yart OS - top-level Makefile
+#  Yart OS - top-level Makefile v3 MAX
 # =============================================================================
 
 CROSS    ?= x86_64-elf
@@ -28,8 +28,6 @@ WP_BIN   := build/wallpaper.bin
 WP_PNG   := $(WP_DIR)/default.png
 CUR_BIN  := build/cursors.bin
 CUR_H    := build/cursor_assets.h
-# Asset layout: /YartOS/kora/ is the canonical location for shipped assets.
-# /etc is reserved for user-editable config (yart.conf, motd).
 BMP_WALL := initrd_root/YartOS/kora/wallpaper.bmp
 
 C_SRCS   := $(shell find kernel -name '*.c')
@@ -44,7 +42,7 @@ CFLAGS := -std=gnu11 -ffreestanding -fno-stack-protector -fno-stack-check       
           -mcmodel=kernel -O2 -g -Wall -Wextra -Wno-unused-parameter             \
           -Wno-unused-function -Wno-address-of-packed-member                     \
           -Ikernel/include -MMD -MP                                              \
-          -DYART_VERSION='"0.7.0-apps"'
+          -DYART_VERSION='"0.8.0-max"'
 
 LDFLAGS := -nostdlib -static -m elf_x86_64 -z max-page-size=0x1000 \
            -T kernel/linker.ld
@@ -56,7 +54,6 @@ UCFLAGS := -std=gnu11 -ffreestanding -fno-stack-protector -fPIC -fPIE \
 ULDFLAGS := -nostdlib -static -pie -m elf_x86_64 -z max-page-size=0x1000 \
             -T userland/init.ld
 
-# ---- Host-tool checks ----
 REQUIRED_TOOLS := nasm xorriso git python3
 MISSING_TOOLS := $(strip $(foreach t,$(REQUIRED_TOOLS),$(if $(shell which $(t) 2>/dev/null),,$(t))))
 ifneq ($(MISSING_TOOLS),)
@@ -65,15 +62,11 @@ ifneq ($(MISSING_TOOLS),)
   $(info   sudo apt install -y build-essential nasm xorriso git python3 python3-pil librsvg2-bin qemu-system-x86 ovmf)
   $(error Aborting)
 endif
-# rsvg-convert is in librsvg2-bin
 ifeq ($(shell which rsvg-convert 2>/dev/null),)
   $(info ERROR: rsvg-convert (librsvg2-bin) not found.)
   $(info   Debian/Ubuntu: sudo apt install librsvg2-bin)
   $(error Aborting)
 endif
-# qemu-system-x86_64 (only needed for `make run`; skip check for plain `make iso`)
-# Check is deferred to the `run` target so `make iso` works on headless build boxes.
-# python3 PIL check via a quick inline import
 PIL_OK := $(strip $(shell python3 -c "from PIL import Image" 2>/dev/null && echo OK))
 ifneq ($(PIL_OK),OK)
   $(info ERROR: Python Pillow module not found.)
@@ -82,36 +75,30 @@ ifneq ($(PIL_OK),OK)
 endif
 
 .PHONY: all iso run clean distclean limine assets
-all: $(KERNEL) $(USER_ELF) build/settings.elf
+all: $(KERNEL) $(USER_ELF) build/nyra.elf
 
 assets: $(KORA_BIN) $(KORA_H) $(WP_BIN) $(CUR_BIN) $(CUR_H)
 
-# ---- Icon pack (Kora SVGs -> RGBA atlas) ----
 $(KORA_BIN) $(KORA_H): scripts/gen_assets.py
 	@mkdir -p build
 	@chmod +x scripts/gen_assets.py 2>/dev/null || true
 	python3 scripts/gen_assets.py
-	@test -s $(KORA_BIN) || { echo "ERROR: kora.bin missing after asset build — rsvg-convert probably failed."; exit 1; }
+	@test -s $(KORA_BIN) || { echo "ERROR: kora.bin missing"; exit 1; }
 
-# ---- Wallpaper pack (multiple BGRA wallpapers linked into compositor) ----
-# scripts/gen_wallpaper_pack.py generates all wallpapers procedurally, writes
-# PNGs to kora/wallpapers/*.png AND the pack binary build/wallpaper.bin.
-# Format v2: magic + offset table so the compositor can cycle through them.
 $(WP_BIN): scripts/gen_wallpaper_pack.py
 	@mkdir -p build $(WP_DIR)
 	@chmod +x scripts/gen_wallpaper_pack.py 2>/dev/null || true
 	python3 scripts/gen_wallpaper_pack.py
-	@test -s $(WP_BIN) || { echo "ERROR: wallpaper.bin missing after asset build."; exit 1; }
+	@test -s $(WP_BIN) || { echo "ERROR: wallpaper.bin missing"; exit 1; }
 
 $(WP_PNG): $(WP_BIN)
-	@: default.png is produced as a side-effect of the pack step above
+	@: default.png side-effect
 
-# ---- Photo cursor themes (real raster art from kora/cursors/) ----
 $(CUR_BIN) $(CUR_H): scripts/gen_cursors.py $(wildcard kora/cursors/*.png)
 	@mkdir -p build
 	@chmod +x scripts/gen_cursors.py 2>/dev/null || true
 	python3 scripts/gen_cursors.py
-	@test -s $(CUR_BIN) || { echo "ERROR: cursors.bin missing after cursor build."; exit 1; }
+	@test -s $(CUR_BIN) || { echo "ERROR: cursors.bin missing"; exit 1; }
 
 $(BMP_WALL): scripts/gen_wallpaper_bmp.py $(WP_PNG)
 	@mkdir -p initrd_root/YartOS/kora
@@ -130,7 +117,7 @@ $(KERNEL): $(OBJS) kernel/linker.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(LDFLAGS) $(OBJS) -o $@
 
-# ---- Userland ----
+# Userland
 build/start.o: userland/start.c userland/sys.h
 	@mkdir -p build
 	$(CC) $(UCFLAGS) -c userland/start.c -o build/start.o
@@ -156,7 +143,7 @@ build/cursors.o: $(CUR_BIN)
 $(USER_ELF): build/start.o build/init.o build/wm.o build/cursors_lib.o build/gfx.o build/assets.o build/wallpaper.o build/cursors.o userland/init.ld
 	$(LD) $(ULDFLAGS) build/start.o build/init.o build/wm.o build/cursors_lib.o build/gfx.o build/assets.o build/wallpaper.o build/cursors.o -o $@
 
-# ---- /bin/hello: the exec() demo binary ----
+# /bin/hello
 build/hello.o: userland/hello.c userland/sys.h
 	@mkdir -p build
 	$(CC) $(UCFLAGS) -c userland/hello.c -o build/hello.o
@@ -164,15 +151,15 @@ build/hello.elf: build/start.o build/hello.o userland/init.ld
 	@mkdir -p build
 	$(LD) $(ULDFLAGS) build/start.o build/hello.o -o $@
 
-# ---- /bin/settings: the first real app (window surface + UI) ----
-build/settings.o: userland/settings.c userland/sys.h userland/gfx.h $(CUR_H)
+# /bin/nyra - Nyra Terminal (unique shell replacing settings)
+build/nyra.o: userland/nyra.c userland/sys.h userland/gfx.h $(CUR_H)
 	@mkdir -p build
-	$(CC) $(UCFLAGS) -c userland/settings.c -o build/settings.o
+	$(CC) $(UCFLAGS) -c userland/nyra.c -o build/nyra.o
 build/cursors_lib.o: userland/cursors.c userland/cursors.h $(CUR_H)
 	@mkdir -p build
 	$(CC) $(UCFLAGS) -c userland/cursors.c -o build/cursors_lib.o
-build/settings.elf: build/start.o build/settings.o build/cursors_lib.o build/gfx.o build/assets.o build/wallpaper.o build/cursors.o userland/init.ld
-	$(LD) $(ULDFLAGS) build/start.o build/settings.o build/cursors_lib.o build/gfx.o build/assets.o build/wallpaper.o build/cursors.o -o $@
+build/nyra.elf: build/start.o build/nyra.o build/cursors_lib.o build/gfx.o build/assets.o build/wallpaper.o build/cursors.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/nyra.o build/cursors_lib.o build/gfx.o build/assets.o build/wallpaper.o build/cursors.o -o $@
 
 initrd_root/bin/init: $(USER_ELF)
 	@mkdir -p initrd_root/bin
@@ -184,36 +171,31 @@ initrd_root/bin/hello: build/hello.elf
 	cp build/hello.elf initrd_root/bin/hello
 	@chmod 755 initrd_root/bin/hello
 
-initrd_root/bin/settings: build/settings.elf
+initrd_root/bin/nyra: build/nyra.elf
 	@mkdir -p initrd_root/bin
-	cp build/settings.elf initrd_root/bin/settings
-	@chmod 755 initrd_root/bin/settings
+	cp build/nyra.elf initrd_root/bin/nyra
+	@chmod 755 initrd_root/bin/nyra
 
 initrd_root/etc/motd:
 	@mkdir -p initrd_root/etc
-	@printf "Yart OS - the calm, simple desktop.\n" > $@
+	@printf "Yart OS MAX - calm, fast, wifi, 10MiB FS, Nyra Terminal\n" > $@
 
 initrd_root/etc/yart.conf:
 	@mkdir -p initrd_root/etc
-	@printf "hostname=yart\ntheme=quartz\naccent=#5BA7DF\nborder=#5BA7DF\ncorner_radius=8\ndock.position=bottom\ndock.icon_size=34\ndock.spacing=44\nwallpaper.mode=image\nwallpaper.path=/YartOS/kora/wallpaper.bmp\nwallpaper.index=0\nfont.system=default\nfont.terminal=default\ndisplay.fps=60\ntime.format24=1\ncursor.size=24\n" > $@
+	@printf "hostname=yart\ntheme=quartz\naccent=#5BA7DF\nborder=#5BA7DF\ncorner_radius=8\ndock.position=bottom\ndock.icon_size=34\ndock.spacing=44\nwallpaper.mode=image\nwallpaper.path=/YartOS/kora/wallpaper.bmp\nwallpaper.index=0\nfont.system=default\nfont.terminal=default\ndisplay.fps=60\ntime.format24=1\ncursor.size=24\nwifi.enabled=1\nfs.max=1\n" > $@
 
-# Default cursor theme: the real photo cursor from the web (smooth raster
-# art), editable live from the Settings app.
 initrd_root/home/yart/cursor.conf:
 	@mkdir -p initrd_root/home/yart
 	@printf "theme=photo-white\n" > $@
 
-# ---- Limine (fetched on demand) ----
 $(LIMINE):
 	@chmod +x scripts/get-limine.sh 2>/dev/null || true
 	bash ./scripts/get-limine.sh
 
-# ---- Initrd ----
-build/initrd.tar: initrd_root/etc/motd initrd_root/etc/yart.conf initrd_root/home/yart/cursor.conf $(BMP_WALL) initrd_root/bin/init initrd_root/bin/hello initrd_root/bin/settings
+build/initrd.tar: initrd_root/etc/motd initrd_root/etc/yart.conf initrd_root/home/yart/cursor.conf $(BMP_WALL) initrd_root/bin/init initrd_root/bin/hello initrd_root/bin/nyra
 	@mkdir -p build
 	cd initrd_root && tar --format=ustar -cf ../build/initrd.tar .
 
-# ---- ISO ----
 iso: $(ISO)
 
 $(ISO): $(KERNEL) build/initrd.tar $(LIMINE)
@@ -236,8 +218,7 @@ $(ISO): $(KERNEL) build/initrd.tar $(LIMINE)
 
 run: $(ISO)
 	@if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then \
-	  echo "ERROR: qemu-system-x86_64 not found (needed for make run)."; \
-	  echo "  Debian/Ubuntu: sudo apt install qemu-system-x86 ovmf"; exit 1; fi
+	  echo "ERROR: qemu-system-x86_64 not found"; exit 1; fi
 	@chmod +x scripts/run-qemu.sh 2>/dev/null || true
 	bash ./scripts/run-qemu.sh
 
@@ -247,7 +228,7 @@ run-bios: $(ISO)
 
 clean:
 	rm -rf build $(ISO_ROOT) $(ISO) initrd_root/bin/init initrd_root/bin/hello \
-	           initrd_root/bin/settings $(BMP_WALL) initrd_root/etc/motd \
+	           initrd_root/bin/nyra initrd_root/bin/settings $(BMP_WALL) initrd_root/etc/motd \
 	           initrd_root/etc/yart.conf initrd_root/home/yart/cursor.conf \
 	           initrd_root/YartOS
 distclean: clean

@@ -22,6 +22,7 @@
 #include <yart/net.h>
 #include <yart/audio.h>
 #include <yart/usb.h>
+#include <yart/wifi.h>
 int smp_start_aps(void);
 void smp_ap_kwork_demo(void);
 
@@ -161,6 +162,7 @@ void kmain(void) {
 
     nic_init();
     net_init();
+    wifi_init();
     audio_init();
     usb_init();
 
@@ -214,6 +216,7 @@ void kmain(void) {
     for (;;) {
         watchdog_kick(g_desktop_wd);
         net_service();
+        wifi_poll();
         audio_poll();
         usb_hid_poll();
         sched_reap_orphans();

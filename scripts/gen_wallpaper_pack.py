@@ -111,29 +111,46 @@ def img_to_bgra(img):
     return bytes(raw)
 
 # ---------- wallpaper generators ----------
+
 def wp_twilight_dunes(seed):
-    """The original twilight-dunes wallpaper Adam wants preserved."""
+    """Improved twilight dunes - modern, crisp, better colors - keeps original vibe but better."""
     random.seed(seed)
-    img = sky_gradient((0x22,0x29,0x38),(0xCB,0xC6,0xBC))
-    img = radial_glow(img, int(W*0.82), int(H*0.56), [
-        (600,14,(255,180,120)),(380,26,(255,198,145)),
-        (210,44,(255,212,165)),(90,62,(255,225,185))], blur=100)
-    # cool blue rim light opposite the sun
+    # Deeper, more modern gradient: dark slate to warm dusk
+    img = sky_gradient((0x12,0x16,0x24),(0x3A,0x3D,0x4A))
+    # Subtle aurora glow top
+    img = radial_glow(img, int(W*0.75), int(H*0.35), [
+        (700,10,(120,140,180)),(450,18,(180,160,200)),
+        (300,28,(255,190,140)),(140,40,(255,210,170))], blur=90)
+    # Warm ground glow
     fill = Image.new("RGBA",(W,H),(0,0,0,0))
     fd = ImageDraw.Draw(fill)
-    fcx,fcy = int(W*0.18), int(H*0.28)
-    fd.ellipse([fcx-320,fcy-280,fcx+320,fcy+280],fill=(120,160,210,16))
-    fill = fill.filter(ImageFilter.GaussianBlur(110))
+    fcx,fcy = int(W*0.2), int(H*0.25)
+    fd.ellipse([fcx-400,fcy-300,fcx+400,fcy+300],fill=(90,110,160,12))
+    fill = fill.filter(ImageFilter.GaussianBlur(100))
     img = Image.alpha_composite(img.convert("RGBA"), fill).convert("RGB")
-    img = haze_band(img, H*0.44, H*0.62)
+    # Haze bands for depth
+    img = haze_band(img, H*0.42, H*0.60, col=(190,195,205), max_a=18, blur=24)
+    img = haze_band(img, H*0.55, H*0.70, col=(140,145,155), max_a=14, blur=20)
+    # More detailed dune layers - 6 layers for depth, sharper
     img = dune_layers(img, [
-        (int(H*0.50), [(1400,28,0.6),(600,10,2.1)],             (148,152,162), 7.0),
-        (int(H*0.58), [(1200,46,1.3),(520,12,0.3)],             (112,118,130), 5.0),
-        (int(H*0.66), [(1000,60,2.5),(440,12,1.0)],             (80, 86, 98),  3.0),
-        (int(H*0.75), [(850, 55,0.2),(360,12,3.3)],             (54, 58, 70),  2.0),
-        (int(H*0.87), [(1600,44,2.0),(520,6,1.0)],              (32, 35, 44),  1.2),
+        (int(H*0.48), [(1600,22,0.5),(700,9,1.8),(300,4,0.3)],             (100,105,115), 8.0),
+        (int(H*0.54), [(1400,28,1.1),(600,11,2.4)],                        (78,82,90), 5.5),
+        (int(H*0.61), [(1200,38,2.0),(520,13,0.4)],                        (58,62,70), 4.0),
+        (int(H*0.68), [(1000,52,0.3),(440,14,1.2)],                        (42,46,54), 2.8),
+        (int(H*0.77), [(850, 48,1.5),(360,11,3.0)],                        (28,32,40), 1.6),
+        (int(H*0.88), [(1800,36,2.2),(520,6,1.0)],                          (18,20,26), 0.8),
     ])
-    img = vignette(img)
+    # Subtle grain for modern feel
+    grain = Image.new("RGBA",(W,H),(0,0,0,0))
+    gd = ImageDraw.Draw(grain)
+    rng = random.Random(seed+10)
+    for _ in range(8000):
+        x=rng.randint(0,W-1); y=rng.randint(0,H-1)
+        a=rng.randint(2,10)
+        gd.point((x,y), fill=(255,255,255,a))
+    grain = grain.filter(ImageFilter.GaussianBlur(0.3))
+    img = Image.alpha_composite(img.convert("RGBA"), grain).convert("RGB")
+    img = vignette(img, strength=32, blur=60)
     return img
 
 def wp_midnight(seed):

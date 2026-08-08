@@ -1,6 +1,7 @@
 /*
  * Yart userland - tiny syscall wrappers + libc.
  * Compiled freestanding.  No glibc, no startup files.
+ * v3: WiFi + max filesystem + enhanced WM
  */
 #ifndef YART_USER_SYS_H
 #define YART_USER_SYS_H
@@ -13,7 +14,6 @@ typedef unsigned int   uint32_t;
 typedef unsigned long  uint64_t;
 typedef long           int64_t;
 
-/* short aliases used by userland code */
 typedef unsigned char  u8;
 typedef unsigned short u16;
 typedef unsigned int   u32;
@@ -101,6 +101,13 @@ enum {
     SYS_TLS_CLOSE   = 70,
     SYS_TLS_LISTEN  = 71,
     SYS_TLS_ACCEPT  = 72,
+    SYS_WIFI_SCAN   = 73,
+    SYS_WIFI_CONNECT = 74,
+    SYS_WIFI_STATUS = 75,
+    SYS_WM_MOVE     = 76,
+    SYS_WM_RESIZE   = 77,
+    SYS_WIFI_DISCONNECT = 78,
+    SYS_TASK_LIST   = 79,
 };
 
 #define O_RDONLY 0x0
@@ -109,40 +116,19 @@ enum {
 #define O_CREAT  0x40
 #define O_TRUNC  0x200
 
-/* Fast path: the `syscall` instruction (EFER.SCE + STAR/LSTAR/SFMASK,
- * GDT slot-5 user code 0x2B).  The kernel keeps int 0x80 as a fallback,
- * but userland uses the native instruction - this is the path the kernel's
- * syscall_entry.asm was built for.  SysV-ish register ABI: rdi/rsi/rdx/r10
- * carry args, rax the number, result back in rax; rcx/r11 are clobbered
- * by the hardware. */
 static inline long _sc(long n, long a, long b, long c) {
     long r;
-    __asm__ volatile (
-        "syscall"
-        : "=a"(r)
-        : "a"(n), "D"(a), "S"(b), "d"(c)
-        : "memory", "rcx", "r11"
-    );
+    __asm__ volatile ("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c) : "memory", "rcx", "r11");
     return r;
 }
 static inline long _sc4(long n, long a, long b, long c, long d) {
-    long r;
-    register long r10 __asm__("r10") = d;
-    __asm__ volatile (
-        "syscall"
-        : "=a"(r)
-        : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10)
-        : "memory", "rcx", "r11"
-    );
+    long r; register long r10 __asm__("r10") = d;
+    __asm__ volatile ("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10) : "memory", "rcx", "r11");
     return r;
 }
 
-static inline ssize_t write(int fd, const void *buf, size_t n) {
-    return _sc(SYS_WRITE, fd, (long)buf, (long)n);
-}
-static inline ssize_t read(int fd, void *buf, size_t n) {
-    return _sc(SYS_READ, fd, (long)buf, (long)n);
-}
+static inline ssize_t write(int fd, const void *buf, size_t n) { return _sc(SYS_WRITE, fd, (long)buf, (long)n); }
+static inline ssize_t read(int fd, void *buf, size_t n) { return _sc(SYS_READ, fd, (long)buf, (long)n); }
 static inline int open(const char *p, int f) { return _sc(SYS_OPEN, (long)p, f, 0); }
 static inline int close(int fd) { return _sc(SYS_CLOSE, fd, 0, 0); }
 static inline int klog(const char *s) { return _sc(SYS_KLOG, (long)s, 0, 0); }
@@ -151,14 +137,8 @@ static inline int yield(void) { return _sc(SYS_YIELD, 0, 0, 0); }
 static inline long getpid(void) { return _sc(SYS_GETPID, 0, 0, 0); }
 static inline long fork(void) { return _sc(SYS_FORK, 0, 0, 0); }
 static inline long waitpid(long pid, int *status) { return _sc(SYS_WAITPID, pid, (long)status, 0); }
-/* waitpid with WNOHANG: returns 0 immediately if the child is alive */
-static inline long waitpid_nohang(long pid, int *status) {
-    return _sc4(SYS_WAITPID, pid, (long)status, 0, 1);
-}
-/* pipe(fds): fds[0]=read end, fds[1]=write end.  0 = ok, -1 = fail. */
+static inline long waitpid_nohang(long pid, int *status) { return _sc4(SYS_WAITPID, pid, (long)status, 0, 1); }
 static inline long pipe(int *fds) { return _sc(SYS_PIPE, (long)fds, 0, 0); }
-/* read/write on a pipe return -2 when it would block (buffer empty/full);
- * userland should sleep briefly and retry. */
 #define PIPE_WOULD_BLOCK (-2)
 static inline long doas(const char *password) { return _sc(SYS_DOAS, (long)password, 0, 0); }
 static inline long chmod(const char *path, long mode) { return _sc(SYS_CHMOD, (long)path, mode, 0); }
@@ -168,41 +148,34 @@ static inline long getcpu(void) { return _sc(SYS_GETCPU, 0, 0, 0); }
 static inline long dmesg(char *buf, long start, long max) { return _sc(SYS_DMESG, (long)buf, start, max); }
 #define DMESG_TOTAL 0x7FFFFFFF
 static inline long net_info(unsigned int *out) { return _sc(SYS_NET_INFO, (long)out, 0, 0); }
-static inline long udp_send(unsigned int ip, unsigned short port, const char *buf, long len)
-    { return _sc4(SYS_UDP_SEND, (long)ip, port, (long)buf, len); }
+static inline long udp_send(unsigned int ip, unsigned short port, const char *buf, long len) { return _sc4(SYS_UDP_SEND, (long)ip, port, (long)buf, len); }
 static inline long udp_recv(char *buf, long cap) { return _sc(SYS_UDP_RECV, (long)buf, cap, 0); }
-
-/* ---- TCP sockets ---- */
-static inline long tcp_connect(unsigned int ip, unsigned short port)
-    { return _sc(SYS_TCP_CONNECT, (long)ip, port, 0); }
-static inline long tcp_send(long c, const char *buf, long len)
-    { return _sc(SYS_TCP_SEND, c, (long)buf, len); }
-static inline long tcp_recv(long c, char *buf, long cap)
-    { return _sc(SYS_TCP_RECV, c, (long)buf, cap); }
+static inline long tcp_connect(unsigned int ip, unsigned short port) { return _sc(SYS_TCP_CONNECT, (long)ip, port, 0); }
+static inline long tcp_send(long c, const char *buf, long len) { return _sc(SYS_TCP_SEND, c, (long)buf, len); }
+static inline long tcp_recv(long c, char *buf, long cap) { return _sc(SYS_TCP_RECV, c, (long)buf, cap); }
 static inline long tcp_close(long c) { return _sc(SYS_TCP_CLOSE, c, 0, 0); }
 static inline long tcp_listen(unsigned short port) { return _sc(SYS_TCP_LISTEN, port, 0, 0); }
 static inline long tcp_accept(long l) { return _sc(SYS_TCP_ACCEPT, l, 0, 0); }
-static inline long dns_resolve(const char *name, unsigned int *out)
-    { return _sc(SYS_DNS_RESOLVE, (long)name, (long)out, 0); }
-static inline long fw_add(long proto, unsigned int dip, unsigned short dport, long drop)
-    { return _sc4(SYS_NET_FW_ADD, proto, (long)dip, dport, drop); }
+static inline long dns_resolve(const char *name, unsigned int *out) { return _sc(SYS_DNS_RESOLVE, (long)name, (long)out, 0); }
+static inline long fw_add(long proto, unsigned int dip, unsigned short dport, long drop) { return _sc4(SYS_NET_FW_ADD, proto, (long)dip, dport, drop); }
 static inline long fw_clear(void) { return _sc(SYS_NET_FW_CLEAR, 0, 0, 0); }
 static inline long udp_bind(unsigned short port) { return _sc(SYS_UDP_BIND, port, 0, 0); }
-static inline long icmp_ping(unsigned int ip, unsigned long *rtt)
-    { return _sc(SYS_ICMP_PING, (long)ip, (long)rtt, 0); }
-static inline long icmp6_ping(const unsigned char *addr, unsigned long *rtt)
-    { return _sc(SYS_ICMP6_PING, (long)addr, (long)rtt, 0); }
-static inline long ipv6_info(unsigned char *addr, unsigned char *router)
-    { return _sc(SYS_IPV6_INFO, (long)addr, (long)router, 0); }
-static inline long tls_connect(unsigned int ip, unsigned short port)
-    { return _sc(SYS_TLS_CONNECT, (long)ip, port, 0); }
-static inline long tls_send(long h, const char *buf, long len)
-    { return _sc(SYS_TLS_SEND, h, (long)buf, len); }
-static inline long tls_recv(long h, char *buf, long cap)
-    { return _sc(SYS_TLS_RECV, h, (long)buf, cap); }
+static inline long icmp_ping(unsigned int ip, unsigned long *rtt) { return _sc(SYS_ICMP_PING, (long)ip, (long)rtt, 0); }
+static inline long icmp6_ping(const unsigned char *addr, unsigned long *rtt) { return _sc(SYS_ICMP6_PING, (long)addr, (long)rtt, 0); }
+static inline long ipv6_info(unsigned char *addr, unsigned char *router) { return _sc(SYS_IPV6_INFO, (long)addr, (long)router, 0); }
+static inline long tls_connect(unsigned int ip, unsigned short port) { return _sc(SYS_TLS_CONNECT, (long)ip, port, 0); }
+static inline long tls_send(long h, const char *buf, long len) { return _sc(SYS_TLS_SEND, h, (long)buf, len); }
+static inline long tls_recv(long h, char *buf, long cap) { return _sc(SYS_TLS_RECV, h, (long)buf, cap); }
 static inline long tls_close(long h) { return _sc(SYS_TLS_CLOSE, h, 0, 0); }
 static inline long tls_listen(unsigned short port) { return _sc(SYS_TLS_LISTEN, port, 0, 0); }
 static inline long tls_accept(long l) { return _sc(SYS_TLS_ACCEPT, l, 0, 0); }
+static inline long wifi_scan(void) { return _sc(SYS_WIFI_SCAN, 0,0,0); }
+static inline long wifi_connect(const char *ssid, const char *psk) { return _sc(SYS_WIFI_CONNECT, (long)ssid, (long)psk, 0); }
+static inline long wifi_disconnect(void) { return _sc(SYS_WIFI_DISCONNECT,0,0,0); }
+static inline long wifi_status(char *out, long cap) { return _sc(SYS_WIFI_STATUS, (long)out, cap, 0); }
+static inline long wm_move(unsigned id, int x, int y) { return _sc(SYS_WM_MOVE, id, x, y); }
+static inline long wm_resize(unsigned id, unsigned w, unsigned h) { return _sc(SYS_WM_RESIZE, id, w, h); }
+static inline long task_list(unsigned *pids, long max) { return _sc(SYS_TASK_LIST, (long)pids, max, 0); }
 static inline long mmap(long len) { return _sc(SYS_MMAP, len, 0, 0); }
 static inline long munmap(long addr) { return _sc(SYS_MUNMAP, addr, 0, 0); }
 static inline long setuid(long uid) { return _sc(SYS_SETUID, uid, 0, 0); }
@@ -217,67 +190,39 @@ static inline long acl(const char *p, long uid, long mask) { return _sc(SYS_ACL,
 static inline void exit(int n) { _sc(SYS_EXIT, n, 0, 0); for(;;); }
 
 static inline size_t strlen(const char *s) { size_t n=0; while(s[n]) n++; return n; }
-static inline int strncmp(const char *a, const char *b, size_t n) {
-    while (n && *a && *a == *b) { a++; b++; n--; }
-    return n ? (int)(unsigned char)*a - (int)(unsigned char)*b : 0;
-}
-static inline int strcmp(const char *a, const char *b) {
-    while (*a && *a == *b) { a++; b++; }
-    return (int)(unsigned char)*a - (int)(unsigned char)*b;
-}
-static inline char *strncpy(char *d, const char *s, size_t n) {
-    size_t i = 0;
-    while (s[i] && i < n) { d[i] = s[i]; i++; }
-    while (i < n) d[i++] = 0;
-    return d;
-}
+static inline int strncmp(const char *a, const char *b, size_t n) { while (n && *a && *a == *b) { a++; b++; n--; } return n ? (int)(unsigned char)*a - (int)(unsigned char)*b : 0; }
+static inline int strcmp(const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return (int)(unsigned char)*a - (int)(unsigned char)*b; }
+static inline char *strncpy(char *d, const char *s, size_t n) { size_t i=0; while (s[i] && i<n){ d[i]=s[i]; i++; } while(i<n) d[i++]=0; return d; }
 static inline int puts(const char *s) { klog(s); return 0; }
-static inline void *memcpy(void *dst, const void *src, size_t n) {
-    unsigned char *d=dst; const unsigned char *s=src;
-    for (size_t i=0;i<n;i++) { d[i]=s[i]; } return dst;
-}
-static inline void *memset(void *dst, int c, size_t n) {
-    unsigned char *d=dst;
-    for (size_t i=0;i<n;i++) { d[i]=(unsigned char)c; } return dst;
-}
+static inline void *memcpy(void *dst, const void *src, size_t n) { unsigned char *d=dst; const unsigned char *s=src; for (size_t i=0;i<n;i++) d[i]=s[i]; return dst; }
+static inline void *memset(void *dst, int c, size_t n) { unsigned char *d=dst; for (size_t i=0;i<n;i++) d[i]=(unsigned char)c; return dst; }
 
-/* --- compositor / wm syscalls --- */
+/* compositor */
 typedef struct { unsigned w, h, pitch, bpp, rgb; } fb_info_t;
 typedef struct { int dx, dy, wheel; unsigned char buttons; } mouse_ev_t;
 static inline void *fb_info(fb_info_t *i) { return (void *)(u64)_sc(SYS_FB_INFO, (long)i, 0, 0); }
-static inline long fb_flip(void *p)           { return _sc(SYS_FB_FLIP, (long)p, 0, 0); }
-static inline int  poll_key(void)            { return (int)_sc(SYS_POLL_KEY, 0, 0, 0); }
+static inline long fb_flip(void *p) { return _sc(SYS_FB_FLIP, (long)p, 0, 0); }
+static inline int  poll_key(void) { return (int)_sc(SYS_POLL_KEY, 0, 0, 0); }
 static inline int  poll_mouse(mouse_ev_t *m) { return (int)_sc(SYS_POLL_MOUSE, (long)m, 0, 0); }
-static inline long time_ms(void)    { return _sc(SYS_TIME_MS, 0, 0, 0); }
-/* SYS_TIME returns packed YYYYMMDDhhmmss as one i64 (RTC) */
-static inline long wall_time(void)  { return _sc(SYS_TIME, 0, 0, 0); }
-/* SYS_SLEEP: block the calling task (no busy loop) for ms milliseconds */
-static inline long sleep(long ms)   { return _sc(SYS_SLEEP, ms, 0, 0); }
-/* SYS_EXEC: replace this process with `path`; argv/envp are NULL-terminated
- * arrays of strings.  Returns 0 inside the NEW program on success. */
-static inline long exec(const char *path, char *const argv[], char *const envp[]) {
-    return _sc(SYS_EXEC, (long)path, (long)argv, (long)envp);
-}
+static inline long time_ms(void) { return _sc(SYS_TIME_MS, 0, 0, 0); }
+static inline long wall_time(void) { return _sc(SYS_TIME, 0, 0, 0); }
+static inline long sleep(long ms) { return _sc(SYS_SLEEP, ms, 0, 0); }
+static inline long exec(const char *path, char *const argv[], char *const envp[]) { return _sc(SYS_EXEC, (long)path, (long)argv, (long)envp); }
 
-/* --- window surfaces (real ring-3 apps) --- */
+/* window surfaces */
 typedef struct {
     unsigned id, w, h;
     unsigned win_x, win_y;
-    unsigned long long app_va;   /* mapped canvas (side depends on call) */
+    unsigned long long app_va;
     unsigned owner_pid;
     unsigned dirty;
+    char title[32];
 } wm_surf_info_t;
-static inline long wm_create(unsigned w, unsigned h, wm_surf_info_t *o) {
-    return _sc(SYS_WM_CREATE, w, h, (long)o);
-}
+static inline long wm_create(unsigned w, unsigned h, wm_surf_info_t *o) { return _sc(SYS_WM_CREATE, w, h, (long)o); }
 static inline long wm_flip(unsigned id) { return _sc(SYS_WM_FLIP, id, 0, 0); }
-static inline long wm_scan(wm_surf_info_t *o, unsigned max) {
-    return _sc(SYS_WM_SCAN, (long)o, max, 0);
-}
+static inline long wm_scan(wm_surf_info_t *o, unsigned max) { return _sc(SYS_WM_SCAN, (long)o, max, 0); }
 static inline long wm_focus(unsigned pid) { return _sc(SYS_WM_FOCUS, pid, 0, 0); }
 static inline long wm_destroy(unsigned id) { return _sc(SYS_WM_DESTROY, id, 0, 0); }
-static inline long wm_title(unsigned id, const char *t) {
-    return _sc(SYS_WM_TITLE, id, (long)t, 0);
-}
+static inline long wm_title(unsigned id, const char *t) { return _sc(SYS_WM_TITLE, id, (long)t, 0); }
 
 #endif

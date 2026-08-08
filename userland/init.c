@@ -1057,29 +1057,29 @@ int main_entry(int argc, char **argv, char **envp) {
         }
     }
 
-    /* ---- real app window round trip: exec /bin/settings with
+    /* ---- real app window round trip: exec /bin/nyra with
      * YART_TEST_EXIT=1 - it creates a window surface, the compositor
      * scans+draws it, then the app closes it and exits 0.  Exercises
      * the full ring-3 app path (exec + SYS_WM_CREATE + scan + flip +
-     * destroy) headlessly. ---- */
-    klog("app: testing real app window (settings, YART_TEST_EXIT)...\n");
+     * destroy) headlessly. Uses Nyra terminal now (settings removed). ---- */
+    klog("app: testing real app window (nyra, YART_TEST_EXIT)...\n");
     {
         long apid = fork();
         if (apid == 0) {
-            char *argv[] = { "/bin/settings", 0 };
+            char *argv[] = { "/bin/nyra", 0 };
             char *envp[] = { "YART_TEST_EXIT=1", "HOME=/home/yart", 0 };
-            long r = exec("/bin/settings", argv, envp);
+            long r = exec("/bin/nyra", argv, envp);
             (void)r;
-            klog("app: settings exec FAILED\n");
+            klog("app: nyra exec FAILED\n");
             exit(1);
         } else if (apid > 0) {
             int status = 0;
             long r;
             while ((r = waitpid(apid, &status)) == 0);
             if (r == apid && status == 0)
-                klog("app: window round trip WORK (settings created + closed cleanly)\n");
+                klog("app: window round trip WORK (nyra created + closed cleanly)\n");
             else
-                klog("app: window round trip FAILED\n");
+                klog("app: window round trip FAILED (but continuing, nyra is new)\n");
         }
     }
 

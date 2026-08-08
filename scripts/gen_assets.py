@@ -8,18 +8,18 @@ Outputs go to            build/kora.bin  +  build/kora.h
 import io, os, struct, subprocess, sys
 
 # --- Dependency check ---
+HAS_RSVG = True
 try:
     subprocess.check_output(["rsvg-convert", "--version"], stderr=subprocess.STDOUT)
 except (FileNotFoundError, subprocess.CalledProcessError):
-    sys.stderr.write(
-        "\nERROR: rsvg-convert not found.\n"
-        "Install librsvg2-bin first:\n"
-        "  Debian/Ubuntu:  sudo apt install librsvg2-bin python3-pil\n"
-        "  Arch:           sudo pacman -S librsvg python-pillow\n"
-        "  Fedora:         sudo dnf install librsvg2-tools python3-pillow\n"
-        "  macOS:          brew install librsvg python3 && pip3 install pillow\n\n"
-    )
-    sys.exit(1)
+    HAS_RSVG = False
+    sys.stderr.write("\nWARNING: rsvg-convert not found, falling back to cairosvg\n")
+    try:
+        import cairosvg
+    except ImportError:
+        sys.stderr.write("\nERROR: neither rsvg-convert nor cairosvg found\n")
+        sys.exit(1)
+
 try:
     from PIL import Image
 except ImportError:
@@ -343,21 +343,31 @@ def find(name, category, size=None, symbolic=False):
     return None
 
 def render_svg(svg, size, css=None):
-    args = ["rsvg-convert", "-w", str(size), "-h", str(size), "-f", "png"]
-    if css:
-        import tempfile
-        with tempfile.NamedTemporaryFile("w", suffix=".css", delete=False) as cf:
-            cf.write(css); cf.flush()
-            args += ["--stylesheet", cf.name]; args.append(svg)
-            png = subprocess.check_output(args)
-        os.unlink(cf.name)
+    if HAS_RSVG:
+        args = ["rsvg-convert", "-w", str(size), "-h", str(size), "-f", "png"]
+        if css:
+            import tempfile
+            with tempfile.NamedTemporaryFile("w", suffix=".css", delete=False) as cf:
+                cf.write(css); cf.flush()
+                args += ["--stylesheet", cf.name]; args.append(svg)
+                png = subprocess.check_output(args)
+            os.unlink(cf.name)
+        else:
+            args.append(svg); png = subprocess.check_output(args)
+        from PIL import Image
+        im = Image.open(io.BytesIO(png)).convert("RGBA")
+        if im.size != (size,size):
+            im = im.resize((size,size), Image.LANCZOS)
+        return im.tobytes()
     else:
-        args.append(svg); png = subprocess.check_output(args)
-    from PIL import Image
-    im = Image.open(io.BytesIO(png)).convert("RGBA")
-    if im.size != (size,size):
-        im = im.resize((size,size), Image.LANCZOS)
-    return im.tobytes()
+        # Fallback via cairosvg
+        import cairosvg
+        from PIL import Image
+        png_bytes = cairosvg.svg2png(url=svg, write_to=None, output_width=size, output_height=size)
+        im = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+        if im.size != (size,size):
+            im = im.resize((size,size), Image.LANCZOS)
+        return im.tobytes()
 
 ICONS = []
 def add(name, filename, cat, size=SZ_APP, sym=False):
@@ -384,6 +394,7 @@ add("dock_browser",      "web-browser",                    "apps",   SZ_DOCK)
 add("dock_editor",       "accessories-text-editor",        "apps",   SZ_DOCK)
 add("dock_settings",     "preferences-system",             "categories", SZ_DOCK)
 add("dock_launcher",    "applications-all",               "apps",   SZ_DOCK)
+add("dock_apps_grid",   "view-app-grid",                  "actions",SZ_DOCK)
 add("dock_trash",       "user-trash",                     "places", SZ_DOCK)
 
 # Places

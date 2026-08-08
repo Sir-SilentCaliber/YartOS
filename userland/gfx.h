@@ -61,9 +61,9 @@ void sf_round_rect_blend(surface_t *s, int x, int y, int w, int h, int r, u32 c)
 void sf_gradient_v(surface_t *s, u32 top, u32 bot);
 void sf_clip(int *x, int *y, int *w, int *h, int maxw, int maxh);
 
-/* ----- font (8x16 CP437-style, clean and readable) ----- */
-#define FONT_W 8
-#define FONT_H 16
+/* ----- font (modern bold, DejaVu Sans Bold 10x18, AA) ----- */
+#define FONT_W 10
+#define FONT_H 18
 void sf_putc(surface_t *s, int x, int y, char ch, u32 fg);
 void sf_text (surface_t *s, int x, int y, const char *txt, u32 fg);
 int  sf_text_width(const char *txt);

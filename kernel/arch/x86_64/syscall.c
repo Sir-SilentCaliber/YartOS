@@ -26,6 +26,7 @@
 #include <yart/watchdog.h>
 #include <yart/sha256.h>
 #include <yart/spinlock.h>
+#include <yart/wifi.h>
 
 /* ---------- doas user database (salted SHA-256) ----------
  * The password check used to accept ANY non-empty string ("ring-3 auth
@@ -1097,6 +1098,13 @@ static i64 sys_wm_scan(wm_surf_info_t *out, u32 max);
 static i64 sys_wm_focus(u32 pid);
 static i64 sys_wm_destroy(u32 id);
 static i64 sys_wm_title(u32 id, const char *name);
+static i64 sys_wm_move(u32 id, int x, int y);
+static i64 sys_wm_resize(u32 id, u32 w, u32 h);
+static i64 sys_wifi_scan(void);
+static i64 sys_wifi_connect(const char *ssid, const char *psk);
+static i64 sys_wifi_disconnect(void);
+static i64 sys_wifi_status(char *out, u64 cap);
+static i64 sys_task_list(u32 *pids, u64 max);
 static void sys_sigreturn(cpu_regs_t *r);
 static i64 sys_pipe(int *fds);
 
@@ -1190,6 +1198,13 @@ static void syscall_handler(cpu_regs_t *r) {
     case SYS_TLS_CLOSE:   r->rax = (u64)sys_tls_close((i64)a0); break;
     case SYS_TLS_LISTEN:  r->rax = (u64)sys_tls_listen((u16)a0); break;
     case SYS_TLS_ACCEPT:  r->rax = (u64)sys_tls_accept((i64)a0); break;
+    case SYS_WIFI_SCAN:   r->rax = (u64)sys_wifi_scan(); break;
+    case SYS_WIFI_CONNECT: r->rax = (u64)sys_wifi_connect((const char*)a0, (const char*)a1); break;
+    case SYS_WIFI_STATUS: r->rax = (u64)sys_wifi_status((char*)a0, a1); break;
+    case SYS_WM_MOVE:     r->rax = (u64)sys_wm_move((u32)a0, (int)a1, (int)a2); break;
+    case SYS_WM_RESIZE:   r->rax = (u64)sys_wm_resize((u32)a0, (u32)a1, (u32)a2); break;
+    case SYS_WIFI_DISCONNECT: r->rax = (u64)sys_wifi_disconnect(); break;
+    case SYS_TASK_LIST:   r->rax = (u64)sys_task_list((u32*)a0, a1); break;
     default:
         kprintf("syscall: bad #%lu\n", r->rax);
         r->rax = (u64)-1;
@@ -1614,19 +1629,107 @@ static i64 sys_wm_title(u32 id, const char *name) {
     return 0;
 }
 
-/* SYS_WM_FOCUS(pid): route keyboard to `pid` (and mouse copies).  The wm
- * calls this when the user clicks a window; 0 clears the focus. */
+/* SYS_WM_FOCUS(pid): route keyboard to `pid` (and mouse copies). */
 static i64 sys_wm_focus(u32 pid) {
     if (cur() != g_wm_task) return -1;
     if (pid == 0) { g_focus_pid = 0; return 0; }
     task_t *t = sched_find(pid);
-    /* reject dead/zombie tasks: focusing a zombie makes the wm think a
-     * relaunch isn't needed while the app never runs again */
-    if (!t || !t->is_user || t->pid == 0 ||
-        t->state == TASK_ZOMBIE) return -1;
+    if (!t || !t->is_user || t->pid == 0 || t->state == TASK_ZOMBIE) return -1;
     g_focus_pid = pid;
     kprintf("wm: input focus -> pid %u\n", pid);
     return 0;
+}
+
+/* NEW: SYS_WM_MOVE(id, x, y): move window, only wm or owner can move */
+static i64 sys_wm_move(u32 id, int x, int y) {
+    if (id >= WM_MAX_SURFACES || !g_wm_surfs[id].used) return -1;
+    task_t *t = cur();
+    if (t && t->pid != g_wm_surfs[id].owner_pid && t != g_wm_task) return -1;
+    if (x < -100) x = -100;
+    if (y < 0) y = 0;
+    if (x > (int)g_fb.width - 50) x = g_fb.width - 50;
+    if (y > (int)g_fb.height - 50) y = g_fb.height - 50;
+    g_wm_surfs[id].win_x = (u32)x;
+    g_wm_surfs[id].win_y = (u32)y;
+    g_wm_surfs[id].dirty = true;
+    return 0;
+}
+
+/* NEW: SYS_WM_RESIZE(id, w, h): resize window (realloc pages) */
+static i64 sys_wm_resize(u32 id, u32 w, u32 h) {
+    if (id >= WM_MAX_SURFACES || !g_wm_surfs[id].used) return -1;
+    task_t *t = cur();
+    if (t && t->pid != g_wm_surfs[id].owner_pid && t != g_wm_task) return -1;
+    if (w < 100 || h < 100 || w > WM_SURF_MAX_W || h > WM_SURF_MAX_H) return -1;
+    wm_surface_t *s = &g_wm_surfs[id];
+    u32 new_pages = (w * h * 4 + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (new_pages > WM_SURF_MAX_PAGES) return -1;
+    /* For simplicity, keep old pages if same count, else realloc not yet.
+       We only allow same-page-count resize to avoid complex remap.
+       Full realloc would need unmap+alloc+map both sides.
+     */
+    if (new_pages != s->npages) {
+        /* realloc: free extra or alloc more */
+        if (new_pages > s->npages) {
+            for (u32 i=s->npages;i<new_pages;i++){
+                paddr_t pg = pmm_alloc_page();
+                if (!pg) return -1;
+                s->pages[i]=pg;
+                vmm_map_in(vmm_current_pml4(), s->app_va + i*PAGE_SIZE, pg, PTE_PRESENT|PTE_RW|PTE_US|PTE_NX|PTE_NOSHR);
+                pmm_ref_page(pg);
+                if (g_wm_task && g_wm_task->pml4){
+                    vmm_map_in(g_wm_task->pml4, s->wm_va + i*PAGE_SIZE, pg, PTE_PRESENT|PTE_RW|PTE_US|PTE_NX|PTE_NOSHR);
+                    pmm_ref_page(pg);
+                }
+            }
+        } else {
+            for (u32 i=new_pages;i<s->npages;i++){
+                vmm_unmap_in(sched_find(s->owner_pid)?sched_find(s->owner_pid)->pml4:vmm_current_pml4(), s->app_va + i*PAGE_SIZE);
+                if (g_wm_task && g_wm_task->pml4) vmm_unmap_in(g_wm_task->pml4, s->wm_va + i*PAGE_SIZE);
+                pmm_free_page(s->pages[i]);
+            }
+        }
+        s->npages = new_pages;
+        if (g_wm_task != cur()) smp_tlb_shootdown_all();
+    }
+    s->w = w; s->h = h; s->dirty = true;
+    return 0;
+}
+
+/* WiFi syscalls */
+static i64 sys_wifi_scan(void){
+    if (!g_sys_from_user) return -1;
+    return (i64)wifi_scan_syscall();
+}
+static i64 sys_wifi_connect(const char *ssid, const char *psk){
+    char kssid[64], kpsk[64];
+    if (!copy_user_str((u64)ssid, kssid, sizeof kssid)) return -1;
+    if (psk && !copy_user_str((u64)psk, kpsk, sizeof kpsk)) return -1;
+    return (i64)wifi_connect_syscall(kssid, psk?kpsk:NULL);
+}
+static i64 sys_wifi_disconnect(void){
+    if (!g_sys_from_user) return -1;
+    extern int wifi_disconnect(void);
+    return (i64)wifi_disconnect();
+}
+static i64 sys_wifi_status(char *out, u64 cap){
+    if (!uptr((u64)out, cap)) return -1;
+    if (cap > 4096) cap = 4096;
+    char kbuf[4096]; int n = wifi_status_syscall(kbuf, (u32)cap);
+    if (n<0) return -1;
+    stac(); memcpy(out, kbuf, (size_t)n); if ((u64)n < cap) out[n]=0; clac();
+    return n;
+}
+static i64 sys_task_list(u32 *pids, u64 max){
+    if (!uptr((u64)pids, max*sizeof(u32))) return -1;
+    if (max>128) max=128;
+    u32 k[128]; int n=0;
+    // walk tasks
+    for (task_t *t = sched_tasks(); t && n<(int)max; t=t->next){
+        if (t->state != TASK_ZOMBIE) k[n++] = t->pid;
+    }
+    stac(); for(int i=0;i<n;i++) pids[i]=k[i]; clac();
+    return n;
 }
 
 /* Called from the orphan reaper when a task dies: free any surface it

@@ -80,6 +80,13 @@ enum {
     SYS_TLS_CLOSE   = 70, /* TLS: close_notify + close the connection                        */
     SYS_TLS_LISTEN  = 71, /* TLS server: listen on a port                                       */
     SYS_TLS_ACCEPT  = 72, /* TLS server: accept + server-side handshake (-2 = not yet)          */
+    SYS_WIFI_SCAN   = 73, /* WiFi: scan for APs, returns count                           */
+    SYS_WIFI_CONNECT = 74,/* WiFi: connect to ssid/psk                                    */
+    SYS_WIFI_STATUS = 75, /* WiFi: get status string (user buf)                          */
+    SYS_WM_MOVE     = 76, /* WM: move window id to x,y (wm or owner)                     */
+    SYS_WM_RESIZE   = 77, /* WM: resize window id to w,h (wm or owner)                  */
+    SYS_WIFI_DISCONNECT = 78, /* WiFi: disconnect                                         */
+    SYS_TASK_LIST   = 79, /* List tasks pids (ps)                                        */
     SYS_MAX
 };
 

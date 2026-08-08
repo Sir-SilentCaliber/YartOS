@@ -39,21 +39,19 @@
 #include "cursors.h"
 
 /* =================== real apps (window surfaces) =================== */
-#define WM_MAX_WIN 8
+#define WM_MAX_WIN 12
 typedef struct {
-    bool active;        /* the kernel still reports this surface          */
-    bool seen;          /* the kernel reported it this scan               */
-    u32  id;            /* kernel surface id                             */
-    u32  owner;         /* pid of the app                                */
-    int  x, y, w, h;    /* screen rect of the surface                     */
-    u64  va;            /* wm-side mapping of the surface (from scan)     */
-    bool dirty;
-    char title[32];     /* window title (set by the app via SYS_WM_TITLE) */
-    int  misses;        /* consecutive scans without this window           */
+    bool active; bool seen; u32 id; u32 owner;
+    int x,y,w,h; u64 va; bool dirty; char title[32]; int misses; int z;
 } win_t;
 static win_t G_wins[WM_MAX_WIN];
-static int  G_app_pid;      /* pid of the launched real app (settings)   */
-static int  G_win_dirty;    /* any window needs recompositing            */
+static int  G_app_pid;
+static int  G_win_dirty;
+static int  G_z_top=0;
+#define MAX_APP_PIDS 16
+static int G_app_pids[MAX_APP_PIDS];
+static int G_app_pids_count;
+#define G_app_count G_app_pids_count    /* any window needs recompositing            */
 
 /* =================== cursor themes =================== */
 static int  G_cur_theme;            /* 0 = classic procedural, 1.. photo */
@@ -67,7 +65,10 @@ static long G_cfg_last_check;       /* ms of the last cursor.conf poll   */
 #define C_PANEL_HAIR    RGB(0x06,0x08,0x0C)
 #define C_PANEL_HILITE  ARGB(0x28,0xFF,0xFF,0xFF)
 #define C_ACCENT        RGB(0x5B,0xA7,0xDF)
-#define C_DOCK_TINT     ARGB(0xBC,0x1A,0x1D,0x24)
+#define C_DOCK_TINT     ARGB(0x80,0x1A,0x1D,0x24)
+#define C_OVERVIEW_BG   ARGB(0xCC,0x0A,0x0B,0x10)
+#define C_QUICK_BG      ARGB(0xF2,0x20,0x22,0x28)
+#define C_APPS_BG       ARGB(0xE6,0x12,0x14,0x1C)
 #define C_DOCK_BORDER   ARGB(0x6E,0x5C,0x62,0x6C)
 #define C_DOCK_INNER    ARGB(0x1E,0xFF,0xFF,0xFF)
 #define C_DOCK_INNER2   ARGB(0x0A,0xFF,0xFF,0xFF)
@@ -86,18 +87,62 @@ static long G_cfg_last_check;       /* ms of the last cursor.conf poll   */
 #define MAG_RADIUS  30       /* gaussian bell half-width; only nearest icon wins */
 #define DOCK_MARGIN 4
 #define DOCK_RAD    14
-#define DOCK_PADX   14
+#define DOCK_PADX   10
 #define DOCK_SHADOW 16
 
-/* =================== dock items ===================
- * NO FAKE APPS: only things that actually exist.  "Settings" launches the
- * real ring-3 app (/bin/settings); "Trash" is a real concept (empty). */
-typedef struct { const char *name; int icon; } dock_item_t;
-static const dock_item_t G_dock[] = {
-    { "Settings",   ICON_DOCK_SETTINGS },
-    { "Trash",      ICON_DOCK_TRASH    },
+/* Dock - Apps leftmost per user, macOS transparent, magnification, Kora icons */
+typedef struct { char name[32]; int icon; char path[64]; bool fixed; } dock_item_t;
+static dock_item_t G_dock[] = {
+    { "Show Apps",     ICON_DOCK_LAUNCHER, "", true },
+    { "Nyra Terminal", ICON_DOCK_TERMINAL, "/bin/nyra", false },
+    { "Trash",         ICON_DOCK_TRASH, "", true },
 };
 #define DOCK_N ((int)(sizeof G_dock / sizeof G_dock[0]))
+#define DOCK_MAX 16
+static int G_dock_count = DOCK_N;
+
+#define APP_GRID_MAX 64
+typedef struct { char name[32]; char path[64]; int icon; } app_entry_t;
+static app_entry_t G_apps_list[APP_GRID_MAX];
+static int G_apps_count=0;
+static bool G_apps_grid=false;
+static char G_search[64]; static int G_search_len=0;
+
+#define CTX_NONE 0
+#define CTX_DOCK 1
+#define CTX_APPGRID 2
+static bool G_ctx_open=false;
+static int G_ctx_x,G_ctx_y,G_ctx_w,G_ctx_h,G_ctx_type=CTX_NONE,G_ctx_idx=-1;
+static char G_ctx_path[64];
+
+static bool G_overview=false;
+static bool G_quick_open=false;
+static bool G_calendar_open=false;
+static int G_quick_x,G_quick_y,G_quick_w,G_quick_h;
+static int G_cal_x,G_cal_y,G_cal_w,G_cal_h;
+static int G_eth_up=0, G_wifi_up=0;
+static int G_activities_x0,G_activities_x1,G_clock_x0,G_clock_x1,G_sys_x0,G_sys_x1;
+static char G_date_text[32]="Aug 7";
+static void osd(const char *msg);
+static void format_date(long wt,char *buf);
+static void load_apps_list(void);
+static void draw_apps_grid(surface_t *s);
+static void draw_context_menu(surface_t *s);
+static void draw_overview(surface_t *s);
+static void draw_quick_settings(surface_t *s);
+static void draw_calendar(surface_t *s);
+static void pin_app(const char *path,const char *name,int icon);
+static void unpin_app(int idx);
+static void uninstall_app(const char *path);
+static void save_dock_config(void);
+static void load_dock_config(void);
+static void launch_nyra(void);
+static void launch_app_path(const char *path);
+static win_t *win_find(u32 id);
+static win_t *win_alloc(void);
+static win_t *win_at_pos(int x,int y);
+static void win_bring_to_front(win_t *w);
+static void safe_close_window(win_t *w);
 
 /* =================== cursors =================== */
 enum {
@@ -126,7 +171,7 @@ static int G_ws_active = 0;
 /* Pre-scaled dock icons at rest size (34px): while hovering/tweening we
  * blit these instead of per-pixel scaling the 48px atlas icons every
  * frame - the single biggest per-frame cost on TCG. */
-static surface_t G_icon_cache[DOCK_N];
+static surface_t G_icon_cache[DOCK_MAX];
 static int       G_icon_cache_ok;
 
 static void build_icon_cache(void) {
@@ -143,12 +188,12 @@ static void build_icon_cache(void) {
 }
 
 /* =================== animated tween state =================== */
-static int G_slot_size[DOCK_N];
-static int G_slot_lift[DOCK_N];
-static int G_slot_target_sz[DOCK_N];
-static int G_slot_target_lift[DOCK_N];
-static int G_slot_bounce[DOCK_N];     /* decaying bounce velocity on click */
-static long G_slot_bounce_t0[DOCK_N];
+static int G_slot_size[DOCK_MAX];
+static int G_slot_lift[DOCK_MAX];
+static int G_slot_target_sz[DOCK_MAX];
+static int G_slot_target_lift[DOCK_MAX];
+static int G_slot_bounce[DOCK_MAX];
+static long G_slot_bounce_t0[DOCK_MAX];
 
 /* =================== cached chrome sprites =================== */
 static surface_t G_panel_spr;
@@ -423,19 +468,18 @@ static void build_panel_sprite(void) {
     sf_fill_rect_blend(&G_panel_spr, 0, 0, w, PANEL_H, C_PANEL_BG);
     sf_hline(&G_panel_spr, 0, 0, w, C_PANEL_HILITE);
     sf_hline(&G_panel_spr, 0, PANEL_H, w, C_PANEL_HAIR);
+    // Yart text removed per user request, keep only logo icon
     draw_logo(&G_panel_spr, 12, 6);
-    sf_text(&G_panel_spr, 24, 6, "Yart", C_PANEL_FG);
 }
 
 static void build_dock_sprite(void) {
-    int content_w = DOCK_N*DOCK_MW + 8;
+    int content_w = G_dock_count*DOCK_MW + 8;
     int dock_w = content_w + DOCK_PADX*2;
     int dock_h = DOCK_H;
     int dock_x = G_fb.w/2 - dock_w/2;
     int dock_y = G_fb.h - dock_h - DOCK_MARGIN;
     int dock_r = DOCK_RAD;
     G_dock_x = dock_x; G_dock_y = dock_y; G_dock_w = dock_w; G_dock_h = dock_h;
-
     int spr_w = dock_w + DOCK_SHADOW*2 + 4;
     int spr_h = dock_h + DOCK_SHADOW*2 + 6;
     int spr_x = dock_x - DOCK_SHADOW - 2;
@@ -444,35 +488,24 @@ static void build_dock_sprite(void) {
     G_dock_spr_w = spr_w; G_dock_spr_h = spr_h;
     if (G_dock_spr.px) sf_free(&G_dock_spr);
     G_dock_spr = sf_alloc(spr_w, spr_h);
-
     int wsx = spr_x, wsy = spr_y, wsw = spr_w, wsh = spr_h;
     if (wsx < 0) { wsw += wsx; wsx = 0; }
     if (wsy < 0) { wsh += wsy; wsy = 0; }
     if (wsx + wsw > G_wp.w) wsw = G_wp.w - wsx;
     if (wsy + wsh > G_wp.h) wsh = G_wp.h - wsy;
     if (wsw > 0 && wsh > 0) sf_blit(&G_dock_spr, wsx - spr_x, wsy - spr_y, &G_wp, wsx, wsy, wsw, wsh);
-
+    // macOS-like blur for frosted glass, no black outline
+    sf_blur_rect(&G_dock_spr, 0, 0, spr_w, spr_h, 8, 2);
     int lx = DOCK_SHADOW+2, ly = DOCK_SHADOW+2;
-    for (int pass=0; pass<5; pass++) {
-        int e = 5-pass;
-        int a = (int[]){6,12,20,28,36}[pass];
-        sf_round_rect_blend(&G_dock_spr, lx-e, ly-e+3, dock_w+2*e, dock_h+2*e+2,
-                            dock_r+e, ARGB(a,0,0,0));
+    for (int pass=0; pass<4; pass++) {
+        int e = 4-pass;
+        int a = (int[]){6,12,20,28}[pass];
+        sf_round_rect_blend(&G_dock_spr, lx-e, ly-e+3, dock_w+2*e, dock_h+2*e+2, dock_r+e, ARGB(a,0,0,0));
     }
     sf_round_rect_blend(&G_dock_spr, lx, ly, dock_w, dock_h, dock_r, C_DOCK_TINT);
     sf_round_rect_blend(&G_dock_spr, lx, ly, dock_w, dock_h*2/5, dock_r, C_DOCK_INNER);
-    sf_fill_rect_blend(&G_dock_spr, lx+dock_r, ly+dock_h*2/5,
-                       dock_w-2*dock_r, dock_h*2/5, C_DOCK_INNER2);
-    int x0 = lx+dock_r, x1 = lx+dock_w-dock_r;
-    for (int x=x0; x<x1; x++) sf_putpx_blend(&G_dock_spr, x, ly+1, C_DOCK_INNER);
-    for (int dy=0; dy<dock_r; dy++) for (int dx=0; dx<dock_r; dx++) {
-        int rr=dx*dx+dy*dy, ro=dock_r*dock_r, ri=(dock_r-2)*(dock_r-2);
-        if (rr<=ro && rr>=ri && dy<=3) {
-            sf_putpx_blend(&G_dock_spr, lx+dock_r-1-dx, ly+dock_r-1-dy, C_DOCK_INNER);
-            sf_putpx_blend(&G_dock_spr, lx+dock_w-dock_r+dx, ly+dock_r-1-dy, C_DOCK_INNER);
-        }
-    }
-    sf_round_rect_blend(&G_dock_spr, lx, ly, dock_w, dock_h, dock_r, C_DOCK_BORDER);
+    sf_fill_rect_blend(&G_dock_spr, lx+dock_r, ly+dock_h*2/5, dock_w-2*dock_r, dock_h*2/5, C_DOCK_INNER2);
+    // no border per user request - remove black outline
 }
 
 /* ================================================================
@@ -480,54 +513,31 @@ static void build_dock_sprite(void) {
  * Returns the rightmost x it painted so the caller can track tray hits.
  * ================================================================ */
 static int draw_panel_content(surface_t *s, long now_ms) {
-    (void)now_ms;
-    int wx = 24 + sf_text_width("Yart") + 20;
-    int cy = PANEL_H/2;
-    for (int i=0;i<G_ws_count;i++) {
-        int active=(i==G_ws_active);
-        u32 c = active?C_PANEL_FG:C_PANEL_DIM;
-        int r = active?3:2;
-        for (int dy=-r;dy<=r;dy++) for (int dx=-r;dx<=r;dx++)
-            if (dx*dx+dy*dy <= r*r) sf_putpx(s, wx+dx+i*12, cy+dy, c);
-    }
-    int plus_x = wx + G_ws_count*12 + 6;
-    {
-        u32 c = C_PANEL_DIM;
-        sf_putpx(s, plus_x,cy,c); sf_putpx(s,plus_x-1,cy,c); sf_putpx(s,plus_x+1,cy,c);
-        sf_putpx(s, plus_x,cy-1,c); sf_putpx(s,plus_x,cy+1,c);
-    }
-
-    G_tray_n = 0;
-    int rx = s->w-12;
-    int cw = sf_text_width(G_clk_text);
-    /* Clock isn't in the tray hit list (it's just a label) */
-    sf_text(s, rx-cw, 6, G_clk_text, C_PANEL_FG);
-    rx -= cw+12;
-
-    int ty = (PANEL_H-18)/2;
-    icon_t ico;
-    ico = icon_get(ICON_TRAY_BATTERY);
-    if (ico.px && rx-ico.w > 80) {
-        int ix = rx-ico.w;
-        G_tray[G_tray_n++] = (tray_hit_t){"battery", ix, ty, ix+ico.w, ty+ico.h, ICON_TRAY_BATTERY};
-        sf_icon_tl(s, ix, ty, ico, TRAY_TINT); rx -= ico.w+6;
-    }
-    ico = icon_get(G_net_up?ICON_TRAY_NET_WIRED:ICON_TRAY_NET_IDLE);
-    if (ico.px && rx-ico.w > 80) {
-        int ix = rx-ico.w;
-        G_tray[G_tray_n++] = (tray_hit_t){"network", ix, ty, ix+ico.w, ty+ico.h,
-                                          G_net_up?ICON_TRAY_NET_WIRED:ICON_TRAY_NET_IDLE};
-        sf_icon_tl(s, ix, ty, ico, TRAY_TINT); rx -= ico.w+6;
-    }
-    ico = icon_get(G_audio_up?ICON_TRAY_AUDIO_HI:ICON_TRAY_AUDIO_MUTE);
-    if (ico.px && rx-ico.w > 80) {
-        int ix = rx-ico.w;
-        G_tray[G_tray_n++] = (tray_hit_t){"audio", ix, ty, ix+ico.w, ty+ico.h,
-                                          G_audio_up?ICON_TRAY_AUDIO_HI:ICON_TRAY_AUDIO_MUTE};
-        sf_icon_tl(s, ix, ty, ico, TRAY_TINT); rx -= ico.w+6;
-    }
+    (void)now_ms; G_tray_n=0; int h=PANEL_H;
+    // Left: Kora icon for Activities (9-dot grid) - no text, uses icons per user request
+    int ax=12, ay=4, aw=32, ah=24;
+    u32 act_bg = G_overview||G_apps_grid? RGB(0x4A,0x4E,0x5A) : ARGB(0x28,0xFF,0xFF,0xFF);
+    sf_round_rect_blend(s, ax, ay, aw, ah, 8, act_bg);
+    icon_t act_ico = icon_get(ICON_DOCK_APPS_GRID);
+    if(act_ico.px) sf_icon_scaled(s, ax+aw/2, ay+ah/2, act_ico, TRAY_TINT, 18, 48);
+    G_activities_x0=ax; G_activities_x1=ax+aw;
+    int wx = ax+aw+16; int cy=h/2;
+    for(int i=0;i<G_ws_count;i++){ int active=(i==G_ws_active); if(active){ sf_round_rect(s, wx+i*18, cy-8, 16, 16, 8, C_PANEL_FG); sf_round_rect(s, wx+i*18+4, cy-4, 8, 8, 4, RGB(0x14,0x16,0x1B)); } else { u32 c=C_PANEL_DIM; int r=3; for(int dy=-r;dy<=r;dy++) for(int dx=-r;dx<=r;dx++) if(dx*dx+dy*dy<=r*r) sf_putpx(s, wx+8+i*18+dx, cy+dy, c); } }
+    // Center clock/date - clean, no extra
+    int cw = sf_text_width(G_clk_text) + sf_text_width(G_date_text) + 20;
+    int cx_center = s->w/2 - cw/2;
+    sf_text(s, cx_center, 8, G_date_text, C_PANEL_FG);
+    sf_text(s, cx_center+sf_text_width(G_date_text)+10, 8, G_clk_text, C_PANEL_FG);
+    G_clock_x0=cx_center-5; G_clock_x1=cx_center+cw+5;
+    // Right: system status with Kora icons only - wifi, sound, battery - clickable
+    int rx = s->w-16; int icon_sz=18; int pad=8;
+    icon_t ico = icon_get(ICON_TRAY_BATTERY); int bat_x = rx - icon_sz - pad; if(ico.px){ sf_icon_tl(s, bat_x, (h-icon_sz)/2, ico, TRAY_TINT); G_tray[G_tray_n++]=(tray_hit_t){"battery", bat_x, (h-icon_sz)/2, bat_x+icon_sz, (h-icon_sz)/2+icon_sz, ICON_TRAY_BATTERY}; rx=bat_x; }
+    ico = icon_get(G_audio_up?ICON_TRAY_AUDIO_HI:ICON_TRAY_AUDIO_MUTE); int audio_x = rx - icon_sz - pad; if(ico.px){ sf_icon_tl(s, audio_x, (h-icon_sz)/2, ico, TRAY_TINT); G_tray[G_tray_n++]=(tray_hit_t){"audio", audio_x, (h-icon_sz)/2, audio_x+icon_sz, (h-icon_sz)/2+icon_sz, G_audio_up?ICON_TRAY_AUDIO_HI:ICON_TRAY_AUDIO_MUTE}; rx=audio_x; }
+    if(G_wifi_up || G_net_up){ int wifi_icon = ICON_TRAY_NET_WIRED; ico = icon_get(wifi_icon); int net_x = rx - icon_sz - pad; if(ico.px){ sf_icon_tl(s, net_x, (h-icon_sz)/2, ico, G_wifi_up? RGB(0x5B,0xA7,0xDF): TRAY_TINT); G_tray[G_tray_n++]=(tray_hit_t){ G_wifi_up?"wifi":"ethernet", net_x, (h-icon_sz)/2, net_x+icon_sz, (h-icon_sz)/2+icon_sz, wifi_icon }; rx=net_x; } } else { ico = icon_get(ICON_TRAY_NET_IDLE); int net_x = rx - icon_sz - pad; if(ico.px){ sf_icon_tl(s, net_x, (h-icon_sz)/2, ico, TRAY_TINT); G_tray[G_tray_n++]=(tray_hit_t){"network", net_x, (h-icon_sz)/2, net_x+icon_sz, (h-icon_sz)/2+icon_sz, ICON_TRAY_NET_IDLE}; rx=net_x; } }
+    int pill_x0 = rx - 10; int pill_x1 = s->w - 6; sf_round_rect_blend(s, pill_x0, 4, pill_x1-pill_x0, h-8, 12, ARGB(0x20,0xFF,0xFF,0xFF)); G_sys_x0=pill_x0; G_sys_x1=pill_x1;
     return rx;
 }
+
 
 /* ================================================================
  * Tooltip

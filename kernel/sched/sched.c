@@ -50,6 +50,8 @@ static u64     g_wd_tick_cnt; /* throttles the BSP watchdog to ~1 Hz   */
 static u32     g_next_pid;
 static bool    g_idle_handoff;   /* idle task is sleeping and may be preempted */
 static spinlock_t g_tasks_lock;  /* protects g_tasks append/remove/find/reap */
+static spinlock_t g_switch_lock; /* serializes switch_to vs sched_kill/reap */
+static u64 g_leaked_tasks;       /* task structs not freed (UAF safety)     */
 
 /* ---------------- sleep queue (blocking sched_sleep_ms) ----------------
  * A sleeping task is registered here (slot + wake tick) and parked as
@@ -69,6 +71,16 @@ void sched_sleep_ms(u32 ms) {
     u64 wake = pit_ticks() + ((u64)ms + 9) / 10;   /* 100 Hz system tick */
     u64 fl = irq_save();
     spin_lock(&g_sleep_lock);
+    /* A task killed (ZOMBIE) on another CPU while this syscall was in
+     * flight must NOT be put to sleep: overwriting ZOMBIE with BLOCKED
+     * resurrects it, and the wake would schedule a task whose kstack/PML4
+     * may already be freed by reap.  Just return; sched_after_isr sees
+     * ZOMBIE and switches away. */
+    if (cur->state == TASK_ZOMBIE) {
+        spin_unlock(&g_sleep_lock);
+        irq_restore(fl);
+        return;
+    }
     int slot = -1;
     for (int i = 0; i < SLEEP_MAX; i++)
         if (!g_sleepers[i]) { slot = i; break; }
@@ -113,6 +125,58 @@ task_t *sched_current(void) {
     return (c && c->ap_current) ? c->ap_current : NULL;
 }
 task_t *sched_tasks(void) { return g_tasks; }
+
+/* Self-healing for a lost wake: a READY task that no CPU has scheduled for
+ * too long is re-kicked.  If it is still on a runqueue, poke that CPU; if
+ * it somehow lost its queue (rq_cpu NULL), re-push it to the least-loaded
+ * CPU and IPI.  Turns the intermittent SMP lost-wake into a logged hiccup
+ * instead of a permanently frozen task. */
+void sched_kick_starved(task_t *t) {
+    if (!t) return;
+    /* Re-kick under g_switch_lock with a full re-check.  Without the lock a
+     * task that just became RUNNING (or was popped from its queue) could be
+     * re-pushed onto a second queue while still running on a CPU - the
+     * "task on two CPUs" corruption that wedges the scheduler. */
+    u64 fl = irq_save();
+    spin_lock(&g_switch_lock);
+    bool running = false;
+    for (u32 i = 0; i < 8; i++) {
+        cpu_local_t *cc = (i == 0) ? bsp_cpu_local() : smp_get_ap_area(i);
+        if (cc && cc->ap_current == t) { running = true; break; }
+    }
+    if (t->state == TASK_READY && !running) {
+        cpu_local_t *q = t->rq_cpu;
+        if (q) {
+            lapic_send_ipi(q->ap_lapic_id, AP_WAKE_VEC);
+        } else {
+            cpu_local_t *target = smp_least_loaded();
+            if (!target) target = get_cpu_local();
+            rq_push(target, t);
+            t->state = TASK_READY;
+            lapic_send_ipi(target->ap_lapic_id, AP_WAKE_VEC);
+        }
+    }
+    spin_unlock(&g_switch_lock);
+    irq_restore(fl);
+}
+
+/* Diagnostic: dump the sleep queue (which tasks are BLOCKED-in-sleep and
+ * what their state field says).  Used by the watchdog to find "lost"
+ * READY tasks that are neither queued nor parked. */
+void sched_dump_sleepers(void) {
+    u64 now = pit_ticks();
+    spin_lock(&g_sleep_lock);
+    for (int i = 0; i < SLEEP_MAX; i++) {
+        task_t *t = g_sleepers[i];
+        if (!t) continue;
+        kprintf("sleep-dbg: slot %d pid %u state=%d wake_in=%lld\n",
+                i, t->pid, t->state,
+                (long long)(g_sleeper_wake[i] > now
+                            ? (long long)(g_sleeper_wake[i] - now)
+                            : (long long)g_sleeper_wake[i] - (long long)now));
+    }
+    spin_unlock(&g_sleep_lock);
+}
 bool    sched_current_is_user(void) { task_t *t = sched_current(); return t && t->is_user; }
 u32     sched_next_pid(void)    { return g_next_pid; }
 u32     sched_current_uid(void) { task_t *t = sched_current(); return t ? t->uid : 0; }
@@ -388,6 +452,7 @@ void sched_init(void) {
     g_next_pid = 1;
     g_idle_handoff = false;
     spin_init(&g_tasks_lock);
+    spin_init(&g_switch_lock);
 
     task_t *idle = kzalloc(sizeof *idle);
     idle->pid = 0;
@@ -547,10 +612,45 @@ task_t *sched_fork(task_t *parent, cpu_regs_t *frame) {
 /* the switch                                                          */
 /* ------------------------------------------------------------------ */
 
+static u64 switch_to_idle(u64 current_rsp);
+
 static u64 switch_to(task_t *next, u64 current_rsp) {
     cpu_local_t *c = get_cpu_local();
     task_t *cur = c->ap_current;
     if (cur == next) return current_rsp;
+    /* Serialize the whole switch against sched_kill()/reap() on other CPUs.
+     * A task popped from a runqueue is "in flight" from that pop until
+     * ap_current is set here.  If another CPU killed it in that window and
+     * freed its PML4/kstack (they saw it not-running), we would either
+     * resume a freed+zeroed frame (iretq into RIP=0) or load a freed PML4
+     * into CR3 (the RIP=0x1/0x84/0xdc corrupt-frame panics).  kill/reap set
+     * state=ZOMBIE and free only while holding g_switch_lock, and we check
+     * state + set ap_current + load CR3 under the SAME lock, so the two can
+     * never interleave. */
+    u64 fl = irq_save();
+    spin_lock(&g_switch_lock);
+    /* Refuse ONLY a zombie.  A READY task is normal, a RUNNING task is
+     * transient (cur), and a BLOCKED task legitimately appears on a
+     * runqueue for a moment: sched_wake_sleepers() does rq_push() BEFORE
+     * the state=READY store, so the target CPU's own timer tick can pop a
+     * still-BLOCKED sleeper in that window.  Dropping it there would lose
+     * the task.  Only a ZOMBIE must never be resumed (its PML4/stack may
+     * already be freed by kill/reap - the same window the lock closes). */
+    if (next->state == TASK_ZOMBIE) {
+        /* Killed while in flight: drop it (the orphan reaper reclaims it).
+         * `cur` was already re-queued/parked by the caller (sched_preempt
+         * rotation / sched_switch_after yield), so hand the CPU to the
+         * idle fallback, which will pop `cur` back normally. */
+        if (cur && cur->state == TASK_RUNNING) cur->state = TASK_READY;
+        spin_unlock(&g_switch_lock);
+        irq_restore(fl);
+        if (c->cpu_id == 0) {
+            if (g_idle_task && g_idle_task != cur)
+                return switch_to(g_idle_task, current_rsp);
+            return current_rsp;
+        }
+        return switch_to_idle(current_rsp);
+    }
     if (cur) {
         /* save the FPU/SSE state of whoever we are leaving, restore the
          * next task's - otherwise floats leak between tasks */
@@ -571,7 +671,10 @@ static u64 switch_to(task_t *next, u64 current_rsp) {
      * (BSP: selector 0x28; AP: its own 0x38 TSS - per-CPU RSP0). */
     tss_set_rsp0(next->kstack_top);
 
-    return next->saved_rsp;            /* the stub iretq's into this frame */
+    u64 rsp = next->saved_rsp;         /* the stub iretq's into this frame */
+    spin_unlock(&g_switch_lock);
+    irq_restore(fl);
+    return rsp;
 }
 
 /* AP: hand the CPU back to the idle loop.  current_rsp is this ISR's frame
@@ -770,11 +873,13 @@ static task_t *sched_steal_pop(cpu_local_t *c) {
 /* Called by an AP's idle loop when its queue is empty: try to steal work,
  * and if successful poke ourselves so the interrupt path switches to it. */
 void sched_ap_steal(cpu_local_t *c) {
-    if (!c) return;
-    task_t *t = sched_steal_pop(c);
-    if (!t) return;
-    rq_push(c, t);
-    lapic_send_ipi(c->ap_lapic_id, AP_WAKE_VEC);
+    (void)c;
+    /* Work-stealing is DISABLED.  Popping a task from another CPU's queue
+     * (then re-pushing it) raced with the wake/switch paths and could leave
+     * a task running on one CPU while queued on another - the root cause of
+     * the intermittent scheduler wedge.  Load-balancing is an optimization;
+     * without it tasks just stay on the CPU they were placed on, which is
+     * correct (just not perfectly balanced). */
 }
 
 /* ------------------------------------------------------------------ */
@@ -796,9 +901,6 @@ u64 sched_tick(u64 current_rsp) {
             watchdog_tick();
     }
     if (!cur) {
-        /* this CPU is idle (an AP in its loop): run a parked/queued task
-         * if any.  Remember the idle frame so we can iretq back when it
-         * finishes. */
         task_t *next = idle_pop(c);
         if (next) {
             c->ap_idle_rsp = current_rsp;
@@ -807,7 +909,7 @@ u64 sched_tick(u64 current_rsp) {
         return current_rsp;
     }
     if (cur->is_user) {
-        if (cur->sig_pending) {
+            if (cur->sig_pending) {
             /* Only deliver when the interrupted frame is a USER frame.
              * If the tick landed mid-syscall (kernel frame: cs=0x08), the
              * saved state is kernel state - running the user handler on
@@ -837,6 +939,29 @@ u64 sched_tick(u64 current_rsp) {
 /* Called after a syscall or fault on THIS cpu: if the current task asked to
  * yield, block or exit, switch away now instead of waiting for the next
  * tick. */
+/* Recover from a corrupted-context kernel fault (e.g. an SMEP violation from
+ * a bad iretq frame): drop the current context and hand the CPU to its idle
+ * fallback.  A user task whose frame is corrupt is marked ZOMBIE (it can
+ * never resume sanely); a kernel task just yields the CPU.  Returns the
+ * frame to resume (idle/desktop). */
+u64 sched_fault_recover(u64 current_rsp) {
+    cpu_local_t *c = get_cpu_local();
+    task_t *cur = c->ap_current;
+    if (cur && cur->is_user && cur->pid != 0) {
+        cur->state = TASK_ZOMBIE;
+        cur->exit_status = -11;
+        kprintf("sched: fault-recover: task %u '%s' dropped (corrupt frame)\n",
+                cur->pid, cur->name);
+        /* the parent (wm) polls waitpid and the orphan reaper will reap it */
+    }
+    if (c->cpu_id == 0) {
+        if (g_idle_task && g_idle_task != cur)
+            return switch_to(g_idle_task, current_rsp);
+        return current_rsp;
+    }
+    return switch_to_idle(current_rsp);
+}
+
 u64 sched_after_isr(u64 current_rsp) {
     cpu_local_t *c = get_cpu_local();
     task_t *cur = c->ap_current;
@@ -957,14 +1082,40 @@ static bool task_running_anywhere(task_t *t) {
     return false;
 }
 
-static void reap(task_t *t) {
-    if (t->pml4 && t->pml4 != vmm_kernel_pml4())
-        vmm_free_pml4(t->pml4);
-    free_kstack(t->kstack_top);
+static bool reap(task_t *t) {
+    /* Freeing the PML4 + kernel stack must be atomic w.r.t. switch_to on
+     * other CPUs: if a switch is in flight (popped t, not yet ap_current),
+     * its caller-side running-check raced us and it will load a freed PML4
+     * or resume a freed stack.  Re-check under g_switch_lock and defer if
+     * the task is now on a CPU. */
+    {
+        u64 fl = irq_save();
+        spin_lock(&g_switch_lock);
+        if (task_running_anywhere(t)) {
+            spin_unlock(&g_switch_lock);
+            irq_restore(fl);
+            return false;              /* in-flight switch: try again later */
+        }
+        if (t->pml4 && t->pml4 != vmm_kernel_pml4())
+            vmm_free_pml4(t->pml4);
+        free_kstack(t->kstack_top);
+        spin_unlock(&g_switch_lock);
+        irq_restore(fl);
+    }
     task_remove(t);
     wm_surface_owner_died(t->pid);   /* free any window surfaces it owned */
     kprintf("sched: reaped task [%u] '%s'\n", t->pid, t->name);
-    kfree(t);
+    /* DO NOT kfree(t).  A task that was "in flight" (popped from a runqueue
+     * by one CPU, not yet resumed by switch_to on that CPU) still holds a
+     * pointer to this struct.  switch_to re-reads next->state under
+     * g_switch_lock to refuse zombies - if we free the struct here and the
+     * heap reuses it, that state read sees garbage and switch_to resumes a
+     * freed task (the RIP=user-addr / RIP=0xdc / #GP err=0x5000 crashes).
+     * Leaking the few-hundred-byte task struct is the standard, safe
+     * choice; the PML4 + kstack above ARE reclaimed. */
+    t->kstack_top = 0;
+    g_leaked_tasks++;
+    return true;
 }
 
 #define SIG_KILL 9
@@ -974,6 +1125,50 @@ int sched_signal(u32 pid, u32 sig) {
     if (sig == 0) return 0;                 /* existence probe */
     if (sig >= 32) return -1;               /* POSIX signal range      */
     if (sig == SIG_KILL) return sched_kill(pid);
+    /* ---- job control: SIGSTOP / SIGCONT ---- */
+    if (sig == 19) {                        /* SIGSTOP: pause the task */
+        bool running = false;
+        /* take it off any runqueue / parked slot */
+        if (t->rq_cpu) rq_remove(t->rq_cpu, t);
+        for (u32 i = 0; i < 8; i++) {
+            cpu_local_t *o = (i == 0) ? bsp_cpu_local() : smp_get_ap_area(i);
+            if (o && o->ap_next == t) o->ap_next = NULL;
+        }
+        {
+            u64 fl = irq_save();
+            spin_lock(&g_switch_lock);
+            if (t->state == TASK_RUNNING || t->state == TASK_READY)
+                t->state = TASK_STOPPED;
+            for (u32 i = 0; i < 8; i++) {
+                cpu_local_t *o = (i == 0) ? bsp_cpu_local() : smp_get_ap_area(i);
+                if (o && o->ap_current == t) { running = true; break; }
+            }
+            spin_unlock(&g_switch_lock);
+            irq_restore(fl);
+        }
+        if (running) {
+            for (u32 i = 0; i < 8; i++) {
+                cpu_local_t *o = (i == 0) ? bsp_cpu_local() : smp_get_ap_area(i);
+                if (o && o->ap_current == t) {
+                    lapic_send_ipi(o->ap_lapic_id, AP_WAKE_VEC);   /* switch away */
+                    break;
+                }
+            }
+        }
+        kprintf("sched: SIGSTOP pid %u '%s'\n", t->pid, t->name);
+        return 0;
+    }
+    if (sig == 18) {                        /* SIGCONT: resume a stopped task */
+        if (t->state == TASK_STOPPED) {
+            cpu_local_t *target = smp_least_loaded();
+            if (!target) target = get_cpu_local();
+            rq_push(target, t);
+            __atomic_store_n(&t->state, TASK_READY, __ATOMIC_RELEASE);
+            lapic_send_ipi(target->ap_lapic_id, AP_WAKE_VEC);
+            kprintf("sched: SIGCONT pid %u '%s'\n", t->pid, t->name);
+        }
+        return 0;
+    }
     if (t->sig_blocked & (1ULL << sig)) return 0;
     t->sig_pending |= (1ULL << sig);
     kprintf("sched: signal %u pending for pid %u\n", sig, t->pid);
@@ -1003,15 +1198,27 @@ int sched_kill(u32 pid) {
         irq_restore(fl);
     }
     /* free its address space NOW if it is not running on some CPU (a
-     * running task's CR3 still points at its PML4 - can't free that) */
-    bool running = false;
-    for (u32 i = 0; i < 8; i++) {
-        cpu_local_t *o = (i == 0) ? bsp_cpu_local() : smp_get_ap_area(i);
-        if (o && o->ap_current == t) { running = true; break; }
-    }
-    if (!running && t->pml4 && t->pml4 != vmm_kernel_pml4()) {
-        vmm_free_pml4(t->pml4);
-        t->pml4 = NULL;
+     * running task's CR3 still points at its PML4 - can't free that).
+     * The state=ZOMBIE + running-check + free must be atomic w.r.t. the
+     * switch_to path on other CPUs (they set ap_current under the same
+     * g_switch_lock), otherwise an in-flight switch could load a PML4 we
+     * just freed. */
+    bool running;
+    {
+        u64 fl = irq_save();
+        spin_lock(&g_switch_lock);
+        t->state = TASK_ZOMBIE;
+        running = false;
+        for (u32 i = 0; i < 8; i++) {
+            cpu_local_t *o = (i == 0) ? bsp_cpu_local() : smp_get_ap_area(i);
+            if (o && o->ap_current == t) { running = true; break; }
+        }
+        if (!running && t->pml4 && t->pml4 != vmm_kernel_pml4()) {
+            vmm_free_pml4(t->pml4);
+            t->pml4 = NULL;
+        }
+        spin_unlock(&g_switch_lock);
+        irq_restore(fl);
     }
     /* if it IS running elsewhere, poke that CPU so it switches away now */
     if (running) {
@@ -1052,6 +1259,14 @@ int sched_waitpid(u32 pid, int *status_out, int flags) {
         irq_restore(fl);
         return -1;                        /* ECHILD */
     }
+    if (c->state == TASK_STOPPED) {
+        /* Job control: report the child as STOPPED (status -19) WITHOUT
+         * reaping it, so the shell can fg/bg it later. */
+        spin_unlock(&g_tasks_lock);
+        irq_restore(fl);
+        if (status_out) *status_out = -19;
+        return (int)c->pid;
+    }
     if (c->state != TASK_ZOMBIE) {
         if (flags & WNOHANG) {            /* non-blocking probe */
             spin_unlock(&g_tasks_lock);
@@ -1073,7 +1288,8 @@ int sched_waitpid(u32 pid, int *status_out, int flags) {
     if (task_running_anywhere(c)) return 0;/* zombie still switching away:
                                               don't free its stack/tables yet */
     if (status_out) *status_out = c->exit_status;
-    reap(c);
+    if (!reap(c)) return 0;               /* in-flight switch won the race:
+                                              orphan reaper will get it */
     return (int)c->pid;
 }
 
@@ -1084,7 +1300,7 @@ void sched_reap_orphans(void) {
         if (t->state == TASK_ZOMBIE && t->pid != 0 &&
             !task_running_anywhere(t) &&
             (t->ppid == 0 || sched_find(t->ppid) == NULL))
-            reap(t);
+            (void)reap(t);
         t = nx;
     }
 }

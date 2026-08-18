@@ -344,6 +344,8 @@ void interrupt_eoi(u8 vector) {
 
 bool apic_active(void) { return g_apic_active; }
 
+static bool g_lapic_enabled;
+bool apic_available(void){ return g_madt.present && lapic_present() && g_lapic_enabled; }
 void apic_init(void) {
     if (!g_madt.present) {
         kprintf("apic: no MADT - staying on 8259 PIC\n");
@@ -365,11 +367,12 @@ void apic_init(void) {
         kprintf("apic: LAPIC init failed - staying on 8259 PIC\n");
         return;
     }
+    g_lapic_enabled = true;
     lapic_mask_ext_ints();
     irq_register(SPURIOUS_VECTOR, lapic_spurious_irq);
 
     if (!ioapic_init(g_madt.ioapic_addr, g_madt.ioapic_gsi_base)) {
-        pic_unmask(0);
+        pic_unmask(0); pic_unmask(1);
         kprintf("apic: IOAPIC init failed - staying on 8259 PIC\n");
         return;
     }

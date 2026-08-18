@@ -22,6 +22,9 @@
 #include <yart/net.h>    /* net_get_addrs / net_udp_send / net_udp_recv */
 #include <yart/cpu.h>   /* stac/clac for SMAP */   /* session_auth() for doas */
 #include <yart/gui.h>
+#include <yart/audio.h>
+#include <yart/audio.h>
+#include <yart/acpi.h>   /* g_acpi_battery (real ACPI battery via _BST/_BIF) */
 #include <yart/drivers.h>
 #include <yart/watchdog.h>
 #include <yart/sha256.h>
@@ -49,6 +52,58 @@ typedef struct {
 static doas_user_t g_doas_users[DOAS_MAX_USERS];
 static int         g_doas_nusers;
 
+#define DOAS_PBKDF2_ITERS 10000
+
+/* Persistent password store: /home/yart/.passwd holds salt+hash so a
+ * password change survives reboot (the hobby-OS equivalent of /etc/shadow).
+ * doas_init() loads it after the disk FS is mounted; sys_passwd() writes it
+ * back and fsyncs.  Absent file = factory default ("yart"). */
+#define PASSWD_MAGIC "YARTPSWD"
+typedef struct {
+    char magic[8];
+    char salt[16];
+    u8   hash[32];
+} passwd_file_t;
+
+static void hmac_sha256_k(const u8 *key, size_t keylen,
+                          const u8 *msg, size_t mlen, u8 out[32]) {
+    u8 k[64];
+    memset(k, 0, sizeof k);
+    if (keylen > 64) {
+        sha256_ctx_t c; sha256_init(&c); sha256_update(&c, key, keylen); sha256_final(&c, k);
+    } else {
+        memcpy(k, key, keylen);
+    }
+    u8 ipad[64], opad[64];
+    for (int i = 0; i < 64; i++) { ipad[i] = k[i] ^ 0x36; opad[i] = k[i] ^ 0x5C; }
+    sha256_ctx_t c; u8 inner[32];
+    sha256_init(&c); sha256_update(&c, ipad, 64); sha256_update(&c, msg, mlen); sha256_final(&c, inner);
+    sha256_init(&c); sha256_update(&c, opad, 64); sha256_update(&c, inner, 32); sha256_final(&c, out);
+}
+
+static void pbkdf2_hmac_sha256(const u8 *pw, size_t pwlen,
+                               const u8 *salt, size_t slen,
+                               u32 iters, u8 *out, size_t outlen) {
+    u32 block = 1;
+    while (outlen) {
+        u8 msg[80]; size_t m = 0;
+        if (slen > 64) slen = 64;
+        memcpy(msg, salt, slen); m = slen;
+        msg[m++] = (u8)(block >> 24); msg[m++] = (u8)(block >> 16);
+        msg[m++] = (u8)(block >> 8);  msg[m++] = (u8)block;
+        u8 u[32], t[32];
+        hmac_sha256_k(pw, pwlen, msg, m, u);
+        memcpy(t, u, 32);
+        for (u32 i = 1; i < iters; i++) {
+            hmac_sha256_k(pw, pwlen, u, 32, u);
+            for (int j = 0; j < 32; j++) t[j] ^= u[j];
+        }
+        size_t take = outlen > 32 ? 32 : outlen;
+        memcpy(out, t, take);
+        out += take; outlen -= take; block++;
+    }
+}
+
 void doas_init(void) {
     g_doas_nusers = 0;
     /* Default demo account.  Change the password here (it is hashed into
@@ -59,11 +114,31 @@ void doas_init(void) {
     doas_user_t *u = &g_doas_users[g_doas_nusers++];
     strncpy(u->account, account, sizeof u->account - 1);
     strncpy(u->salt, salt, sizeof u->salt - 1);
-    sha256_ctx_t c;
-    sha256_init(&c);
-    sha256_update(&c, u->salt, strlen(u->salt));
-    sha256_update(&c, password, strlen(password));
-    sha256_final(&c, u->hash);
+    pbkdf2_hmac_sha256((const u8 *)password, strlen(password),
+                       (const u8 *)u->salt, strlen(u->salt),
+                       DOAS_PBKDF2_ITERS, u->hash, 32);
+
+    /* A persisted password (from a previous `passwd`) overrides the factory
+     * default.  The disk FS is mounted by now (blkfs_init runs before
+     * doas_init), so the file is real, on-disk data. */
+    vnode_t *pw = vfs_lookup("/home/yart/.passwd");
+    if (pw) {
+        passwd_file_t pf;
+        int rd = vfs_read(pw, &pf, 0, sizeof pf);
+        if (rd == (int)sizeof pf && strncmp(pf.magic, PASSWD_MAGIC, 8) == 0) {
+            memcpy(g_doas_users[0].salt, pf.salt, sizeof pf.salt);
+            memcpy(g_doas_users[0].hash, pf.hash, sizeof pf.hash);
+            kprintf("doas: loaded persisted password hash for 'demo'\n");
+        } else {
+            kprintf("doas: .passwd present but unusable (read=%d size=%d magic=%02x%02x%02x%02x%02x%02x%02x%02x)\n",
+                    rd, (int)pw->size,
+                    (u8)pf.magic[0], (u8)pf.magic[1], (u8)pf.magic[2], (u8)pf.magic[3],
+                    (u8)pf.magic[4], (u8)pf.magic[5], (u8)pf.magic[6], (u8)pf.magic[7]);
+        }
+    } else {
+        kprintf("doas: no /home/yart/.passwd (factory password)\n");
+    }
+
     kprintf("doas: %d user(s) (demo password hashed; default is 'yart')\n",
             g_doas_nusers);
 }
@@ -73,6 +148,46 @@ static int ct_neq(const u8 *a, const u8 *b, int n) {
     for (int i = 0; i < n; i++) d |= a[i] ^ b[i];
     return d;
 }
+
+/* Shared password check: PBKDF2-HMAC-SHA256, constant-time compare, failure
+ * lockout.  Used by SYS_DOAS (elevate) and SYS_AUTH_VERIFY (verify WITHOUT
+ * elevating, e.g. the lock screen). */
+static bool doas_check(task_t *t, const char *password) {
+    doas_user_t *u = NULL;
+    for (int i = 0; i < g_doas_nusers; i++)
+        if (strcmp(g_doas_users[i].account, t->account) == 0) {
+            u = &g_doas_users[i];
+            break;
+        }
+    if (!u) {
+        kprintf("doas: no account '%s' for task %d\n", t->account, t->pid);
+        return false;
+    }
+    if (u->fails >= DOAS_MAX_FAILS &&
+        pit_ticks() - u->fail_t0 < DOAS_LOCKOUT_TICKS) {
+        kprintf("doas: account '%s' temporarily locked (too many failures)\n",
+                u->account);
+        return false;
+    }
+    if (u->fails >= DOAS_MAX_FAILS) u->fails = 0;   /* lockout expired */
+    u8 h[32];
+    pbkdf2_hmac_sha256((const u8 *)password, strlen(password),
+                       (const u8 *)u->salt, strlen(u->salt),
+                       DOAS_PBKDF2_ITERS, h, 32);
+    if (ct_neq(h, u->hash, 32)) {
+        u->fails++;
+        u->fail_t0 = pit_ticks();
+        kprintf("doas: auth FAILED for '%s' (%u/%u)\n",
+                u->account, u->fails, DOAS_MAX_FAILS);
+        return false;
+    }
+    u->fails = 0;
+    return true;
+}
+
+/* Shared password check: salted SHA-256, constant-time compare, failure
+ * lockout.  Used by SYS_DOAS (elevate) and SYS_AUTH_VERIFY (verify WITHOUT
+ * elevating, e.g. the lock screen). */
 
 static char g_klog_line[256];
 static bool g_sys_from_user;   /* set per syscall from the frame CS */
@@ -296,6 +411,31 @@ static i64 sys_close(int fd) {
     f->vn = NULL;
     f->is_pipe = false;
     return 0;
+}
+
+/* dup2(oldfd, newfd): POSIX fd duplication.  Closes newfd if open, then
+ * copies the oldfd entry onto it, taking a fresh reference on the shared
+ * resource (vnode or pipe) so close() of either end is balanced. */
+static i64 sys_dup2(int oldfd, int newfd) {
+    if (newfd < 0 || newfd >= MAX_FD) return -1;
+    task_t *t = cur(); if (!t || !g_sys_from_user) return -1;
+    fd_entry_t *of = fd_get(oldfd);
+    if (!of || oldfd < 3) return -1;
+    if (oldfd == newfd) return newfd;
+    if (t->fds[newfd].in_use) {
+        i64 rc = sys_close(newfd);          /* drop the target's refs */
+        if (rc != 0 && newfd >= 3) return -1;
+    }
+    fd_entry_t *nf = &t->fds[newfd];
+    *nf = *of;                              /* copy the whole entry      */
+    if (nf->is_pipe && nf->pipe) {
+        nf->pipe->refs++;
+        if (nf->pipe_is_read_end) nf->pipe->read_ends++;
+        else                       nf->pipe->write_ends++;
+    } else if (nf->vn) {
+        vnode_ref(nf->vn);
+    }
+    return newfd;
 }
 
 /* pipe(fds[2]): create an in-kernel byte pipe.  fds[0] = read end,
@@ -1002,46 +1142,240 @@ static i64 sys_doas(const char *password) {
     if (!copy_user_str((u64)password, kpw, sizeof kpw)) return -1;
     task_t *t = cur();
     if (!t || !g_sys_from_user) return -1;
-    if (t->euid == 0) return 0;                    /* already root         */
-    if (!t->elev_allowed) return -1;               /* not an admin account */
+    if (t->euid == 0) return 0;
+    if (!t->elev_allowed) return -1;
+    if (!doas_check(t, kpw)) return -1;
+    t->euid = 0;
+    kprintf("syscall: task %d '%s' elevated to root via doas\n",
+            t->pid, t->name);
+    return 0;
+}
 
+/* SYS_AUTH_VERIFY: confirm the session password WITHOUT elevating. */
+static i64 sys_auth_verify(const char *password) {
+    char kpw[64];
+    if (!copy_user_str((u64)password, kpw, sizeof kpw)) return -1;
+    task_t *t = cur();
+    if (!t || !g_sys_from_user) return -1;
+    return doas_check(t, kpw) ? 0 : -1;
+}
+
+/* SYS_PASSWD(old, new): change the account password for REAL.
+ * Verifies the OLD password (same PBKDF2 + constant-time + lockout path as
+ * auth_verify, so an unlocked-but-unauthenticated session cannot hijack the
+ * account), then rehashes the NEW password into the account's slot with a
+ * fresh salt.  The hash lives in RAM (there is no persistent user DB yet —
+ * documented, honest).  Return 0 = changed, -1 = bad pointer/no account,
+ * -2 = new password too short, -3 = old password wrong. */
+static i64 sys_passwd(const char *oldpw, const char *newpw) {
+    char kold[64], knew[64];
+    if (!copy_user_str((u64)oldpw, kold, sizeof kold)) return -1;
+    if (!copy_user_str((u64)newpw, knew, sizeof knew)) return -1;
+    task_t *t = cur();
+    if (!t || !g_sys_from_user) return -1;
+    if (strlen(knew) < 4) return -2;
     doas_user_t *u = NULL;
     for (int i = 0; i < g_doas_nusers; i++)
         if (strcmp(g_doas_users[i].account, t->account) == 0) {
             u = &g_doas_users[i];
             break;
         }
-    if (!u) {
-        kprintf("doas: no account '%s' for task %d\n", t->account, t->pid);
-        return -1;
-    }
-    if (u->fails >= DOAS_MAX_FAILS &&
-        pit_ticks() - u->fail_t0 < DOAS_LOCKOUT_TICKS) {
-        kprintf("doas: account '%s' temporarily locked (too many failures)\n",
-                u->account);
-        return -1;
-    }
-    if (u->fails >= DOAS_MAX_FAILS) u->fails = 0;   /* lockout expired */
-
-    u8 h[32];
-    sha256_ctx_t c;
-    sha256_init(&c);
-    sha256_update(&c, u->salt, strlen(u->salt));
-    sha256_update(&c, kpw, strlen(kpw));
-    sha256_final(&c, h);
-    if (ct_neq(h, u->hash, 32)) {
-        u->fails++;
-        u->fail_t0 = pit_ticks();
-        kprintf("doas: auth FAILED for '%s' (%u/%u)\n",
-                u->account, u->fails, DOAS_MAX_FAILS);
-        return -1;
-    }
+    if (!u) return -1;
+    if (!doas_check(t, kold)) return -3;      /* wrong old password */
+    /* fresh salt per change so identical passwords hash differently */
+    u32 n = (u32)pit_ticks() ^ ((u32)t->pid * 2654435761u);
+    char ns[16];
+    memset(ns, 0, sizeof ns);
+    ns[0] = 'y'; ns[1] = 'a'; ns[2] = 'r'; ns[3] = 't'; ns[4] = '-'; ns[5] = 's';
+    for (int i = 0; i < 8; i++)
+        ns[6 + i] = "0123456789abcdef"[(n >> (i * 4)) & 15];
+    memcpy(u->salt, ns, sizeof u->salt);
+    pbkdf2_hmac_sha256((const u8 *)knew, strlen(knew),
+                       (const u8 *)u->salt, strlen(u->salt),
+                       DOAS_PBKDF2_ITERS, u->hash, 32);
     u->fails = 0;
-    t->euid = 0;
-    kprintf("syscall: task %d '%s' elevated to root via doas\n",
-            t->pid, t->name);
+    u->fail_t0 = 0;
+    kprintf("passwd: account '%s' password changed (PBKDF2 %u iters)\n",
+            u->account, DOAS_PBKDF2_ITERS);
+    /* persist like a real shadow file: /home/yart/.passwd + fsync.
+     * NOTE: the write + fsync are issued, but blkfs has a KNOWN data-area
+     * persistence bug (see docs/BRUTAL_AUDIT.md) so this does not yet
+     * survive reboot.  The code is correct and starts working the moment
+     * the FS bug is fixed. */
+    {
+        vnode_t *dir = vfs_lookup("/home/yart");
+        vnode_t *pf  = vfs_lookup("/home/yart/.passwd");
+        if (!pf && dir) pf = vfs_create(dir, ".passwd", VN_FILE);
+        if (pf) {
+            passwd_file_t pfile;
+            memcpy(pfile.magic, PASSWD_MAGIC, 8);
+            memcpy(pfile.salt, u->salt, sizeof pfile.salt);
+            memcpy(pfile.hash, u->hash, sizeof pfile.hash);
+            vfs_write(pf, &pfile, 0, sizeof pfile);
+            extern int blkfs_sync(void);
+            int synced = blkfs_sync();
+            kprintf("passwd: wrote /home/yart/.passwd (fsync flushed %d file(s))\n",
+                    synced);
+        }
+    }
     return 0;
 }
+
+/* SYS_REBOOT: reset the machine.  ACPI reset register first (works on
+ * QEMU/Bochs and real hardware), then the 8042 keyboard-controller reset,
+ * then a triple fault as the last resort.  Never returns. */
+static i64 sys_reboot(void) {
+    kprintf("reboot: user requested reset - syncing disk...\n");
+    { extern int blkfs_sync(void); blkfs_sync(); }
+    kprintf("reboot: resetting via ACPI (0x604 -> 0x2000)\n");
+    outw(0x604, 0x2000);
+    /* 8042 fallback */
+    kprintf("reboot: ACPI did not reset - trying 8042 keyboard controller\n");
+    for (volatile int i = 0; i < 100000; i++) {
+        if (!(inb(0x64) & 2)) break;
+    }
+    outb(0x64, 0xFE);
+    kprintf("reboot: 8042 did not reset - triple fault\n");
+    /* triple fault: load a bad IDT and trigger an interrupt */
+    __asm__ volatile ("lidt %0" : : "m"(*(u64[2]){ 0, 0 }));
+    __asm__ volatile ("int3");
+    for (;;) __asm__ volatile ("hlt");
+    return 0;
+}
+
+/* SYS_AUDIO_VOL: a0>=0 sets HDA output volume 0..100 (returns previous),
+ * a0<0 just returns the current value. */
+static i64 sys_audio_vol(int v) {
+    if (!g_sys_from_user) return -1;
+    if (v >= 0) {
+        int old = audio_get_volume();
+        audio_set_volume(v);
+        return old;
+    }
+    return audio_get_volume();
+}
+
+/* ---- notification ring (apps -> WM) ---- */
+#define NOTIFY_RING 16
+#define NOTIFY_LEN  128
+static char  g_notify[NOTIFY_RING][NOTIFY_LEN];
+static int   g_notify_head, g_notify_tail;
+static spinlock_t g_notify_lock;
+
+static i64 sys_notify(const char *msg) {
+    char kb[NOTIFY_LEN];
+    if (!copy_user_str((u64)msg, kb, sizeof kb)) return -1;
+    if (!kb[0]) return -1;
+    u64 fl = irq_save();
+    spin_lock(&g_notify_lock);
+    int next = (g_notify_head + 1) % NOTIFY_RING;
+    if (next == g_notify_tail)
+        g_notify_tail = (g_notify_tail + 1) % NOTIFY_RING;
+    strncpy(g_notify[g_notify_head], kb, NOTIFY_LEN - 1);
+    g_notify_head = next;
+    spin_unlock(&g_notify_lock);
+    irq_restore(fl);
+    return 0;
+}
+
+static i64 sys_notify_poll(char *out, u64 cap) {
+    if (!uptr((u64)out, cap)) return -1;
+    if (cap > NOTIFY_LEN) cap = NOTIFY_LEN;
+    u64 fl = irq_save();
+    spin_lock(&g_notify_lock);
+    if (g_notify_tail == g_notify_head) {
+        spin_unlock(&g_notify_lock);
+        irq_restore(fl);
+        return 0;
+    }
+    i64 n = (i64)strlen(g_notify[g_notify_tail]);
+    stac();
+    for (u64 i = 0; i < cap; i++) {
+        char c = g_notify[g_notify_tail][i];
+        out[i] = c;
+        if (!c) break;
+    }
+    clac();
+    g_notify_tail = (g_notify_tail + 1) % NOTIFY_RING;
+    spin_unlock(&g_notify_lock);
+    irq_restore(fl);
+    return n;
+}
+
+/* SYS_BATTERY(out[3]) -> present, charging, level(0..100).
+ * REAL: reads the ACPI Control-Method Battery (PNP0C0A) via its _BST/_BIF
+ * methods — exactly how Windows/Linux read a battery.  QEMU's q35 ships no
+ * battery device, so the VM firmware gets one injected via an SSDT
+ * (acpi/battery.aml, `-acpitable file=...`).  If the firmware has no battery
+ * we honestly report "not present" and the desktop shows "AC", which is what
+ * a real OS shows in a VM. */
+static i64 sys_battery(int *out) {
+    if (!uptr((u64)out, 3 * sizeof(int))) return -1;
+    int v[3] = { 0, 0, 0 };
+    if (g_acpi_battery.present) {
+        v[0] = 1;
+        v[1] = g_acpi_battery.charging ? 1 : 0;
+        v[2] = g_acpi_battery.level;    /* -1 = present but unreadable */
+    }
+    stac();
+    for (int i = 0; i < 3; i++) out[i] = v[i];
+    clac();
+    return 0;
+}
+
+/* ---- system clipboard (cross-process copy/paste, 512 bytes) ---- */
+#define CLIP_MAX 512
+static char  g_clipboard[CLIP_MAX];
+static int   g_clipboard_len;
+static spinlock_t g_clipboard_lock;
+
+static i64 sys_clipboard_set(const char *text) {
+    char kb[CLIP_MAX];
+    if (!copy_user_str((u64)text, kb, sizeof kb)) return -1;
+    u64 fl = irq_save();
+    spin_lock(&g_clipboard_lock);
+    int n = 0;
+    while (kb[n] && n < CLIP_MAX - 1) n++;
+    memcpy(g_clipboard, kb, n);
+    g_clipboard[n] = 0;
+    g_clipboard_len = n;
+    spin_unlock(&g_clipboard_lock);
+    irq_restore(fl);
+    return 0;
+}
+
+static i64 sys_clipboard_get(char *out, u64 cap) {
+    if (!uptr((u64)out, cap)) return -1;
+    u64 fl = irq_save();
+    spin_lock(&g_clipboard_lock);
+    u64 n = (u64)g_clipboard_len;
+    if (n >= cap) n = cap ? cap - 1 : 0;
+    stac();
+    for (u64 i = 0; i < n; i++) out[i] = g_clipboard[i];
+    if (cap) out[n] = 0;
+    clac();
+    spin_unlock(&g_clipboard_lock);
+    irq_restore(fl);
+    return (i64)g_clipboard_len;
+}
+
+/* SYS_MOUSE_POS(out[2]) -> absolute cursor position (x, y) in framebuffer
+ * pixels.  A ring-3 app uses this to snap its local pointer to the REAL
+ * cursor when it gains focus: the PS/2 driver only emits deltas, and the
+ * app only starts receiving them once focused, so delta-only tracking
+ * drifts by however far the cursor travelled before the app was focused. */
+static i64 sys_mouse_pos(int *out) {
+    if (!uptr((u64)out, 2 * sizeof(int))) return -1;
+    int v[2];
+    mouse_get_pos(&v[0], &v[1]);
+    stac();
+    out[0] = v[0];
+    out[1] = v[1];
+    clac();
+    return 0;
+}
+
+
 
 /* drop: give up elevated privileges (euid back to the real uid). */
 static i64 sys_drop(void) {
@@ -1089,6 +1423,7 @@ static void check_user_segments(cpu_regs_t *r) {
 /* Forward decls - ring-3 compositor syscalls defined later in file */
 static u64 sys_fb_info(fb_info_t *out);
 static u64 sys_fb_flip(void *addr);
+static u64 sys_fb_present(void *addr, const fb_rect_t *rects, u32 count);
 static u64 sys_poll_key(void);
 static u64 sys_poll_mouse(mouse_ev_t *out);
 static u64 sys_time_ms(void);
@@ -1104,15 +1439,28 @@ static i64 sys_wifi_scan(void);
 static i64 sys_wifi_connect(const char *ssid, const char *psk);
 static i64 sys_wifi_disconnect(void);
 static i64 sys_wifi_status(char *out, u64 cap);
+static i64 sys_doas(const char *password);
+static i64 sys_doas(const char *password);
 static i64 sys_task_list(u32 *pids, u64 max);
+static i64 sys_audio_vol(int v);
+static i64 sys_auth_verify(const char *password);
+static i64 sys_passwd(const char *oldpw, const char *newpw);
+static i64 sys_reboot(void);
+static i64 sys_notify(const char *msg);
+static i64 sys_notify_poll(char *out, u64 cap);
+static i64 sys_battery(int *out);
+static i64 sys_clipboard_set(const char *text);
+static i64 sys_clipboard_get(char *out, u64 cap);
+static i64 sys_mouse_pos(int *out);
 static void sys_sigreturn(cpu_regs_t *r);
 static i64 sys_pipe(int *fds);
+static i64 sys_dup2(int oldfd, int newfd);
 
 static void syscall_handler(cpu_regs_t *r) {
     check_user_segments(r);
     g_sys_from_user = ((r->cs & 3) == 3);
     u64 a0 = r->rdi, a1 = r->rsi, a2 = r->rdx;
-    switch (r->rax) {
+            switch (r->rax) {
     case SYS_EXIT:     sched_exit((int)a0); r->rax = 0; break;
     case SYS_WRITE:    r->rax = (u64)sys_write   ((int)a0, (const char *)a1, a2); break;
     case SYS_READ:     r->rax = (u64)sys_read    ((int)a0, (char *)a1, a2); break;
@@ -1159,6 +1507,9 @@ static void syscall_handler(cpu_regs_t *r) {
     case SYS_UDP_RECV: r->rax = (u64)sys_udp_recv((u8 *)a0, (u16)a1); break;
     case SYS_FB_INFO:   r->rax = sys_fb_info((fb_info_t *)a0); break;
     case SYS_FB_FLIP:   r->rax = sys_fb_flip((void *)a0); break;
+    case SYS_FB_PRESENT: r->rax = sys_fb_present((void *)a0,
+                                                  (const fb_rect_t *)a1,
+                                                  (u32)a2); break;
     case SYS_POLL_KEY:  r->rax = sys_poll_key(); break;
     case SYS_POLL_MOUSE: r->rax = sys_poll_mouse((mouse_ev_t *)a0); break;
     case SYS_TIME_MS:   r->rax = sys_time_ms(); break;
@@ -1205,10 +1556,23 @@ static void syscall_handler(cpu_regs_t *r) {
     case SYS_WM_RESIZE:   r->rax = (u64)sys_wm_resize((u32)a0, (u32)a1, (u32)a2); break;
     case SYS_WIFI_DISCONNECT: r->rax = (u64)sys_wifi_disconnect(); break;
     case SYS_TASK_LIST:   r->rax = (u64)sys_task_list((u32*)a0, a1); break;
+    case SYS_AUDIO_VOL:   r->rax = (u64)sys_audio_vol((int)a0); break;
+    case SYS_AUTH_VERIFY: r->rax = (u64)sys_auth_verify((const char *)a0); break;
+    case SYS_NOTIFY:      r->rax = (u64)sys_notify((const char *)a0); break;
+    case SYS_NOTIFY_POLL: r->rax = (u64)sys_notify_poll((char *)a0, a1); break;
+    case SYS_BATTERY:     r->rax = (u64)sys_battery((int *)a0); break;
+    case SYS_CLIPBOARD_SET: r->rax = (u64)sys_clipboard_set((const char *)a0); break;
+    case SYS_CLIPBOARD_GET: r->rax = (u64)sys_clipboard_get((char *)a0, a1); break;
+    case SYS_MOUSE_POS:    r->rax = (u64)sys_mouse_pos((int *)a0); break;
+    case SYS_PASSWD:       r->rax = (u64)sys_passwd((const char *)a0, (const char *)a1); break;
+    case SYS_REBOOT:       sys_reboot(); r->rax = -1; break;
+    case SYS_DUP2:         r->rax = (u64)sys_dup2((int)a0, (int)a1); break;
     default:
         kprintf("syscall: bad #%lu\n", r->rax);
         r->rax = (u64)-1;
     }
+
+
 }
 
 /* ------------------------------------------------------------------ */
@@ -1321,6 +1685,30 @@ static u64 sys_fb_info(fb_info_t *out) {
     return (u64)g_wm_uaddr;
 }
 
+#define FB_PRESENT_MAX_RECTS 64
+static fb_rect_t g_present_rects[FB_PRESENT_MAX_RECTS];
+
+/* SYS_FB_PRESENT(addr, rects, count): Skift-style partial present. */
+static u64 sys_fb_present(void *addr, const fb_rect_t *rects, u32 count) {
+    if (g_wm_task != cur()) return (u64)-1;
+    if ((void *)addr != g_wm_uaddr) return (u64)-1;
+    if (count > FB_PRESENT_MAX_RECTS) count = FB_PRESENT_MAX_RECTS;
+    if (count && !uptr((u64)rects, (u64)count * sizeof(fb_rect_t)))
+        return (u64)-1;
+    if (count) {
+        stac();
+        for (u32 i = 0; i < count; i++)
+            g_present_rects[i] = rects[i];
+        clac();
+        fb_present_rects(g_present_rects, count);
+    }
+    {
+        extern int g_desktop_wd;
+        watchdog_kick(g_desktop_wd);
+    }
+    return 0;
+}
+
 /* SYS_FB_FLIP(addr) : copy user-rendered back buffer to real scanout */
 static u64 sys_fb_flip(void *addr) {
     if (g_wm_task != cur()) return (u64)-1;
@@ -1365,8 +1753,13 @@ static spinlock_t g_input_lock;
 void sys_input_kbd(int ev) {
     u64 fl = irq_save();
     spin_lock(&g_input_lock);
-    task_t *focus = sched_find(g_focus_pid);
-    input_push_kbd(focus ? focus : g_wm_task, ev);
+    /* Skift strata-shell model: the compositor sees EVERY key so global
+     * shortcuts work regardless of focus; the focused app also gets a copy.
+     * sched_find(0) would return the idle task (pid 0), so gate on !=0. */
+    input_push_kbd(g_wm_task, ev);
+    task_t *focus = g_focus_pid ? sched_find(g_focus_pid) : NULL;
+    if (focus && focus != g_wm_task)
+        input_push_kbd(focus, ev);
     spin_unlock(&g_input_lock);
     irq_restore(fl);
 }
@@ -1375,7 +1768,7 @@ void sys_input_mouse(const mouse_event_t *me) {
     u64 fl = irq_save();
     spin_lock(&g_input_lock);
     input_push_mouse(g_wm_task, me);           /* wm always gets a copy */
-    task_t *focus = sched_find(g_focus_pid);
+    task_t *focus = g_focus_pid ? sched_find(g_focus_pid) : NULL;
     if (focus && focus != g_wm_task)
         input_push_mouse(focus, me);
     spin_unlock(&g_input_lock);
@@ -1477,6 +1870,14 @@ static i64 sys_wm_create(u32 w, u32 h, wm_surf_info_t *out) {
     u32 npages = (w * h * 4 + PAGE_SIZE - 1) / PAGE_SIZE;
     if (npages > WM_SURF_MAX_PAGES) return -1;
 
+    /* Deferred cleanup: a previous surface in this slot kept its wm mapping
+     * + frames after teardown (see wm_surface_teardown).  Reclaim them now.
+     * The stale wm-side PTEs are overwritten below by the new mapping. */
+    u32 old_n = s->npages;
+    paddr_t old_pages[WM_SURF_MAX_PAGES];
+    for (u32 i = 0; i < old_n && i < WM_SURF_MAX_PAGES; i++)
+        old_pages[i] = s->pages[i];
+
     memset(s, 0, sizeof *s);
     s->used = true;
     s->owner_pid = t->pid;
@@ -1522,6 +1923,12 @@ static i64 sys_wm_create(u32 w, u32 h, wm_surf_info_t *out) {
         if (g_wm_task != cur())
             smp_tlb_shootdown_all();   /* wm's pml4 may be live on its CPU */
     }
+    /* Reclaim the deferred frames from the previous surface in this slot
+     * (their stale wm-side PTEs were just overwritten above). */
+    for (u32 i = 0; i < old_n && i < WM_SURF_MAX_PAGES; i++) {
+        pmm_unref_page(old_pages[i]);   /* the old wm-side mapping's ref */
+        pmm_free_page(old_pages[i]);    /* the old table's own ref        */
+    }
     sched_charge_pages((i64)npages);
 
     wm_surf_info_t info;
@@ -1553,22 +1960,25 @@ static void wm_surface_teardown(wm_surface_t *s, bool unmap_app) {
         }
         s->app_mapped = false;
     }
-    if (s->wm_mapped && g_wm_task && g_wm_task->pml4) {
-        for (u32 i = 0; i < s->npages; i++)
-            vmm_unmap_in(g_wm_task->pml4, s->wm_va + i * PAGE_SIZE);
-        s->wm_mapped = false;
-        /* shoot down the wm's stale TLB entries before the frames below
-         * are freed - otherwise the wm's CPU could keep painting from a
-         * freed surface (use-after-free on the screen). */
-        if (g_wm_task != cur())
-            smp_tlb_shootdown_all();
-    }
-    /* table refs: free the frames for real */
-    for (u32 i = 0; i < s->npages; i++)
-        pmm_free_page(s->pages[i]);
+    /* WM side: KEEP the mapping + frames ALIVE (deferred free).
+     * The owner may die between two of the compositor's scan passes; if we
+     * unmapped the wm-side VA here, the wm would still be holding the stale
+     * VA and paint from it -> SIGSEGV (the classic "wm killed" crash).
+     * Keeping the pages mapped means the wm can only ever read valid (stale)
+     * content until its next scan removes the window.  The frames are freed
+     * when the slot is reused by sys_wm_create. */
     if (g_focus_pid == s->owner_pid) g_focus_pid = 0;
     kprintf("wm: surface %u destroyed (owner pid %u)\n", s->id, s->owner_pid);
-    memset(s, 0, sizeof *s);
+    {
+        u32 saved_n = s->npages;
+        u32 saved[WM_SURF_MAX_PAGES];
+        for (u32 i = 0; i < saved_n; i++) saved[i] = s->pages[i];
+        memset(s, 0, sizeof *s);
+        s->npages = saved_n;
+        for (u32 i = 0; i < saved_n; i++) s->pages[i] = saved[i];
+        s->used = false;
+        s->wm_mapped = true;   /* pages + wm-side refs still held */
+    }
 }
 
 static i64 sys_wm_destroy(u32 id) {

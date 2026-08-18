@@ -101,11 +101,29 @@ static void check_hung_tasks(u64 now) {
         if (t->is_user && t->pid != 0 &&
             t->state == TASK_READY &&
             (now - t->last_sched) > HUNG_TASK_TIMEOUT_TICKS) {
-            kprintf("watchdog: task %u '%s' appears starved (un-scheduled "
-                    "for %llu ticks) - reported, not killed\n",
+            kprintf("watchdog: task %u '%s' starved (%llu ticks) - re-kicking\n",
                     t->pid, t->name, (unsigned long long)(now - t->last_sched));
-            g_wd_kills++;   /* counts reports here (kept for the stat name) */
+            g_wd_kills++;   /* counts recoveries here (kept for the stat name) */
             t->last_sched = now;   /* avoid re-reporting every second */
+            sched_kick_starved(t);   /* self-heal: re-queue + IPI */
+            /* DIAGNOSTIC: where is this task parked? */
+            sched_dump_sleepers();
+            {
+                extern cpu_local_t *bsp_cpu_local(void);
+                extern cpu_local_t *smp_get_ap_area(u32);
+                kprintf("watchdog-dbg: pid %u state=%d rq_cpu=%p\n",
+                        t->pid, t->state, (void *)t->rq_cpu);
+                for (u32 i = 0; i < 8; i++) {
+                    cpu_local_t *c = (i == 0) ? bsp_cpu_local() : smp_get_ap_area(i);
+                    if (!c) continue;
+                    kprintf("watchdog-dbg: cpu %u cur=%d next=%d rq=%u head=%d\n",
+                            i,
+                            c->ap_current ? (int)c->ap_current->pid : -1,
+                            c->ap_next ? (int)c->ap_next->pid : -1,
+                            (unsigned)c->ap_rq_count,
+                            c->ap_rq_head ? (int)c->ap_rq_head->pid : -1);
+                }
+            }
         }
         t = nx;
     }
@@ -116,6 +134,18 @@ void watchdog_tick(void) {
     u64 now = pit_ticks();
     check_services(now);
     check_hung_tasks(now);
+    /* Periodic writeback (Linux pdflush model): every ~2 s, flush dirty
+     * files to the disk so user data survives reboot WITHOUT every app
+     * having to call fsync() explicitly.  Runs on the BSP timer path;
+     * blkfs_sync() is IRQ-safe and a no-op when no disk is present. */
+    static u64 g_last_wb = 0;
+    if (now - g_last_wb >= 200) {
+        g_last_wb = now;
+        extern int blkfs_sync(void);
+        int n = blkfs_sync();
+        if (n > 0)
+            kprintf("vfs: auto-writeback flushed %d dirty file(s) to disk\n", n);
+    }
 }
 
 u64 watchdog_restart_count(void) { return g_wd_restarts; }

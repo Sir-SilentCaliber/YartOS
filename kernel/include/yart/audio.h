@@ -12,3 +12,5 @@ bool audio_present(void);
 u16  audio_codec_vendor_id(void);
 u16  audio_codec_device_id(void);
 u64  audio_stream_position(void);   /* bytes played by the output stream  */
+void audio_set_volume(int v);       /* 0..100, drives the DAC amp gain    */
+int  audio_get_volume(void);        /* last value applied to the amp      */

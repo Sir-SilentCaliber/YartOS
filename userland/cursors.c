@@ -5,20 +5,21 @@ extern char _binary_cursors_bin_start[];
 extern char _binary_cursors_bin_end[];
 
 static cursor_theme_t G_themes[CURSOR_THEME_COUNT];
-static const char *G_names[CURSOR_THEME_COUNT];
+static char G_names[CURSOR_THEME_COUNT][16];
 static int G_count;
 
 /* Blob pixels are R,G,B,A bytes; the renderer wants ARGB u32 words, so we
  * convert into static buffers at parse time. */
-static u32 G_rgb[CURSOR_THEME_COUNT][CURSOR_KIND_COUNT][32 * 32];
+static u32 G_rgb[CURSOR_THEME_COUNT][CURSOR_KIND_COUNT][48 * 48];
 
 int cursors_init(void) {
     const u8 *b = (const u8 *)_binary_cursors_bin_start;
     size_t size = (size_t)(_binary_cursors_bin_end - _binary_cursors_bin_start);
     if (size < 16) return 0;
     if (b[0] != 'Y' || b[1] != 'C' || b[2] != 'R' || b[3] != 'S') return 0;
-    unsigned n_themes = (unsigned)(b[4] | (b[5] << 8));
-    unsigned n_kinds  = (unsigned)(b[6] | (b[7] << 8));
+    /* header: "YCRS" u16 version u16 n_themes u16 n_kinds u16 pad */
+    unsigned n_themes = (unsigned)(b[6] | (b[7] << 8));
+    unsigned n_kinds  = (unsigned)(b[8] | (b[9] << 8));
     if (n_themes == 0 || n_themes > CURSOR_THEME_COUNT) return 0;
     if (n_kinds != CURSOR_KIND_COUNT) return 0;
 
@@ -30,14 +31,15 @@ int cursors_init(void) {
             char name[17];
             for (int i = 0; i < 16; i++) name[i] = (char)b[e + i];
             name[16] = 0;
-            if (t == 0 && k == 0) {
+            if (k == 0) {
                 /* entry name is "<theme>-<kind>"; strip the kind suffix
-                 * so the theme name matches the config value */
+                 * so the theme name matches the config value. Do this
+                 * for EVERY theme (G_names would otherwise be NULL and
+                 * crash cursors_theme_by_name). */
                 int len = 0;
                 while (name[len]) len++;
                 while (len > 0 && name[len-1] != '-') len--;
-                if (len > 0) name[len-1] = 0;
-                G_names[t] = name;
+                if (len > 0) { name[len-1] = 0; int k=0; while(name[k]){G_names[t][k]=name[k];k++;} G_names[t][k]=0; }
             }
             unsigned w  = (unsigned)(b[e+16] | (b[e+17] << 8));
             unsigned h  = (unsigned)(b[e+18] | (b[e+19] << 8));
@@ -50,7 +52,7 @@ int cursors_init(void) {
             if (w == 0 || h == 0 || w > 128 || h > 128) continue;
             size_t need = (size_t)w * h * 4;
             if (off + need > size) continue;
-            if (w * h > 32 * 32) continue;         /* renderer buffer cap */
+            if (w * h > 48 * 48) continue;         /* renderer buffer cap */
             im->w = (int)w; im->h = (int)h;
             im->hotx = (int)hx; im->hoty = (int)hy;
             /* convert RGBA bytes -> ARGB words */

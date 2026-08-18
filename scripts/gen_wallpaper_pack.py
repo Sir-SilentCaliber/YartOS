@@ -226,6 +226,15 @@ WALLPAPERS = [
 def main():
     blobs = []
     names = []
+    # The Skift desktop's default wallpaper (deep indigo abstract), scaled to
+    # the framebuffer. It is index 0 so the compositor boots with it.
+    skift_path = os.path.join(WP_DIR, "skift_abstract.png")
+    if os.path.exists(skift_path):
+        img = Image.open(skift_path).convert("RGB").resize((W, H), Image.LANCZOS)
+        img.save(os.path.join(WP_DIR, "abstract.png"), "PNG")
+        blobs.append(img_to_bgra(img))
+        names.append("abstract")
+        print(f"  + abstract: {skift_path} -> {W}x{H}")
     for name, fn, seed in WALLPAPERS:
         img = fn(seed)
         png_path = os.path.join(WP_DIR, f"{name}.png")

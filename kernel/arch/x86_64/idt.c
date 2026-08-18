@@ -153,6 +153,16 @@ static u64 page_fault(cpu_regs_t *r) {
         return kill_user_task("Page Fault", r->vector, err, (u64)r);
     }
 
+    /* Kernel-mode instruction fetch (err bit 4) from a USER address is an
+     * SMEP violation from a corrupted iretq/sysret frame - the kernel
+     * jumped into user code.  Recover by dropping the corrupt context and
+     * switching to the idle task instead of panicking the whole OS. */
+    if ((err & 0x10) && va < 0xffff800000000000ULL) {
+        kprintf("cpu: SMEP fault at va=%p - dropping corrupt context\\n",
+                (void *)va);
+        return sched_fault_recover((u64)r);
+    }
+
     cli();
     dump_exception(r);
     kprintf("vmm: kernel page fault at va=0x%lx (err=0x%lx)\n", va, err);

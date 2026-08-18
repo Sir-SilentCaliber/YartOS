@@ -107,6 +107,22 @@ u16 audio_codec_device_id(void) { return g_did; }
 bool audio_present(void)         { return g_up; }
 u64  audio_stream_position(void) { return g_played; }
 
+/* Real output-volume control: drives the codec's output-amp gain verb. */
+static int g_hda_vol = 100;
+void audio_set_volume(int v) {
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    g_hda_vol = v;
+    if (!g_up) return;
+    u16 gain = (u16)(((100 - v) * 80) / 100);
+    u16 payload = gain & 0x7F;
+    if (v == 0) payload |= 0x80;
+    verb(g_dac_node, V_SET_AMP_GAIN_MUTE, payload); verb_resp();
+    verb(g_pin_node, V_SET_AMP_GAIN_MUTE, payload); verb_resp();
+}
+int  audio_get_volume(void) { return g_hda_vol; }
+
+
 /* Generate a 440 Hz sine wave (A4) at 48 kHz / 16-bit / stereo.  We build a
  * single-period buffer (one full sine cycle) so that the DMA looping it
  * produces a continuous tone.  A 440 Hz wave at 48 kHz has 48000/440 ≈

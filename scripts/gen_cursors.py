@@ -10,8 +10,12 @@ Blob format (little-endian):
     offset 0:  "YCRS" u16 version=1 u16 n_themes u16 n_kinds u16 pad   (16 B)
     entries:   n_themes * n_kinds x { char name[16]; u16 w,h; u16 hotx,hoty; u32 off; }
     pixels:    RGBA rows, pitch = w*4, per entry at off
-Kinds are fixed: 0 = arrow, 1 = hand.
-File naming:  kora/cursors/<theme>-<kind>.png   (kind in {arrow, hand})
+Kinds are fixed: 0 = arrow, 1 = hand, 2 = resize.
+File naming:  kora/cursors/<theme>-<kind>.png   (kind in {arrow, hand, resize})
+
+A <theme>-<kind>.hot sidecar ("hotx,hoty") marks a cursor that must be
+packed at its EXACT native size with that exact hotspot (used for Skift's
+vector cursors, which are rasterised at their real 28-32px size).
 """
 import os, struct, sys
 
@@ -19,9 +23,9 @@ ROOT   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC    = os.path.join(ROOT, "kora", "cursors")
 OUT_B  = os.path.join(ROOT, "build", "cursors.bin")
 OUT_H  = os.path.join(ROOT, "build", "cursor_assets.h")
-SZ     = 32          # output cursor size (px)
-KINDS  = [("arrow", 0), ("hand", 1)]
-KIND_N = 2
+SZ     = 48          # default output cursor size (px)
+KINDS  = [("arrow", 0), ("hand", 1), ("resize", 2)]
+KIND_N = 3
 
 def main():
     from PIL import Image
@@ -55,6 +59,26 @@ def main():
                 entries.append((name, 1, 1, 0, 0, 0))
                 continue
             im = Image.open(fn).convert("RGBA")
+            hot_fn = os.path.join(SRC, f"{t}-{kind}.hot")
+            if os.path.exists(hot_fn):
+                # exact-size cursor with sidecar hotspot (e.g. Skift vectors)
+                hotx, hoty = (int(v) for v in open(hot_fn).read().strip().split(","))
+                w, h = im.size
+                if w > 128 or h > 128:
+                    print(f"cursor too large: {fn}", file=sys.stderr)
+                    missing += 1
+                    entries.append((name, 1, 1, 0, 0, 0))
+                    continue
+                px = im.load()
+                raw = bytearray()
+                for y in range(h):
+                    for x in range(w):
+                        r, g, b, a = px[x, y]
+                        raw += bytes((r, g, b, a))
+                off = len(bin_data)
+                bin_data += raw
+                entries.append((name, w, h, hotx, hoty, off))
+                continue
             bbox = im.getbbox()                # alpha bbox
             if not bbox:
                 missing += 1
@@ -102,6 +126,7 @@ def main():
         f.write(f"#define CURSOR_THEME_COUNT {len(themes)}\n")
         f.write("#define CURSOR_KIND_ARROW 0\n")
         f.write("#define CURSOR_KIND_HAND 1\n")
+        f.write("#define CURSOR_KIND_RESIZE 2\n")
         f.write(f"#define CURSOR_KIND_COUNT {KIND_N}\n")
         f.write(f"#define CURSOR_THEME_NAMES {{ {names} }}\n")
         f.write(f"#define CURSOR_SIZE {SZ}\n")

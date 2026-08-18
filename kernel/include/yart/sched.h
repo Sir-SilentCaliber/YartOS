@@ -39,7 +39,8 @@ typedef struct yart_pipe {
     int  write_ends;      /* open write-end fds                           */
 } yart_pipe_t;
 
-typedef enum { TASK_READY, TASK_RUNNING, TASK_BLOCKED, TASK_ZOMBIE } task_state_t;
+typedef enum { TASK_READY, TASK_RUNNING, TASK_BLOCKED, TASK_ZOMBIE,
+               TASK_STOPPED } task_state_t;   /* STOPPED = SIGSTOP'd (job control) */
 
 /* One process.  The scheduler saves/restores a full cpu_regs_t frame on each
  * task's private kernel stack; the frame is the one the ISR pushed, so a
@@ -97,6 +98,8 @@ typedef struct task {
 
 void    sched_init(void);
 task_t *sched_tasks(void);          /* head of the global all-tasks list   */
+void sched_dump_sleepers(void);     /* debug: dump the sleep queue          */
+void sched_kick_starved(task_t *t); /* self-heal a lost wake (requeue+IPI)  */
 task_t *sched_current(void);
 /* OOM killer (called from pmm_alloc_page when RAM is exhausted): kill the
  * user task holding the most physical pages so the OS survives. */
@@ -120,6 +123,7 @@ task_t *sched_fork(task_t *parent, cpu_regs_t *frame);   /* NULL on error */
 
 u64     sched_tick(u64 current_rsp);      /* timer IRQ: maybe preempt     */
 u64     sched_after_isr(u64 current_rsp); /* syscall/fault: maybe switch  */
+u64     sched_fault_recover(u64 rsp);      /* corrupt-frame fault: drop ctx */
 void    sched_yield(void);                /* cooperative hand-off         */
 void    sched_exit(int status);           /* zombie + wake parent; no ret */
 void    sched_idle_sleep(void);           /* idle hand-off then hlt       */

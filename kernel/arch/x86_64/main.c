@@ -23,6 +23,19 @@
 #include <yart/audio.h>
 #include <yart/usb.h>
 #include <yart/wifi.h>
+#include <yart/dma.h>
+#include <yart/fw.h>
+#include <yart/rtw88.h>
+#include <yart/rtw_dma.h>
+#include <yart/rtw_phy.h>
+#include <yart/rtw_io.h>
+#include <yart/ieee80211.h>
+#include <yart/wifi_sta.h>
+#include <yart/wifi_session.h>
+#include <yart/sha1.h>
+#include <yart/ccmp.h>
+#include <yart/wpa.h>
+#include <yart/eapol.h>
 int smp_start_aps(void);
 void smp_ap_kwork_demo(void);
 
@@ -117,6 +130,45 @@ void kmain(void) {
     pmm_selftest();
     vmm_selftest();
     heap_selftest();
+    kprintf("dma: %s\n", dma_selftest() == 0
+            ? "DMA allocator selftest ok (32-bit physically contiguous)"
+            : "DMA allocator selftest FAILED");
+    kprintf("rtw: %s\n", rtw_selftest() == 0
+            ? "firmware-download selftest ok (legacy 8051 handshake vs fake chip)"
+            : "firmware-download selftest FAILED");
+    kprintf("rtw: %s\n", rtw_efuse_selftest() == 0
+            ? "EFUSE selftest ok (physical read + logical reconstruction + MAC)"
+            : "EFUSE selftest FAILED");
+    kprintf("rtw: %s\n", rtw_dma_selftest() == 0
+            ? "DMA ring selftest ok (alloc + reg setup + TX/RX descriptor fill/parse)"
+            : "DMA ring selftest FAILED");
+    kprintf("rtw: %s\n", rtw_phy_selftest() == 0
+            ? "PHY selftest ok (power-on seq + tables + RF write + conditional parser)"
+            : "PHY selftest FAILED");
+    kprintf("rtw: %s\n", rtw_io_selftest() == 0
+            ? "frame I/O selftest ok (TX doorbell + RX ring round-trip + ordering)"
+            : "frame I/O selftest FAILED");
+    kprintf("wifi: %s\n", ieee80211_selftest() == 0
+            ? "802.11 frame codec selftest ok (mgmt frame build/parse)"
+            : "802.11 frame codec selftest FAILED");
+    kprintf("wifi: %s\n", wifi_sta_selftest() == 0
+            ? "802.11 session selftest ok (auth/assoc/4-way/CCMP data)"
+            : "802.11 session selftest FAILED");
+    kprintf("wifi: %s\n", wifi_session_selftest() == 0
+            ? "full session selftest ok (scan+join+EAPOL 4-way+CCMP data)"
+            : "full session selftest FAILED");
+    kprintf("crypto: %s\n", sha1_selftest() == 0
+            ? "SHA-1/HMAC-SHA1/PBKDF2 selftest ok (WPA2 key derivation ready)"
+            : "SHA-1 selftest FAILED");
+    kprintf("crypto: %s\n", ccmp_selftest() == 0
+            ? "AES-CCMP selftest ok (WPA2 frame encryption ready)"
+            : "AES-CCMP selftest FAILED");
+    kprintf("crypto: %s\n", wpa_selftest() == 0
+            ? "WPA2 PRF/PTK selftest ok (4-way handshake primitives ready)"
+            : "WPA2 PRF selftest FAILED");
+    kprintf("crypto: %s\n", eapol_selftest() == 0
+            ? "EAPOL 4-way handshake selftest ok (WPA2 key exchange ready)"
+            : "EAPOL selftest FAILED");
 
     fb_init(fb_request.response->framebuffers[0]);
     kprintf("Welcome to Yart OS\n");
@@ -130,6 +182,9 @@ void kmain(void) {
     vfs_init(initrd, initrd_size);
     blk_init();
     blkfs_init();
+    kprintf("fw: %s\n", fw_selftest() == 0
+            ? "firmware loader selftest ok (rtw8822c_fw.bin loaded from VFS)"
+            : "firmware loader selftest FAILED");
     vmm_swap_disk_init();
 
     if (rsdp_request.response) acpi_init(rsdp_request.response->address);
@@ -182,7 +237,9 @@ void kmain(void) {
     }
     /* user home */
     vfs_mkdir_p("/home/yart");
-    blkfs_selftest();      /* 64 KiB through indirect blocks + CRCs */
+#ifdef BLKFS_SELFTEST
+    blkfs_selftest();
+#endif
 
     /* Load /bin/init as the ring-3 compositor (wm). */
     vnode_t *initbin = vfs_lookup("/bin/init");

@@ -1,1311 +1,937 @@
-/* Yart OS - ring-3 compositor (wm) — "quartz" 60fps polish pass, v2.
- *
- * Pure ring-3. Kernel exposes FB_INFO, FB_FLIP, POLL_KEY, POLL_MOUSE, TIME_MS,
- * TIME (RTC wall clock).
- *
- * Perf notes:
- *  - Static chrome (panel, dock body+shadow+glass) is cached in offscreen
- *    sprites at startup. Per-frame work is:
- *      1. wallpaper-restore only the small dirty rects (cursor, tooltip,
- *         dock region when tweening, panel strip only when clock changes),
- *      2. blit cached chrome sprites (u64 memcpy),
- *      3. paint dynamic bits: icons (scaled nearest-neighbour), text, cursor.
- *  - fb_flip() is called ONLY when pixels actually changed.
- *  - Tween uses a deadband so it actually CONVERGES (no 1px hunt/oscillate,
- *    which was the source of the "freeze" on TCG: tweening flag stayed true
- *    forever, forcing a full repaint every yield).
- *  - Magnification picks the SINGLE nearest icon within the magnify zone,
- *    not every icon within MAG_RADIUS (which caused both dock items to
- *    bloat at once when hovering the dock midpoint).
- *  - Adaptive 16ms pacing with mid-yield mouse poll for 60Hz cursor feel.
- *    We call sched_yield() in short slices so the cursor stays responsive
- *    even when the scheduler is tick-slow.
- *
- * Visual polish:
- *  - Dock flush to bottom (4px margin), multi-pass soft shadow, frosted glass,
- *    rounded 14px corners, gaussian-bell magnification on the SINGLE hovered
- *    icon, smooth tween animation with deadband, running-indicator dots,
- *    hover pill, fading tooltip with pointer triangle (macOS-style).
- *  - Panel 28px dark glass, top highlight + bottom hairline, custom blue "Y"
- *    logo, workspace dots (active larger), "+", tray icons (clickable),
- *    REAL RTC clock.
- *  - Proper multi-state cursors (arrow/hand/ibeam/wait/forbidden/h-resize/
- *    v-resize) selected per hot-spot region; clean procedurally-drawn 24px
- *    sprites with soft shadow and dark outline.
- */
-#include "sys.h"
-#include "gfx.h"
-#include "kora.h"
-#include "cursors.h"
+/* YartOS ring-3 compositor — orchestrator module.
+ * Screen concerns are split across wm_damage.c, wm_windows.c, wm_dock.c,
+ * wm_panel.c, wm_launcher.c, wm_overlays.c (see wm.h).  This file owns the
+ * main loop, input routing, cursor, backdrop compositing, config loading,
+ * process management and app launching. */
+#include "wm.h"
 
-/* =================== real apps (window surfaces) =================== */
-#define WM_MAX_WIN 12
-typedef struct {
-    bool active; bool seen; u32 id; u32 owner;
-    int x,y,w,h; u64 va; bool dirty; char title[32]; int misses; int z;
-} win_t;
-static win_t G_wins[WM_MAX_WIN];
-static int  G_app_pid;
-static int  G_win_dirty;
-static int  G_z_top=0;
-#define MAX_APP_PIDS 16
-static int G_app_pids[MAX_APP_PIDS];
-static int G_app_pids_count;
-#define G_app_count G_app_pids_count    /* any window needs recompositing            */
+/* ---- global state definitions (see wm.h for the shared contract) ---- */
+surface_t G_fb, G_wp;
+surface_t G_backdrop;
+bool    g_backdrop_dirty = true;
+int     G_cx, G_cy, G_pressed_x, G_pressed_y;
+unsigned char G_mb;
+long    G_start_ms;
+char    G_clk[16] = "00:00:00";
+unsigned long G_last_sec = (unsigned long)-1;
+char    G_date[32] = "";
+int     G_workspace = 0;
+int     G_ws_count = 1;
+app_t   G_app[MAX_APPS];
+int     G_apps;
+bool    G_grid, G_overview, G_quick, G_calendar, G_dockmenu, G_switcher;
+bool    G_locked = true;   /* login at boot: the lock screen is the login screen (real auth, like an enterprise OS) */
+bool    G_super_held = false;
+/* Lock screen auth state (real password check via SYS_AUTH_VERIFY). */
+bool    G_lock_prompt = false;
+char    G_lock_pw[64];
+int     G_lock_pw_len = 0;
+bool    G_lock_bad = false;
+/* Dock visibility (settings.conf dock=0/1). */
+bool    G_dock_visible = true;
+/* Active cursor theme (settings.conf cursor=...). */
+static int G_cur_theme = -1;
+int     G_switcher_idx;
+int     G_dockmenu_x, G_dockmenu_y, G_dockmenu_w, G_dockmenu_h;
+int     G_quick_x, G_quick_y, G_quick_w, G_quick_h, G_cal_x, G_cal_y, G_cal_w, G_cal_h;
+int     G_cal_month = 8, G_cal_year = 2026;
+char    G_search[40];
+int     G_search_len;
+int     G_sel_app = -1, G_sel_desk = -1;
+bool    G_double;
+bool    G_multi_sel, G_desktop_drag, G_title_drag, G_marquee, G_icon_drag;
+int     G_drag_win = -1, G_drag_dx, G_drag_dy;
+int     G_resize_win = -1, G_resize_edges, G_drag_icon = -1, G_icon_dx, G_icon_dy;
+int     G_mx0, G_my0, G_mx1, G_my1;
+long    G_last_click_desk;
+long    G_last_title_click;
+int     G_last_click_idx = -1;
+bool    G_menu;
+long    G_menu_t0;
+int     G_menu_x, G_menu_y, G_menu_w, G_menu_h, G_menu_type, G_menu_idx, G_menu_arg;
+menuitem_t G_menu_items[MAX_MENU];
+int     G_menu_n;
+char    G_menu_path[72];
+bool    G_audio = true, G_wifi = false, G_wired = true;   /* QEMU: wired e1000, no 802.11 hw */
+bool    G_clip_open = false;
+char    G_clipboard[512]; int G_clipboard_len = 0;
+bool    G_netlist_open = false;
+char    G_netlist[1024]; int G_netlist_len = 0;
+int     G_net_x0, G_net_x1, G_clip_x0, G_clip_x1, G_lang_x0, G_lang_x1;
+int     G_clip_x, G_clip_y, G_clip_w, G_clip_h;
+int     G_nl_x, G_nl_y, G_nl_w, G_nl_h;
+int     G_vol = 70;
+int     G_net_up;
+int     G_scale = 1;   /* HiDPI UI scale (1 or 2), persisted in settings.conf */
+long    G_tooltip_t0;
+int     G_tooltip_item = -1;
+long    G_osd_t0;
+char    G_osd[80];
+int     G_wp_index;
+char    G_notifs[16][128];
+int     G_notif_n = 0;
+proc_t G_pids[MAX_PIDS];
+int     G_pids_n;
+pending_t G_pending[MAX_PIDS];
+int     G_pending_n;
 
-/* =================== cursor themes =================== */
-static int  G_cur_theme;            /* 0 = classic procedural, 1.. photo */
-static char G_theme_name[24];       /* current theme name in config      */
-static long G_cfg_last_check;       /* ms of the last cursor.conf poll   */
+void osd(const char *m){ int i=0; while(m[i]&&i<(int)sizeof(G_osd)-1){G_osd[i]=m[i];i++;} G_osd[i]=0; G_osd_t0=time_ms(); }
 
-/* =================== theme =================== */
-#define C_PANEL_BG      ARGB(0xD2,0x14,0x16,0x1B)
-#define C_PANEL_FG      RGB(0xEC,0xEE,0xF1)
-#define C_PANEL_DIM     RGB(0x88,0x8D,0x96)
-#define C_PANEL_HAIR    RGB(0x06,0x08,0x0C)
-#define C_PANEL_HILITE  ARGB(0x28,0xFF,0xFF,0xFF)
-#define C_ACCENT        RGB(0x5B,0xA7,0xDF)
-#define C_DOCK_TINT     ARGB(0x80,0x1A,0x1D,0x24)
-#define C_OVERVIEW_BG   ARGB(0xCC,0x0A,0x0B,0x10)
-#define C_QUICK_BG      ARGB(0xF2,0x20,0x22,0x28)
-#define C_APPS_BG       ARGB(0xE6,0x12,0x14,0x1C)
-#define C_DOCK_BORDER   ARGB(0x6E,0x5C,0x62,0x6C)
-#define C_DOCK_INNER    ARGB(0x1E,0xFF,0xFF,0xFF)
-#define C_DOCK_INNER2   ARGB(0x0A,0xFF,0xFF,0xFF)
-#define C_HOVER         ARGB(0x30,0xFF,0xFF,0xFF)
-#define C_PRESS         ARGB(0x50,0xFF,0xFF,0xFF)
-#define C_DOT_RUN       ARGB(0xBB,0xC8,0xCB,0xD0)
-#define C_DOT_HOVER     C_PANEL_FG
-#define TRAY_TINT       C_PANEL_FG
+int icon_for_path(const char *p){
+    if(strcmp(p,"/bin/nyra")==0) return ICON_DOCK_TERMINAL;
+    if(strcmp(p,"/bin/files")==0) return ICON_DOCK_FILES;
+    if(strcmp(p,"/bin/settings")==0) return ICON_DOCK_SETTINGS;
+    if(strcmp(p,"/bin/browser")==0) return ICON_DOCK_BROWSER;
+    if(strcmp(p,"/bin/editor")==0) return ICON_DOCK_EDITOR;
+    return ICON_MIME_APPLICATION_X_EXECUTABLE;
+}
 
-/* =================== layout =================== */
-#define PANEL_H     28
-#define DOCK_H      58
-#define ICON_SZ     34       /* dock icons rest size */
-#define DOCK_MW     44       /* slot pitch between icon centers */
-#define MAG         8        /* max extra px added on hover (subtle) */
-#define MAG_RADIUS  30       /* gaussian bell half-width; only nearest icon wins */
-#define DOCK_MARGIN 4
-#define DOCK_RAD    14
-#define DOCK_PADX   10
-#define DOCK_SHADOW 16
+/* ---------- app, dock and desktop persistence ---------- */
+void add_app(const char *name,const char *path,int icon){
+    if(G_apps>=MAX_APPS) return;
+    for(int i=0;i<G_apps;i++) if(strcmp(G_app[i].path,path)==0) return;
+    copy_str(G_app[G_apps].name,name,sizeof(G_app[0].name));
+    copy_str(G_app[G_apps].path,path,sizeof(G_app[0].path));
+    G_app[G_apps].icon=icon; G_app[G_apps].removable=(path[0]=='/'); G_apps++;
+}
+int app_index(const char *path){ for(int i=0;i<G_apps;i++) if(strcmp(G_app[i].path,path)==0) return i; return -1; }
 
-/* Dock - Apps leftmost per user, macOS transparent, magnification, Kora icons */
-typedef struct { char name[32]; int icon; char path[64]; bool fixed; } dock_item_t;
-static dock_item_t G_dock[] = {
-    { "Show Apps",     ICON_DOCK_LAUNCHER, "", true },
-    { "Nyra Terminal", ICON_DOCK_TERMINAL, "/bin/nyra", false },
-    { "Trash",         ICON_DOCK_TRASH, "", true },
-};
-#define DOCK_N ((int)(sizeof G_dock / sizeof G_dock[0]))
-#define DOCK_MAX 16
-static int G_dock_count = DOCK_N;
-
-#define APP_GRID_MAX 64
-typedef struct { char name[32]; char path[64]; int icon; } app_entry_t;
-static app_entry_t G_apps_list[APP_GRID_MAX];
-static int G_apps_count=0;
-static bool G_apps_grid=false;
-static char G_search[64]; static int G_search_len=0;
-
-#define CTX_NONE 0
-#define CTX_DOCK 1
-#define CTX_APPGRID 2
-static bool G_ctx_open=false;
-static int G_ctx_x,G_ctx_y,G_ctx_w,G_ctx_h,G_ctx_type=CTX_NONE,G_ctx_idx=-1;
-static char G_ctx_path[64];
-
-static bool G_overview=false;
-static bool G_quick_open=false;
-static bool G_calendar_open=false;
-static int G_quick_x,G_quick_y,G_quick_w,G_quick_h;
-static int G_cal_x,G_cal_y,G_cal_w,G_cal_h;
-static int G_eth_up=0, G_wifi_up=0;
-static int G_activities_x0,G_activities_x1,G_clock_x0,G_clock_x1,G_sys_x0,G_sys_x1;
-static char G_date_text[32]="Aug 7";
-static void osd(const char *msg);
-static void format_date(long wt,char *buf);
-static void load_apps_list(void);
-static void draw_apps_grid(surface_t *s);
-static void draw_context_menu(surface_t *s);
-static void draw_overview(surface_t *s);
-static void draw_quick_settings(surface_t *s);
-static void draw_calendar(surface_t *s);
-static void pin_app(const char *path,const char *name,int icon);
-static void unpin_app(int idx);
-static void uninstall_app(const char *path);
-static void save_dock_config(void);
-static void load_dock_config(void);
-static void launch_nyra(void);
-static void launch_app_path(const char *path);
-static win_t *win_find(u32 id);
-static win_t *win_alloc(void);
-static win_t *win_at_pos(int x,int y);
-static void win_bring_to_front(win_t *w);
-static void safe_close_window(win_t *w);
-
-/* =================== cursors =================== */
-enum {
-    CUR_ARROW = 0,
-    CUR_HAND,
-    CUR_IBEAM,
-    CUR_WAIT,
-    CUR_FORBIDDEN,
-    CUR_HRESIZE,
-    CUR_VRESIZE,
-    CUR_N,
-};
-static int G_cursor_icon[CUR_N] = {
-    ICON_CURSOR_ARROW, ICON_CURSOR_HAND, ICON_CURSOR_IBEAM, ICON_CURSOR_WAIT,
-    ICON_CURSOR_FORBIDDEN, ICON_CURSOR_HRESIZE, ICON_CURSOR_VRESIZE,
-};
-/* Hotspots per cursor (tip vs center etc.), in 24px canvas coords. */
-static const int G_cursor_hotx[CUR_N] = {2, 12, 11, 2, 11, 11, 11};
-static const int G_cursor_hoty[CUR_N] = {2,  3, 11, 2, 11, 11, 11};
-
-/* =================== workspaces =================== */
-#define MAX_WS 9
-static int G_ws_count = 1;
-static int G_ws_active = 0;
-
-/* Pre-scaled dock icons at rest size (34px): while hovering/tweening we
- * blit these instead of per-pixel scaling the 48px atlas icons every
- * frame - the single biggest per-frame cost on TCG. */
-static surface_t G_icon_cache[DOCK_MAX];
-static int       G_icon_cache_ok;
-
-static void build_icon_cache(void) {
-    for (int i=0;i<DOCK_N;i++) {
-        if (G_icon_cache[i].px) sf_free(&G_icon_cache[i]);
-        icon_t ico = icon_get(G_dock[i].icon);
-        if (!ico.px || !ico.w || !ico.h) continue;
-        G_icon_cache[i] = sf_alloc(ICON_SZ, ICON_SZ);
-        if (!G_icon_cache[i].px) continue;
-        surface_t *c = &G_icon_cache[i];
-        sf_icon_scaled(c, ICON_SZ/2, ICON_SZ/2, ico, 0, ICON_SZ, 48);
+void save_config(void){
+    int fd=open("/home/yart/desktop.conf",O_WRONLY|O_CREAT|O_TRUNC); if(fd<0) return;
+    char line[160];
+    for(int i=0;i<G_dock_n;i++){ if(G_dock[i].core) continue; int k=0; const char *p="dock="; while(*p)line[k++]=*p++; for(int j=0;G_dock[i].name[j]&&k<150;j++)line[k++]=G_dock[i].name[j]; line[k++]='|'; for(int j=0;G_dock[i].path[j]&&k<156;j++)line[k++]=G_dock[i].path[j]; line[k++]='\n'; write(fd,line,k); }
+    for(int i=0;i<G_desk_n;i++){ int k=0; const char *p="desk="; while(*p)line[k++]=*p++; for(int j=0;G_desk[i].name[j]&&k<120;j++)line[k++]=G_desk[i].name[j]; line[k++]='|'; for(int j=0;G_desk[i].path[j]&&k<120;j++)line[k++]=G_desk[i].path[j]; line[k++]='|'; char num[8]; int nx=G_desk[i].gx; int d=10000; while(d){ num[0]='0'+(nx/d); if(k<150){line[k++]=num[0];} nx%=d; d/=10; } line[k++]='|'; int ny=G_desk[i].gy; d=10000; while(d){ num[0]='0'+(ny/d); if(k<150){line[k++]=num[0];} ny%=d; d/=10; } line[k++]='\n'; write(fd,line,k); }
+    fsync(fd); close(fd);
+}
+static void load_apps_config(void){
+    add_app("Console","/bin/nyra",ICON_DOCK_TERMINAL);
+    add_app("Files","/bin/files",ICON_DOCK_FILES);
+    add_app("Settings","/bin/settings",ICON_DOCK_SETTINGS);
+    add_app("Text","/bin/editor",ICON_DOCK_EDITOR);
+}
+static void load_desktop_config(void){
+    G_desk_n=0;
+    add_desktop("Home","/home/yart",ICON_PLACE_HOME,1);
+    add_desktop("Documents","/home/yart/Documents",ICON_PLACE_DOCS,2);
+    add_desktop("Downloads","/home/yart/Downloads",ICON_PLACE_DL,3);
+    add_desktop("Trash","trash",ICON_DOCK_TRASH,4);
+    int fd=open("/home/yart/desktop.conf",0);
+    if(fd<0) return;
+    char buf[2048]; long n=read(fd,buf,sizeof(buf)-1); close(fd); if(n<=0) return; buf[n]=0;
+    char *p=buf;
+    while(*p){
+        char *e=p; while(*e&&*e!='\n') e++; char old=*e; *e=0;
+        if(strncmp(p,"dock=",5)==0){ char *q=p+5; char *bar=0; for(char*r=q;*r;r++) if(*r=='|'){bar=r;break;} if(bar){*bar=0; add_dock_app(bar+1,q,icon_for_path(bar+1),true);} }
+        else if(strncmp(p,"desk=",5)==0){ char *q=p+5; char *b1=0,*b2=0,*b3=0; for(char*r=q;*r;r++){ if(*r=='|'&&!b1)b1=r; else if(*r=='|'&&b1&&!b2)b2=r; else if(*r=='|'&&b2){b3=r;break;} } if(b1){*b1=0; char *path=b1+1; int px=-1,py=-1; if(b2){*b2=0; if(b3){*b3=0; px=0; for(char*d=b2+1;*d;d++)px=px*10+(*d-'0'); py=0; for(char*d=b3+1;*d;d++)py=py*10+(*d-'0'); } add_desktop_xy(q,path,icon_for_path(path),100,px,py); } else add_desktop(q,path,icon_for_path(path),100); } }
+        p=old?e+1:e;
     }
-    G_icon_cache_ok = 1;
+}
+void load_all(void){
+    load_apps_config(); default_dock(); dock_apply_hidden();
+    int fd=open("/home/yart/dock.conf",0);
+    if(fd>=0){ char buf[1024]; long n=read(fd,buf,sizeof(buf)-1); close(fd); if(n>0){ buf[n]=0; char *p=buf; while(*p){ char *e=p; while(*e&&*e!='\n')e++; char old=*e; *e=0; if(strncmp(p,"pin=",4)==0) add_dock_app(p+4,p+4,icon_for_path(p+4),true); p=old?e+1:e; } } }
+    load_desktop_config();
+}
+void save_dock_only(void){
+    int fd=open("/home/yart/dock.conf",O_WRONLY|O_CREAT|O_TRUNC); if(fd<0)return; char line[128];
+    for(int i=0;i<G_dock_n;i++){ if(G_dock[i].core||G_dock[i].path[0]!='/') continue; int k=0; const char*q="pin="; while(*q)line[k++]=*q++; for(int j=0;G_dock[i].path[j]&&k<120;j++)line[k++]=G_dock[i].path[j]; line[k++]='\n'; write(fd,line,k); }
+    close(fd);
 }
 
-/* =================== animated tween state =================== */
-static int G_slot_size[DOCK_MAX];
-static int G_slot_lift[DOCK_MAX];
-static int G_slot_target_sz[DOCK_MAX];
-static int G_slot_target_lift[DOCK_MAX];
-static int G_slot_bounce[DOCK_MAX];
-static long G_slot_bounce_t0[DOCK_MAX];
+/* ---------- settings.conf (REAL, persistent settings) ----------
+ * The Settings app writes /home/yart/settings.conf; the compositor reads it
+ * at boot and re-reads it every couple of seconds, applying accent / cursor
+ * theme / wallpaper / dock visibility / volume.  No visual redesign — the
+ * values only feed the existing theme/cursor/wallpaper/dock systems. */
+extern theme_t g_theme;
+static int  G_cursor_last_idx = -1;
+static long G_last_settings_check = 0;
 
-/* =================== cached chrome sprites =================== */
-static surface_t G_panel_spr;
-static surface_t G_dock_spr;
-static int G_dock_spr_x0, G_dock_spr_y0, G_dock_spr_w, G_dock_spr_h;
-static int G_dock_x, G_dock_y, G_dock_w, G_dock_h;
+static int atoi_small(const char *s){ int v=0; while(*s>='0'&&*s<='9'){ v=v*10+(*s-'0'); s++; } return v; }
 
-/* =================== framebuffer =================== */
-static surface_t G_fb;
-static surface_t G_wp;
-static int G_cx, G_cy;
-static unsigned char G_mb;
-static int G_net_up, G_audio_up, G_bat_up;
-static long G_start_ms;
-static int G_full_repaint;
-static int G_wp_index = 0;
-
-/* =================== tray hit-boxes =================== */
-typedef struct { const char *name; int x0,y0,x1,y1; int icon; } tray_hit_t;
-static tray_hit_t G_tray[8];
-static int G_tray_n = 0;
-
-/* =================== dirty tracking =================== */
-static int G_last_cx = -1, G_last_cy = -1;
-static int G_last_cursor = -1;
-static int G_panel_dirty = 1;
-static int G_dock_dirty  = 1;
-static int G_tooltip_dirty = 0;
-static int G_tip_x0, G_tip_y0, G_tip_x1, G_tip_y1;
-static unsigned long G_last_clock_s = (unsigned long)-1;
-static char G_clk_text[16] = "00:00:00";
-
-/* =================== tooltip =================== */
-static int G_tooltip_item = -1;
-static long G_tooltip_t0 = 0;
-#define TOOLTIP_DELAY_MS 450
-#define TOOLTIP_FADE_MS  150
-
-/* =================== on-screen display (wallpaper name etc.) ========== */
-static long G_osd_t0 = 0;
-static char G_osd_text[64];
-
-/* Wallpaper names, indexed in the same order as gen_wallpaper_pack.py */
-static const char * const WP_NAMES[] = {
-    "Twilight Dunes", "Midnight", "Ocean Breeze", "Graphite"
-};
-#define WP_NAMES_N ((int)(sizeof WP_NAMES / sizeof WP_NAMES[0]))
-
-/* =================== helpers =================== */
-static void format_wallclock(long wt, char *buf) {
-    long s = wt % 100; wt /= 100;
-    long m = wt % 100; wt /= 100;
-    long h = wt % 100;
-    buf[0]='0'+h/10; buf[1]='0'+h%10; buf[2]=':';
-    buf[3]='0'+m/10; buf[4]='0'+m%10; buf[5]=':';
-    buf[6]='0'+s/10; buf[7]='0'+s%10; buf[8]=0;
-}
-
-static int abs_int(int x) { return x<0 ? -x : x; }
-
-/* ================================================================
- * Cursor: build + draw.  Each cursor sprite is taken directly from
- * the asset atlas (Kora-style procedural cursors at 24px).  We
- * render them with a soft drop shadow for depth.
- * ================================================================ */
-static u32 G_cursor_buf[CUR_N][24*24] __attribute__((aligned(16)));
-/* Active cursor sprites: point either at the procedural buffers above or
- * at photo-theme images (classic = procedural, photo themes = real
- * raster art from the web).  `w/h` vary per sprite. */
-static surface_t G_cursor_spr[CUR_N];
-static int       G_cursor_hotx2[CUR_N];
-static int       G_cursor_hoty2[CUR_N];
-
-/* Inline alpha-blend helper for raw u32 buffers (used during cursor build).
- * Matches sf_putpx_blend's math exactly. c and d are ARGB-packed u32s. */
-static inline void sf_putpx_blend_at(u32 *buf, int x, int y, int pitch, u32 c) {
-    u32 d = buf[y*pitch + x];
-    u8 sa = (u8)(c>>24);
-    if (sa == 0) return;
-    u8 cr=(u8)(c>>16), cg=(u8)(c>>8), cb=(u8)c;
-    if (sa == 255) { buf[y*pitch+x] = 0xFF000000 | ((u32)cr<<16) | ((u32)cg<<8) | cb; return; }
-    u32 ia = 255 - sa;
-    u8 dr=(u8)(d>>16), dg=(u8)(d>>8), db=(u8)d;
-    u8 nr=(u8)(((u32)cr*sa + (u32)dr*ia + 127)/255);
-    u8 ng=(u8)(((u32)cg*sa + (u32)dg*ia + 127)/255);
-    u8 nb=(u8)(((u32)cb*sa + (u32)db*ia + 127)/255);
-    buf[y*pitch+x] = 0xFF000000 | ((u32)nr<<16) | ((u32)ng<<8) | nb;
-}
-
-static void cursor_build_one(int id) {
-    icon_t ico = icon_get(G_cursor_icon[id]);
-    u32 *dst = G_cursor_buf[id];
-    for (int i=0;i<24*24;i++) dst[i] = 0;
-    if (!ico.px) return;
-    int sz = ico.w < 24 ? ico.w : 24;
-    /* Soft shadow (Gaussian-ish 3x3 kernel, offset +2,+2). We paint into a
-     * temporary alpha mask then blur so overlapping shadow edges accumulate
-     * correctly rather than the "max alpha" look of the old code. */
-    u8 shadow[24*24] = {0};
-    for (int j=0;j<sz;j++) for (int i=0;i<sz;i++) {
-        u8 sa = (u8)(ico.px[j*ico.pitch+i]>>24);
-        if (sa < 8) continue;
-        int base = (sa*140)/255;
-        for (int dy=-1;dy<=2;dy++) for (int dx=-1;dx<=2;dx++) {
-            int nx=i+dx+2, ny=j+dy+2;
-            if ((u32)nx>=24||(u32)ny>=24) continue;
-            int d2=dx*dx+dy*dy;
-            int a = base;
-            if (d2<=1) a = base;
-            else if (d2<=3) a = (base*60)/100;
-            else if (d2<=5) a = (base*28)/100;
-            else if (d2<=8) a = (base*12)/100;
-            else continue;
-            int idx=ny*24+nx;
-            int na = shadow[idx] + a;
-            shadow[idx] = (u8)(na>255?255:na);
+static void settings_apply(const char *key, const char *val){
+    if(strcmp(key,"accent")==0){
+        u32 c = theme_parse_color(val);
+        if(c && g_theme.c[T_ACCENT] != c){
+            g_theme.c[T_ACCENT] = c;
+            g_theme.c[T_ACCENT_DIM] = (c & 0xFF000000u) | ((((c>>16)&0xFF)*7/10)<<16) |
+                                      ((((c>>8)&0xFF)*7/10)<<8) | ((c&0xFF)*7/10);
+            g_theme.c[T_BTN_TOGGLE_ON] = (c & 0xFFFFFFu) | 0xDC000000u;
+            g_backdrop_dirty=true; damage_whole();
+        }
+    } else if(strcmp(key,"cursor")==0){
+        int t = cursors_theme_by_name(val);
+        if(t >= 0 && t != G_cursor_last_idx){
+            G_cur_theme = t;
+            G_cursor_last_idx = t;
+        }
+    } else if(strcmp(key,"wallpaper")==0){
+        int idx = atoi_small(val);
+        if(idx >= 0 && idx < wallpaper_count() && idx != G_wp_index){
+            G_wp_index = idx;
+            wallpaper_load_index(idx);
+            wallpaper_bind(&G_wp);
+            g_backdrop_dirty=true; damage_whole();
+        }
+    } else if(strcmp(key,"dock")==0){
+        bool vis = val[0] != '0';
+        if(vis != G_dock_visible){
+            G_dock_visible = vis;
+            g_backdrop_dirty=true; damage_whole();
+        }
+    } else if(strcmp(key,"volume")==0){
+        int v = atoi_small(val);
+        if(v < 0) v = 0;
+        if(v > 100) v = 100;
+        if(v != G_vol){ G_vol = v; G_audio = v > 0; audio_vol(v); }
+    } else if(strcmp(key,"scale")==0){
+        int sc = atoi_small(val);
+        if(sc < 1) sc = 1;
+        if(sc > 2) sc = 2;
+        if(sc != G_scale){
+            G_scale = sc;
+            sf_set_scale(sc);            /* HiDPI text scale for the compositor */
+            rebuild_dock_cache();        /* dock icons re-render at the new size */
+            g_backdrop_dirty = true;
+            damage_whole();
         }
     }
-    for (int i=0;i<24*24;i++) {
-        if (shadow[i]) dst[i] = ARGB(shadow[i], 0,0,0);
-    }
-    /* Body: blit sprite at (0,0) using native alpha OVER the shadow */
-    for (int j=0;j<sz;j++) for (int i=0;i<sz;i++) {
-        u32 sp = ico.px[j*ico.pitch+i];
-        u8 sa=(u8)(sp>>24);
-        if (!sa) continue;
-        u8 sr=(u8)sp, sg=(u8)(sp>>8), sb=(u8)(sp>>16);
-        /* Alpha blend over whatever's already there (shadow/outline) */
-        sf_putpx_blend_at(dst, i, j, 24, ARGB(sa,sr,sg,sb));
-    }
 }
-static void cursor_build_all(void) {
-    for (int i=0;i<CUR_N;i++) cursor_build_one(i);
-    /* default theme: classic procedural sprites */
-    for (int i=0;i<CUR_N;i++) {
-        G_cursor_spr[i].px = G_cursor_buf[i];
-        G_cursor_spr[i].w = 24; G_cursor_spr[i].h = 24;
-        G_cursor_spr[i].pitch = 24;
-        G_cursor_hotx2[i] = G_cursor_hotx[i];
-        G_cursor_hoty2[i] = G_cursor_hoty[i];
+
+static void settings_load(void){
+    int fd=open("/home/yart/settings.conf",0);
+    if(fd<0) return;
+    static char buf[512];
+    long n=read(fd,buf,sizeof(buf)-1);
+    close(fd);
+    if(n<=0) return;
+    buf[n]=0;
+    char *p=buf;
+    while(*p){
+        char *e=p; while(*e&&*e!='\n') e++;
+        char old=*e; *e=0;
+        char *eq=0; for(char*q=p;*q;q++) if(*q=='='){eq=q;break;}
+        if(eq){ *eq=0; settings_apply(p, eq+1); }
+        p = old?e+1:e;
     }
 }
 
-/* Switch the cursor theme: 0 = classic procedural; t >= 1 = photo theme
- * (t-1 indexes the blob).  Photo themes replace the arrow + hand with the
- * real raster art; all other cursor kinds keep the procedural sprites. */
-static void cursor_apply_theme(int t) {
-    int n = cursors_theme_count();
-    if (t < 0 || t > n) return;
-    G_cur_theme = t;
-    if (t == 0) {
-        for (int i=0;i<CUR_N;i++) {
-            G_cursor_spr[i].px = G_cursor_buf[i];
-            G_cursor_spr[i].w = 24; G_cursor_spr[i].h = 24;
-            G_cursor_spr[i].pitch = 24;
-            G_cursor_hotx2[i] = G_cursor_hotx[i];
-            G_cursor_hoty2[i] = G_cursor_hoty[i];
+static void settings_poll(long now){
+    /* re-read cheaply every ~2s so the Settings app's writes take effect */
+    if(now - G_last_settings_check < 2000) return;
+    G_last_settings_check = now;
+    settings_load();
+}
+
+/* ---------- processes ---------- */
+void pid_forget_dead(void){
+    for(int i=0;i<G_pids_n;){
+        int st=0; long r=waitpid_nohang(G_pids[i].pid,&st);
+        if(r==G_pids[i].pid||r==-1){ for(int j=i;j<G_pids_n-1;j++)G_pids[j]=G_pids[j+1]; G_pids_n--; } else i++;
+    }
+}
+void pid_record(long pid,const char*path){ if(pid<=0)return; for(int i=0;i<G_pids_n;i++) if(G_pids[i].pid==pid)return; if(G_pids_n<MAX_PIDS){G_pids[G_pids_n].pid=pid; copy_str(G_pids[G_pids_n].path,path,sizeof(G_pids[0].path)); G_pids_n++;} if(G_pending_n<MAX_PIDS){G_pending[G_pending_n].pid=pid; copy_str(G_pending[G_pending_n].path,path,sizeof(G_pending[0].path)); G_pending[G_pending_n].stamp=time_ms(); G_pending_n++;} }
+bool pid_for_path(const char*path){ for(int i=0;i<G_pids_n;i++) if(strcmp(G_pids[i].path,path)==0) return true; return false; }
+
+void launch_app(const char *path){
+    if(!path||!path[0]) return;
+    if(strcmp(path,"trash")==0){
+        /* REAL trash: open the Files app pointed at the trash directory. */
+        const char *real="/bin/files";
+        long pid=fork();
+        if(pid==0){
+            char *argv[]={(char*)real,(char*)"/home/yart/.trash",0};
+            char *envp[]={"HOME=/home/yart","TERM=nyra",0};
+            long r=exec(real,argv,envp); (void)r;
+            klog("wm: exec failed\n"); exit(1);
+        } else if(pid>0){ pid_record(pid,real); }
+        return;
+    }
+    if(path[0]!='/'){ osd("App not available"); return; }
+    /* Like GNOME: launching an app always starts a new process/window. */
+    long pid=fork();
+    if(pid==0){
+        char *argv[]={(char*)path,0};
+        char *envp[]={"HOME=/home/yart","TERM=nyra",0};
+        long r=exec(path,argv,envp); (void)r;
+        klog("wm: exec failed\n"); exit(1);
+    } else if(pid>0){ pid_record(pid,path); int i=dock_find_path(path); if(i>=0)G_slot_bounce[i]=20; /* focus will be set when window appears in scan_windows */ }
+}
+
+/* ---------- input / overlays helpers ---------- */
+static void close_all_overlays(void){ G_grid=G_overview=G_quick=G_calendar=G_dockmenu=false; menu_close(); }
+static void handle_menu_action(int hit){ if(hit>=0) menu_dispatch(hit); else if(hit==-1) menu_close(); }
+static void launch_dock(int i){
+    if(i==0){ G_dockmenu=!G_dockmenu; G_grid=G_overview=G_quick=G_calendar=false; G_menu=false;
+              G_dockmenu_w=260; G_dockmenu_h=420; G_dockmenu_x=G_dock_x-30; G_dockmenu_y=G_dock_y-G_dockmenu_h-8;
+              if(G_dockmenu_y<PANEL_H+4)G_dockmenu_y=PANEL_H+4;
+              G_search_len=0; G_search[0]=0; return; }
+    if(!strcmp(G_dock[i].path,"trash")){ launch_app("trash"); return; }
+    if(G_dock[i].path[0]=='/'){
+        for(int j=0;j<MAX_WIN;j++){ win_t*w=&G_win[j];
+            if(w->active && (w->workspace==G_workspace||w->workspace<0) && !strcmp(w->path,G_dock[i].path)){
+                if(w->hidden){            /* bring a show-desktop'd window back */
+                    w->hidden=false; w->dirty=true;
+                    g_backdrop_dirty=true; damage_whole();
+                }
+                if(w->minimized){ restore_win(w); return; }
+                /* click dock icon of focused app -> launch a NEW window (GNOME) */
+                if(G_focus_win==j){ launch_app(G_dock[i].path); return; }
+                bring_front(w); wm_focus(w->owner); G_focus_win=j; return;
+            }
+        }
+        launch_app(G_dock[i].path);
+    }
+}
+static int desktop_area(int y){ return y>=PANEL_H && y < (G_dock_visible ? G_dock_y-4 : G_fb.h-4); }
+/* Show Desktop is a TOGGLE: first press hides every window (a WM-side
+ * compositing flag — the app keeps rendering, we just stop painting it),
+ * pressing again brings them all back.  The old code called
+ * wm_move(id,-10000,-10000), but the kernel clamps positions to x>=-100,
+ * so windows just piled up in the top-left corner and could never be
+ * restored — a real bug. */
+void show_desktop_toggle(void){
+    close_all_overlays();
+    bool any_hidden=false;
+    for(int i=0;i<MAX_WIN;i++) if(G_win[i].active && G_win[i].hidden) any_hidden=true;
+    if(any_hidden){
+        for(int i=0;i<MAX_WIN;i++) if(G_win[i].active) G_win[i].hidden=false;
+        osd("Windows restored");
+    } else {
+        for(int i=0;i<MAX_WIN;i++) if(G_win[i].active) G_win[i].hidden=true;
+        osd("Show Desktop");
+    }
+    g_backdrop_dirty=true; damage_whole();
+}
+/* Extract the idx-th AP SSID from the wifi status text ("  SSID [...]"). */
+static bool netlist_ssid_at(int idx, char *out){
+    if(idx<0) return false;
+    int i=0, n=0;
+    while(i<G_netlist_len){
+        while(i<G_netlist_len && (G_netlist[i]=='\r'||G_netlist[i]=='\n')) i++;
+        if(i+1<G_netlist_len && G_netlist[i]==' ' && G_netlist[i+1]==' '){
+            int ss=i+2, se=ss;
+            while(se<G_netlist_len && G_netlist[se]!=' ' && G_netlist[se]!='[' && G_netlist[se]!='\n') se++;
+            if(n==idx){
+                int k=0; for(int q=ss;q<se&&k<39;q++) out[k++]=G_netlist[q]; out[k]=0;
+                return k>0;
+            }
+            n++; i=se;
+        }
+        while(i<G_netlist_len && G_netlist[i]!='\n') i++;
+        if(i<G_netlist_len) i++;
+    }
+    return false;
+}
+
+static void handle_press(int x,int y,int button){
+    if(G_locked) return;      /* ignore clicks while locked */
+    G_pressed_x=x; G_pressed_y=y;
+    if(button==3){
+        if(G_menu){menu_close();return;}
+        if(G_grid){ int ai; if(app_grid_hit(x,y,&ai)){ if(ai>=0)menu_open(x,y,2,ai); return; } }
+        /* right-click a window titlebar -> Skift window menu (Restore /
+         * Maximize / Minimize / Snap Left / Snap Right / Close) */
+        win_t *rw=win_at(x,y);
+        if(rw){ int rty=rw->y-TB_H; if(rty<PANEL_H)rty=PANEL_H;
+            if(ptin(x,y,rw->x,rty,rw->x+rw->w,rty+TB_H)){ menu_open_win(x,y,rw); return; } }
+        int i=dock_hit(x,y); if(i>=0){menu_open(x,y,1,i);return;}
+        int di=desk_hit(x,y); if(desktop_area(y)&&di>=0){G_sel_desk=di; menu_open(x,y,3,di);return;}
+        if(desktop_area(y)){G_sel_desk=-1; menu_open(x,y,3,-1);return;}
+        if(y<PANEL_H) menu_open(x,y,4,0);
+        return;
+    }
+    if(button!=1)return;
+    int mh=menu_hit(x,y); if(G_menu){ handle_menu_action(mh); return; }
+    if(G_quick){ if(!ptin(x,y,G_quick_x,G_quick_y,G_quick_x+G_quick_w,G_quick_y+G_quick_h))G_quick=false; else {
+        int bx=G_quick_x+16,by=G_quick_y+16;
+        if(ptin(x,y,bx,by,bx+140,by+44)){ /* Wi-Fi tile: on -> real scan + pick a network from the list */
+            if(G_wifi){ wifi_disconnect(); G_wifi=false; }
+            else { G_quick=false; G_netlist_open=true; wifi_scan(); G_netlist_len=(int)wifi_status(G_netlist,sizeof G_netlist); if(G_netlist_len<0)G_netlist_len=0; }
+        }
+        else if(ptin(x,y,bx+152,by,bx+292,by+44))G_wired=!G_wired;
+        else { /* volume slider drag/click */
+            int slx=bx+26,sly=by+64+22,slw=G_quick_w-58;
+            if(ptin(x,y,slx-4,sly-6,slx+slw+4,sly+10)){
+                int v=(x-slx)*100/slw; if(v<0)v=0; if(v>100)v=100; G_vol=v; G_audio=(v>0); audio_vol(v);
+            }
+        }
+        return; } }
+    if(G_calendar){ if(!ptin(x,y,G_cal_x,G_cal_y,G_cal_x+G_cal_w,G_cal_y+G_cal_h))G_calendar=false; else { if(ptin(x,y,G_cal_x+G_cal_w-48,G_cal_y+12,G_cal_x+G_cal_w-34,G_cal_y+30))G_cal_month++; else if(ptin(x,y,G_cal_x+G_cal_w-26,G_cal_y+12,G_cal_x+G_cal_w-10,G_cal_y+30))G_cal_month--; if(G_cal_month>12){G_cal_month=1;G_cal_year++;} if(G_cal_month<1){G_cal_month=12;G_cal_year--;} return; } }
+    if(G_clip_open){ if(!ptin(x,y,G_clip_x,G_clip_y,G_clip_x+G_clip_w,G_clip_y+G_clip_h))G_clip_open=false; return; }
+    if(G_netlist_open){
+        if(!ptin(x,y,G_nl_x,G_nl_y,G_nl_x+G_nl_w,G_nl_y+G_nl_h)){ G_netlist_open=false; return; }
+        /* click a network row -> try to connect (WPA2 needs a password) */
+        int row=(y-(G_nl_y+44))/24;
+        char ssid[40]; if(netlist_ssid_at(row,ssid)){
+            if(wifi_connect(ssid,"")==0){ G_wifi=true; G_netlist_open=false; osd("Connected to network"); }
+            else { char b[80]; int k=0; const char*q="WPA2: use Console - wifi connect "; while(*q&&k<79)b[k++]=*q++; for(int i=0;ssid[i]&&k<79;i++)b[k++]=ssid[i]; b[k]=0; osd(b); }
         }
         return;
     }
-    cursor_theme_t *th = cursors_theme(t - 1);
-    if (!th) return;
-    /* map cursor kinds to photo kinds: ARROW, HAND (others keep procedural) */
-    int kind_of[CUR_N] = { CURSOR_KIND_ARROW, CURSOR_KIND_HAND,
-                           -1, -1, -1, -1, -1 };
-    for (int i=0;i<CUR_N;i++) {
-        if (kind_of[i] >= 0 && th->img[kind_of[i]].present) {
-            cursor_img_t *im = &th->img[kind_of[i]];
-            G_cursor_spr[i].px = (u32 *)im->px;
-            G_cursor_spr[i].w = im->w; G_cursor_spr[i].h = im->h;
-            G_cursor_spr[i].pitch = im->w;
-            G_cursor_hotx2[i] = im->hotx;
-            G_cursor_hoty2[i] = im->hoty;
-        } else {
-            G_cursor_spr[i].px = G_cursor_buf[i];
-            G_cursor_spr[i].w = 24; G_cursor_spr[i].h = 24;
-            G_cursor_spr[i].pitch = 24;
-            G_cursor_hotx2[i] = G_cursor_hotx[i];
-            G_cursor_hoty2[i] = G_cursor_hoty[i];
+    if(G_dockmenu){ int ai; if(dockmenu_hit(x,y,&ai)){ if(ai>=0){launch_app(G_app[ai].path);G_dockmenu=false;} return; } G_dockmenu=false; return; }
+    if(G_grid){ int ai; if(app_grid_hit(x,y,&ai)){ if(ai>=0)G_sel_app=ai; else if(ai==-2){G_grid=false;} return; } G_grid=false; }
+    if(G_overview){ int wi=overview_card_at(x,y); if(wi>=0){bring_front(&G_win[wi]); wm_focus(G_win[wi].owner); G_focus_win=wi; G_overview=false; return;} G_overview=false; return; }
+    if(y<PANEL_H){
+        if(ptin(x,y,G_act_x0,0,G_act_x1,PANEL_H)){ G_grid=!G_grid; if(G_grid){G_search_len=0; G_search[0]=0;} G_overview=false; return; }
+        if(ptin(x,y,G_ws_x0,0,G_ws_x1,PANEL_H)){ int ws=(x-G_ws_x0)/18; if(ws>=0&&ws<G_ws_count&&ws!=G_workspace){G_workspace=ws;char b[32];int k=0;const char*q="Workspace ";while(q[k]){b[k]=q[k];k++;} b[k++]='0'+1+ws; b[k]=0; osd(b); g_backdrop_dirty=true; damage_whole(); wm_focus(0);} return; }
+        if(ptin(x,y,G_clock_x0,0,G_clock_x1,PANEL_H)){ G_calendar=!G_calendar; G_quick=false; return; }
+        /* input-language button (English layout - honest: no other layout exists yet) */
+        if(ptin(x,y,G_lang_x0,0,G_lang_x1,PANEL_H)){ osd("Input: English (US) — only layout available"); G_quick=false; G_calendar=false; return; }
+        /* clipboard button */
+        if(ptin(x,y,G_clip_x0,0,G_clip_x1,PANEL_H)){ G_clip_open=!G_clip_open; G_netlist_open=false; if(G_clip_open){ G_clipboard_len=(int)clipboard_get(G_clipboard,sizeof G_clipboard); if(G_clipboard_len<0)G_clipboard_len=0; } G_quick=false; G_calendar=false; return; }
+        /* wifi ">" chevron -> real scan + network list */
+        if(!(G_wifi && G_net_up) && ptin(x,y,G_net_x0,0,G_net_x1,PANEL_H)){ G_netlist_open=!G_netlist_open; G_clip_open=false; if(G_netlist_open){ wifi_scan(); G_netlist_len=(int)wifi_status(G_netlist,sizeof G_netlist); if(G_netlist_len<0)G_netlist_len=0; } G_quick=false; G_calendar=false; return; }
+        if(ptin(x,y,G_sys_x0,0,G_sys_x1,PANEL_H)){ G_quick=!G_quick; G_calendar=false; return; }
+        int th=tray_hit(x,y); if(th>=0){ G_quick=!G_quick; G_calendar=false; return; }
+        return;
+    }
+    win_t *w=win_at(x,y);
+    if(w){ int ty=w->y-TB_H; if(ty<PANEL_H)ty=PANEL_H; bring_front(w); wm_focus(w->owner); G_focus_win=(int)(w-G_win);
+        if(ptin(x,y,w->x,ty,w->x+w->w,ty+TB_H)){
+            /* [min] [max] [close] buttons on the right (Skift style) */
+            int bx=w->x+w->w-TB_H+4, by=ty+4, bs=TB_H-8;
+            if(ptin(x,y,bx,by,bx+bs,by+bs)){ close_win(w); return; }         /* close */
+            bx-=bs+2;
+            if(ptin(x,y,bx,by,bx+bs,by+bs)){ toggle_max(w); return; }        /* maximize */
+            bx-=bs+2;
+            if(ptin(x,y,bx,by,bx+bs,by+bs)){ minimize_win(w); return; }      /* minimize */
+            if(!w->maximized){
+                long now=time_ms();
+                if(now-G_last_title_click<320){ toggle_max(w); G_last_title_click=0; return; }
+                G_last_title_click=now;
+                G_title_drag=true;G_drag_win=(int)(w-G_win);G_drag_dx=x-w->x;G_drag_dy=(y+TB_H)-w->y;
+            } return;
         }
-    }
-}
-
-static void cursor_draw(surface_t *s, int id, int x, int y) {
-    if (id<0||id>=CUR_N) id=0;
-    surface_t *sp = &G_cursor_spr[id];
-    if (!sp->px || sp->w <= 0 || sp->h <= 0) return;
-    int x0 = x - G_cursor_hotx2[id], y0 = y - G_cursor_hoty2[id];
-    for (int j=0;j<sp->h;j++) {
-        int py = y0+j;
-        if ((u32)py >= (u32)s->h) continue;
-        for (int i=0;i<sp->w;i++) {
-            u32 c = sp->px[j*sp->pitch+i];
-            if (!A(c)) continue;
-            int px = x0+i;
-            if ((u32)px >= (u32)s->w) continue;
-            sf_putpx_blend(s, px, py, c);
+        if(!w->maximized){
+            int onl=x>=w->x-4&&x<=w->x+6, onr=x<=w->x+w->w+4&&x>=w->x+w->w-6;
+            int onb=y<=ty+TB_H+w->h+4&&y>=ty+TB_H+w->h-6;
+            int ont=y>=ty-4&&y<=ty+4;
+            if(onl||onr||onb||ont){ G_resize_win=(int)(w-G_win); G_resize_edges=(onl?1:0)|(onr?2:0)|(ont?4:0)|(onb?8:0); return; }
         }
+        return; }
+    int di=desk_hit(x,y); if(di>=0){ G_sel_desk=di; G_multi_sel=false; long now=time_ms(); G_double=(now-G_last_click_desk<450&&G_last_click_idx==di); G_last_click_desk=now;G_last_click_idx=di; if(G_double){ if(G_desk[di].kind==4)launch_app("trash"); else if(G_desk[di].kind<=3)launch_app("/bin/files"); else launch_app(G_desk[di].path); G_double=false;} else { int x0,y0,x1,y1; desk_rect(di,&x0,&y0,&x1,&y1); G_drag_icon=di; G_icon_dx=x-x0; G_icon_dy=y-y0; G_icon_drag=true; } return; }
+    if(desktop_area(y)){ G_sel_desk=-1; G_desktop_drag=true; G_marquee=false; G_mx0=G_mx1=x; G_my0=G_my1=y; wm_focus(0); return; }
+    int dk=dock_hit(x,y); if(dk>=0){ launch_dock(dk); return; }
+    wm_focus(0); G_focus_win=-1;
+}
+void win_snap(win_t*w,int side){
+    if(!w)return;
+    if(side==3){ toggle_max(w); return; }
+    if(w->maximized){ /* restore from maximize to saved geometry first */
+        wm_move(w->id,w->saved_x,w->saved_y); w->w=w->saved_w; w->h=w->saved_h; w->maximized=false;
+    }
+    if(w->snap!=side){
+        if(!w->snap){ w->saved_x=w->x; w->saved_y=w->y; w->saved_w=w->w; w->saved_h=w->h; }
+        int gap=6, top=PANEL_H+4;
+        if(side==1){ w->x=gap; w->y=top; w->w=G_fb.w/2-gap; w->h=G_fb.h-top-gap; }
+        else if(side==2){ w->x=G_fb.w/2; w->y=top; w->w=G_fb.w/2-gap; w->h=G_fb.h-top-gap; }
+        wm_move(w->id,w->x,w->y); wm_resize(w->id,w->w,w->h); w->snap=side;
+    } else { /* unsnap */
+        w->x=w->saved_x; w->y=w->saved_y; w->w=w->saved_w; w->h=w->saved_h;
+        wm_move(w->id,w->x,w->y); wm_resize(w->id,w->w,w->h); w->snap=0;
+    }
+    g_backdrop_dirty=true; damage_whole();
+}
+static win_t*focused_win(void){ if(G_focus_win<0)return 0; win_t*w=&G_win[G_focus_win]; if(w->active)return w; return 0; }
+static void handle_drag(int x,int y){
+    if(G_quick){ int bx=G_quick_x+16, slx=bx+26, slw=G_quick_w-58;
+        if(G_mb&1 && x>=slx-4 && x<=slx+slw+4){ int v=(x-slx)*100/slw; if(v<0)v=0; if(v>100)v=100; G_vol=v; G_audio=v>0; audio_vol(v); damage_add((GfxRect){G_quick_x-4,G_quick_y-4,G_quick_w+8,G_quick_h+8}); return; } }
+    if(G_resize_win>=0&&G_resize_win<MAX_WIN&&G_win[G_resize_win].active){ win_t*w=&G_win[G_resize_win];
+        int nx=w->x, ny=w->y, nw=w->w, nh=w->h;
+        if(G_resize_edges&1){ int dx=x-w->x; if(w->w-dx>=240){nx=x;nw=w->w-dx;} }
+        if(G_resize_edges&2){ nw=x-w->x; if(nw<240)nw=240; }
+        if(G_resize_edges&4){ int dh=w->y-y; if(w->h+dh>=120){ ny=y; nh=w->h+dh; } }
+        if(G_resize_edges&8){ nh=y-(w->y-TB_H)-TB_H; if(nh<120)nh=120; }
+        if(nx<0){nx=0;} if(nx+nw>G_fb.w){nw=G_fb.w-nx;}
+        wm_move(w->id,nx,ny); wm_resize(w->id,nw,nh); w->x=nx;w->y=ny;w->w=nw;w->h=nh;w->dirty=true; }
+    else if(G_title_drag&&G_drag_win>=0&&G_drag_win<MAX_WIN&&G_win[G_drag_win].active){
+        /* drag slop: ignore tiny movements so clicks don't jiggle the window */
+        if(absi(x-G_pressed_x)+absi(y-G_pressed_y) < 5) return;
+        win_t*w=&G_win[G_drag_win]; int nx=x-G_drag_dx,ny=maxi(PANEL_H+24,y-G_drag_dy); if(nx<20)nx=20; if(nx>G_fb.w-60)nx=G_fb.w-60; wm_move(w->id,nx,ny); w->x=nx;w->y=ny;w->dirty=true; }
+    if(G_icon_drag&&G_drag_icon>=0){ int nx=x-G_icon_dx,ny=y-G_icon_dy; if(nx<8)nx=8; if(ny<PANEL_H+8)ny=PANEL_H+8; if(nx>G_fb.w-96)nx=G_fb.w-96; if(ny>G_dock_y-96)ny=G_dock_y-96; G_desk[G_drag_icon].gx=nx; G_desk[G_drag_icon].gy=ny; g_backdrop_dirty=true; damage_whole(); }
+    else if(G_desktop_drag&&desktop_area(G_pressed_y)){ if(absi(x-G_pressed_x)>4||absi(y-G_pressed_y)>4)G_marquee=true;
+        GfxRect oldr={(G_mx0<G_mx1?G_mx0:G_mx1)-1,(G_my0<G_my1?G_my0:G_my1)-1,absi(G_mx1-G_mx0)+2,absi(G_my1-G_my0)+2};
+        G_mx1=x;G_my1=y; if(G_marquee)G_multi_sel=true;
+        GfxRect newr={(G_mx0<G_mx1?G_mx0:G_mx1)-1,(G_my0<G_my1?G_my0:G_my1)-1,absi(G_mx1-G_mx0)+2,absi(G_my1-G_my0)+2};
+        damage_add(oldr); damage_add(newr);
     }
 }
-
-/* ================================================================
- * Restore helpers (blit wallpaper back into dirty rects)
- * ================================================================ */
-static void restore_rect(surface_t *fb, int x0, int y0, int w, int h) {
-    if (x0<0) x0=0;
-    if (y0<0) y0=0;
-    if (x0+w>fb->w) w=fb->w-x0;
-    if (y0+h>fb->h) h=fb->h-y0;
-    if (w<=0||h<=0) return;
-    sf_blit(fb, x0, y0, &G_wp, x0, y0, w, h);
-}
-static void draw_one_window(win_t *w);   /* defined later */
-
-/* Wallpaper-restore that re-blits any app window intersecting the rect
- * (otherwise moving the cursor over a window would punch wallpaper holes
- * through it). */
-static void restore_rect_win(surface_t *fb, int x0, int y0, int w, int h) {
-    restore_rect(fb, x0, y0, w, h);
-    for (int i=0;i<WM_MAX_WIN;i++) {
-        win_t *win = &G_wins[i];
-        if (!win->active || !win->va) continue;
-        int ty = win->y - 24;
-        if (ty < PANEL_H) ty = PANEL_H;
-        if (x0 < win->x + win->w && x0 + w > win->x &&
-            y0 < ty + 24 + win->h && y0 + h > ty) {
-            draw_one_window(win);
-        }
-    }
-}
-
-static void restore_cursor(surface_t *fb) {
-    if (G_last_cx < 0) return;
-    /* 44x44 covers both the 24px procedural and the 32px photo cursors */
-    restore_rect_win(fb, G_last_cx-14, G_last_cy-14, 44, 44);
-}
-static void restore_tooltip(surface_t *fb) {
-    if (!G_tooltip_dirty) return;
-    restore_rect(fb, G_tip_x0, G_tip_y0, G_tip_x1-G_tip_x0, G_tip_y1-G_tip_y0);
-    G_tooltip_dirty = 0;
-}
-static void restore_dock_region(surface_t *fb) {
-    if (!G_dock_dirty) return;
-    restore_rect(fb, G_dock_spr_x0, G_dock_spr_y0, G_dock_spr_w, G_dock_spr_h);
-    G_dock_dirty = 0;
-}
-static void restore_panel(surface_t *fb) {
-    if (!G_panel_dirty) return;
-    restore_rect(fb, 0, 0, fb->w, PANEL_H+2);
-    G_panel_dirty = 0;
-}
-
-/* ================================================================
- * Chrome renderers (called once at startup / resolution change)
- * ================================================================ */
-static void draw_logo(surface_t *s, int x, int y) {
-    u32 fg = C_ACCENT;
-    int pts[][2] = {
-        {1,2},{2,2},{5,2},{6,2},
-        {2,3},{3,3},{4,3},{5,3},
-        {3,4},{4,4},{3,5},{4,5},{3,6},{4,6},{3,7},{4,7},{3,8},{4,8},{3,9},{4,9},
-    };
-    for (unsigned i=0; i<sizeof(pts)/sizeof(pts[0]); i++)
-        sf_putpx(s, x+pts[i][0], y+pts[i][1], fg);
-}
-
-static void build_panel_sprite(void) {
-    int w = G_fb.w, h = PANEL_H+2;
-    if (G_panel_spr.px) sf_free(&G_panel_spr);
-    G_panel_spr = sf_alloc(w, h);
-    sf_blit(&G_panel_spr, 0, 0, &G_wp, 0, 0, w, h);
-    sf_fill_rect_blend(&G_panel_spr, 0, 0, w, PANEL_H, C_PANEL_BG);
-    sf_hline(&G_panel_spr, 0, 0, w, C_PANEL_HILITE);
-    sf_hline(&G_panel_spr, 0, PANEL_H, w, C_PANEL_HAIR);
-    // Yart text removed per user request, keep only logo icon
-    draw_logo(&G_panel_spr, 12, 6);
-}
-
-static void build_dock_sprite(void) {
-    int content_w = G_dock_count*DOCK_MW + 8;
-    int dock_w = content_w + DOCK_PADX*2;
-    int dock_h = DOCK_H;
-    int dock_x = G_fb.w/2 - dock_w/2;
-    int dock_y = G_fb.h - dock_h - DOCK_MARGIN;
-    int dock_r = DOCK_RAD;
-    G_dock_x = dock_x; G_dock_y = dock_y; G_dock_w = dock_w; G_dock_h = dock_h;
-    int spr_w = dock_w + DOCK_SHADOW*2 + 4;
-    int spr_h = dock_h + DOCK_SHADOW*2 + 6;
-    int spr_x = dock_x - DOCK_SHADOW - 2;
-    int spr_y = dock_y - DOCK_SHADOW - 2;
-    G_dock_spr_x0 = spr_x; G_dock_spr_y0 = spr_y;
-    G_dock_spr_w = spr_w; G_dock_spr_h = spr_h;
-    if (G_dock_spr.px) sf_free(&G_dock_spr);
-    G_dock_spr = sf_alloc(spr_w, spr_h);
-    int wsx = spr_x, wsy = spr_y, wsw = spr_w, wsh = spr_h;
-    if (wsx < 0) { wsw += wsx; wsx = 0; }
-    if (wsy < 0) { wsh += wsy; wsy = 0; }
-    if (wsx + wsw > G_wp.w) wsw = G_wp.w - wsx;
-    if (wsy + wsh > G_wp.h) wsh = G_wp.h - wsy;
-    if (wsw > 0 && wsh > 0) sf_blit(&G_dock_spr, wsx - spr_x, wsy - spr_y, &G_wp, wsx, wsy, wsw, wsh);
-    // macOS-like blur for frosted glass, no black outline
-    sf_blur_rect(&G_dock_spr, 0, 0, spr_w, spr_h, 8, 2);
-    int lx = DOCK_SHADOW+2, ly = DOCK_SHADOW+2;
-    for (int pass=0; pass<4; pass++) {
-        int e = 4-pass;
-        int a = (int[]){6,12,20,28}[pass];
-        sf_round_rect_blend(&G_dock_spr, lx-e, ly-e+3, dock_w+2*e, dock_h+2*e+2, dock_r+e, ARGB(a,0,0,0));
-    }
-    sf_round_rect_blend(&G_dock_spr, lx, ly, dock_w, dock_h, dock_r, C_DOCK_TINT);
-    sf_round_rect_blend(&G_dock_spr, lx, ly, dock_w, dock_h*2/5, dock_r, C_DOCK_INNER);
-    sf_fill_rect_blend(&G_dock_spr, lx+dock_r, ly+dock_h*2/5, dock_w-2*dock_r, dock_h*2/5, C_DOCK_INNER2);
-    // no border per user request - remove black outline
-}
-
-/* ================================================================
- * Panel content (text/dots/tray/clock) — drawn per frame over cached bg.
- * Returns the rightmost x it painted so the caller can track tray hits.
- * ================================================================ */
-static int draw_panel_content(surface_t *s, long now_ms) {
-    (void)now_ms; G_tray_n=0; int h=PANEL_H;
-    // Left: Kora icon for Activities (9-dot grid) - no text, uses icons per user request
-    int ax=12, ay=4, aw=32, ah=24;
-    u32 act_bg = G_overview||G_apps_grid? RGB(0x4A,0x4E,0x5A) : ARGB(0x28,0xFF,0xFF,0xFF);
-    sf_round_rect_blend(s, ax, ay, aw, ah, 8, act_bg);
-    icon_t act_ico = icon_get(ICON_DOCK_APPS_GRID);
-    if(act_ico.px) sf_icon_scaled(s, ax+aw/2, ay+ah/2, act_ico, TRAY_TINT, 18, 48);
-    G_activities_x0=ax; G_activities_x1=ax+aw;
-    int wx = ax+aw+16; int cy=h/2;
-    for(int i=0;i<G_ws_count;i++){ int active=(i==G_ws_active); if(active){ sf_round_rect(s, wx+i*18, cy-8, 16, 16, 8, C_PANEL_FG); sf_round_rect(s, wx+i*18+4, cy-4, 8, 8, 4, RGB(0x14,0x16,0x1B)); } else { u32 c=C_PANEL_DIM; int r=3; for(int dy=-r;dy<=r;dy++) for(int dx=-r;dx<=r;dx++) if(dx*dx+dy*dy<=r*r) sf_putpx(s, wx+8+i*18+dx, cy+dy, c); } }
-    // Center clock/date - clean, no extra
-    int cw = sf_text_width(G_clk_text) + sf_text_width(G_date_text) + 20;
-    int cx_center = s->w/2 - cw/2;
-    sf_text(s, cx_center, 8, G_date_text, C_PANEL_FG);
-    sf_text(s, cx_center+sf_text_width(G_date_text)+10, 8, G_clk_text, C_PANEL_FG);
-    G_clock_x0=cx_center-5; G_clock_x1=cx_center+cw+5;
-    // Right: system status with Kora icons only - wifi, sound, battery - clickable
-    int rx = s->w-16; int icon_sz=18; int pad=8;
-    icon_t ico = icon_get(ICON_TRAY_BATTERY); int bat_x = rx - icon_sz - pad; if(ico.px){ sf_icon_tl(s, bat_x, (h-icon_sz)/2, ico, TRAY_TINT); G_tray[G_tray_n++]=(tray_hit_t){"battery", bat_x, (h-icon_sz)/2, bat_x+icon_sz, (h-icon_sz)/2+icon_sz, ICON_TRAY_BATTERY}; rx=bat_x; }
-    ico = icon_get(G_audio_up?ICON_TRAY_AUDIO_HI:ICON_TRAY_AUDIO_MUTE); int audio_x = rx - icon_sz - pad; if(ico.px){ sf_icon_tl(s, audio_x, (h-icon_sz)/2, ico, TRAY_TINT); G_tray[G_tray_n++]=(tray_hit_t){"audio", audio_x, (h-icon_sz)/2, audio_x+icon_sz, (h-icon_sz)/2+icon_sz, G_audio_up?ICON_TRAY_AUDIO_HI:ICON_TRAY_AUDIO_MUTE}; rx=audio_x; }
-    if(G_wifi_up || G_net_up){ int wifi_icon = ICON_TRAY_NET_WIRED; ico = icon_get(wifi_icon); int net_x = rx - icon_sz - pad; if(ico.px){ sf_icon_tl(s, net_x, (h-icon_sz)/2, ico, G_wifi_up? RGB(0x5B,0xA7,0xDF): TRAY_TINT); G_tray[G_tray_n++]=(tray_hit_t){ G_wifi_up?"wifi":"ethernet", net_x, (h-icon_sz)/2, net_x+icon_sz, (h-icon_sz)/2+icon_sz, wifi_icon }; rx=net_x; } } else { ico = icon_get(ICON_TRAY_NET_IDLE); int net_x = rx - icon_sz - pad; if(ico.px){ sf_icon_tl(s, net_x, (h-icon_sz)/2, ico, TRAY_TINT); G_tray[G_tray_n++]=(tray_hit_t){"network", net_x, (h-icon_sz)/2, net_x+icon_sz, (h-icon_sz)/2+icon_sz, ICON_TRAY_NET_IDLE}; rx=net_x; } }
-    int pill_x0 = rx - 10; int pill_x1 = s->w - 6; sf_round_rect_blend(s, pill_x0, 4, pill_x1-pill_x0, h-8, 12, ARGB(0x20,0xFF,0xFF,0xFF)); G_sys_x0=pill_x0; G_sys_x1=pill_x1;
-    return rx;
-}
-
-
-/* ================================================================
- * Tooltip
- * ================================================================ */
-static void draw_tooltip(surface_t *s, int item, long now_ms) {
-    if (item<0||item>=DOCK_N) return;
-    long dt = now_ms - G_tooltip_t0;
-    if (dt < TOOLTIP_DELAY_MS) return;
-    int a=235;
-    if (dt < TOOLTIP_DELAY_MS+TOOLTIP_FADE_MS) {
-        a = (int)(235*(dt-TOOLTIP_DELAY_MS)/TOOLTIP_FADE_MS);
-        if (a<0) a=0;
-        if (a>235) a=235;
-    }
-    const char *txt = G_dock[item].name;
-    int tw = sf_text_width(txt), padx=10, pady=4;
-    int w = tw+padx*2, h = 16+pady*2;
-    int start_x = G_dock_x + G_dock_w/2 - (DOCK_N-1)*DOCK_MW/2;
-    int slot_cx = start_x + item*DOCK_MW;
-    int tx = slot_cx - w/2;
-    int ty = G_dock_y - h - 8;
-    if (tx<4) tx=4;
-    if (tx+w>s->w-4) tx=s->w-4-w;
-    G_tip_x0=tx-2; G_tip_y0=ty-2; G_tip_x1=tx+w+2; G_tip_y1=ty+h+2;
-    u32 bg = ARGB(a,0x24,0x27,0x2E);
-    u32 bd = ARGB(a*200/235,0x6B,0x71,0x7B);
-    u32 fg = ARGB(a,0xFF,0xFF,0xFF);
-    sf_round_rect_blend(s, tx-1, ty-1, w+2, h+2, 6, ARGB(a/3,0,0,0));
-    sf_round_rect_blend(s, tx, ty, w, h, 5, bg);
-    sf_round_rect_blend(s, tx, ty, w, h, 5, bd);
-    sf_text_blend(s, tx+padx, ty+pady, txt, fg);
-    sf_putpx_blend(s, slot_cx,   ty+h,   bg);
-    sf_putpx_blend(s, slot_cx-1, ty+h,   bg);
-    sf_putpx_blend(s, slot_cx+1, ty+h,   bg);
-    sf_putpx_blend(s, slot_cx,   ty+h-1, bg);
-    G_tooltip_dirty = 1;
-}
-
-/* ================================================================
- * Dock: blit cached sprite, draw icons + dots.
- *
- * Magnification picks the single NEAREST icon to the mouse (within
- * MAG_RADIUS horizontally and within the dock+shadow band vertically)
- * and applies a gaussian-bell scale to that icon alone. Neighbors
- * stay at rest size unless they also fall into the bell, which only
- * happens for very tight spacing - with DOCK_MW=40 and MAG_RADIUS=28
- * only the hovered icon grows, which is the macOS-like behavior
- * users expect.
- * ================================================================ */
-static void draw_dock_content(surface_t *s, long now_ms, int pressed) {
-    int mx=G_cx, my=G_cy;
-    int slot_pos[DOCK_N];
-    int start_x = G_dock_x + G_dock_w/2 - (DOCK_N-1)*DOCK_MW/2;
-    int over_dock = (my >= G_dock_y-24 && my <= G_dock_y+G_dock_h+10);
-    /* Find nearest icon horizontally */
-    int hover = -1;
-    int best_d = 0x7FFFFFFF;
-    for (int i=0;i<DOCK_N;i++) {
-        slot_pos[i] = start_x + i*DOCK_MW;
-        int d = abs_int(slot_pos[i]-mx);
-        if (over_dock && d < best_d) { best_d = d; hover = i; }
-    }
-    /* Only magnify if within radius (otherwise hover stays -1) */
-    if (best_d > MAG_RADIUS) hover = -1;
-
-    for (int i=0;i<DOCK_N;i++) {
-        if (i==hover) {
-            int t = (best_d*1024)/MAG_RADIUS;
-            int w = 1024 - (t*t)/1024;
-            int m = (MAG*w)/1024;
-            G_slot_target_sz[i] = ICON_SZ + m*2;
-            G_slot_target_lift[i] = m*3/4;
-        } else {
-            G_slot_target_sz[i] = ICON_SZ;
-            G_slot_target_lift[i] = 0;
-        }
-    }
-    if (hover>=0) {
-        if (G_tooltip_item!=hover) { G_tooltip_item=hover; G_tooltip_t0=now_ms; G_tooltip_dirty=1; }
-    } else {
-        if (G_tooltip_item!=-1) { G_tooltip_dirty=1; G_tooltip_item=-1; G_tip_x0=G_tip_y0=G_tip_x1=G_tip_y1=0; }
-    }
-
-    /* Smooth tween toward targets. IMPORTANT: snap when within 1px to
-     * avoid 1px oscillation (the old code did +1/-1 every frame when
-     * ds==±1, which kept tweening==true forever and caused TCG freezes).
-     * Bounce physics: when G_slot_bounce[i] is non-zero we decay it toward
-     * zero and add it to the target lift so clicked icons spring up and
-     * settle like macOS. */
-    int tweening = 0;
-    for (int i=0;i<DOCK_N;i++) {
-        /* decay bounce */
-        if (G_slot_bounce[i] != 0) {
-            G_slot_bounce[i] = (G_slot_bounce[i] * 7) / 10;
-            if (abs_int(G_slot_bounce[i]) < 2) G_slot_bounce[i] = 0;
-        }
-        int target_lift = G_slot_target_lift[i] + G_slot_bounce[i];
-        int ds = G_slot_target_sz[i] - G_slot_size[i];
-        int dl = target_lift - G_slot_lift[i];
-        if (abs_int(ds) <= 1) G_slot_size[i] = G_slot_target_sz[i];
-        else                  G_slot_size[i] += ds/3 + (ds>0?1:-1);
-        if (abs_int(dl) <= 1) G_slot_lift[i] = target_lift;
-        else                  G_slot_lift[i] += dl/3 + (dl>0?1:-1);
-        if (G_slot_size[i] != G_slot_target_sz[i] ||
-            G_slot_lift[i] != target_lift ||
-            G_slot_bounce[i] != 0) tweening = 1;
-        if (G_slot_size[i] < ICON_SZ)    G_slot_size[i] = ICON_SZ;
-        if (G_slot_size[i] > ICON_SZ+MAG*2) G_slot_size[i] = ICON_SZ+MAG*2;
-    }
-    (void)tweening;
-
-    /* Running dots */
-    for (int i=0;i<DOCK_N;i++) {
-        int cx=slot_pos[i], cy=G_dock_y+G_dock_h-4;
-        u32 c = (i==hover)?C_DOT_HOVER:C_DOT_RUN;
-        sf_putpx(s,cx,cy,c); sf_putpx(s,cx-1,cy,c); sf_putpx(s,cx+1,cy,c);
-    }
-
-    /* Hover pill (only under hovered icon; press = brighter) */
-    if (hover>=0) {
-        int cx = slot_pos[hover];
-        sf_round_rect_blend(s, cx-DOCK_MW/2+4, G_dock_y+4,
-                            DOCK_MW-8, G_dock_h-8, 8,
-                            pressed ? C_PRESS : C_HOVER);
-    }
-
-    /* Icons: rest size -> cached sprite blit; magnified -> per-pixel
-     * scale (only the hovered icon ever magnifies) */
-    for (int i=0;i<DOCK_N;i++) {
-        int cx=slot_pos[i], cy=G_dock_y+G_dock_h/2-1-G_slot_lift[i];
-        int sc=G_slot_size[i];
-        if (sc == ICON_SZ && G_icon_cache_ok && G_icon_cache[i].px) {
-            sf_blit_alpha(s, cx-ICON_SZ/2, cy-ICON_SZ/2, &G_icon_cache[i],
-                          0, 0, ICON_SZ, ICON_SZ);
-            continue;
-        }
-        icon_t ico = icon_get(G_dock[i].icon);
-        if (!ico.px) continue;
-        sf_icon_scaled(s, cx, cy, ico, 0, sc, ICON_SZ);
-    }
-    if (G_tooltip_item>=0) draw_tooltip(s, G_tooltip_item, now_ms);
-}
-
-static void draw_osd(surface_t *s, long now) {
-    long dt = now - G_osd_t0;
-    if (dt < 0) return;
-    if (dt > 1800) return;
-    int a;
-    if (dt < 200)       a = (int)(220*dt/200);          /* fade in */
-    else if (dt < 1300) a = 220;                         /* hold */
-    else                a = (int)(220*(1800-dt)/500);    /* fade out */
-    if (a<0) a=0;
-    if (a>255) a=255;
-    int tw = sf_text_width(G_osd_text);
-    int padx=18, pady=8;
-    int w=tw+padx*2, h=16+pady*2;
-    int x = s->w/2 - w/2;
-    int y = s->h - DOCK_H - DOCK_MARGIN - h - 30;
-    if (y < PANEL_H+10) y = PANEL_H+10;
-    u32 bg  = ARGB((u8)(a*200/220), 0x1E,0x21,0x28);
-    u32 bd  = ARGB((u8)(a*150/220), 0x6B,0x71,0x7B);
-    u32 fg  = ARGB((u8)a, 0xFF,0xFF,0xFF);
-    sf_round_rect_blend(s, x-2, y-2, w+4, h+4, 8, ARGB(a/3,0,0,0));
-    sf_round_rect_blend(s, x, y, w, h, 7, bg);
-    sf_round_rect_blend(s, x, y, w, h, 7, bd);
-    sf_text_blend(s, x+padx, y+pady, G_osd_text, fg);
-}
-
-/* ================================================================
- * Cursor selection per region
- * ================================================================ */
-static int cursor_pick(int x, int y) {
-    /* App window title bars -> hand */
-    for (int i=0;i<WM_MAX_WIN;i++) {
-        win_t *w = &G_wins[i];
-        if (!w->active) continue;
-        int ty = w->y - 24;
-        if (ty < PANEL_H) ty = PANEL_H;
-        if (x >= w->x && x < w->x + w->w && y >= ty && y < ty + 24)
-            return CUR_HAND;
-    }
-    /* Panel tray icons -> hand */
-    for (int i=0;i<G_tray_n;i++) {
-        if (x>=G_tray[i].x0 && x<G_tray[i].x1 && y>=G_tray[i].y0 && y<G_tray[i].y1)
-            return CUR_HAND;
-    }
-    /* Workspace dots / plus */
-    if (y < PANEL_H) {
-        int wx = 24 + sf_text_width("Yart") + 20;
-        if (x >= wx-4 && x < wx + MAX_WS*12 + 18) return CUR_HAND;
-    }
-    /* Dock icons -> hand */
-    if (y >= G_dock_y-8 && y <= G_dock_y+G_dock_h) {
-        int start_x = G_dock_x + G_dock_w/2 - (DOCK_N-1)*DOCK_MW/2;
-        for (int i=0;i<DOCK_N;i++) {
-            int cx = start_x + i*DOCK_MW;
-            if (abs_int(x-cx) < DOCK_MW/2) return CUR_HAND;
-        }
-    }
-    return CUR_ARROW;
-}
-
-/* ================================================================
- * Click handling
- * ================================================================ */
-static void launch_settings(void);   /* defined below */
-static void handle_click(int x, int y, int button) {
-    if (button != 1) return;
-    /* App windows: title bar (close / refocus) and surface (focus).  A
-     * click anywhere else drops the input focus back to the wm. */
-    for (int i=0;i<WM_MAX_WIN;i++) {
-        win_t *w = &G_wins[i];
-        if (!w->active) continue;
-        int ty = w->y - 24;
-        if (ty < PANEL_H) ty = PANEL_H;
-        if (x >= w->x && x < w->x + w->w) {
-            if (y >= ty && y < ty + 24) {
-                /* title bar: close button or focus */
-                int cx = w->x + w->w - 18, cy = ty + 12;
-                if ((x-cx)*(x-cx) + (y-cy)*(y-cy) <= 81) {
-                    /* close = destroy the surface AND kill the app (the
-                     * app keeps running invisible otherwise, and clicking
-                     * the dock icon again would refocus a windowless
-                     * ghost that never relaunches) */
-                    wm_destroy(w->id);
-                    kill((long)w->owner);
-                    if (G_app_pid == (int)w->owner) G_app_pid = 0;
-                    klog("wm: close button clicked\n");
-                } else {
-                    wm_focus(w->owner);
-                }
-                return;
-            }
-            if (y >= ty + 24 && y < ty + 24 + w->h) {
-                wm_focus(w->owner);
-                return;
+static void handle_release(int x,int y,int button){
+    if(button!=1)return;
+    if(G_grid&&G_sel_app>=0){ int ai; if(app_grid_hit(x,y,&ai)&&ai==G_sel_app){launch_app(G_app[ai].path);G_grid=false;} G_sel_app=-1; }
+    if(G_title_drag){
+        G_title_drag=false; G_drag_win=-1;
+        /* edge snapping */
+        win_t*w=focused_win();
+        if(w && !w->maximized){
+            if(x<=4) win_snap(w,1);
+            else if(x>=G_fb.w-5) win_snap(w,2);
+            else if(y<=PANEL_H+2) win_snap(w,3);
+            else if(w->snap){ /* dragged away from snap -> restore */
+                w->x=x-w->w/2; w->y=y-15; if(w->x<0)w->x=0; if(w->y<PANEL_H)w->y=PANEL_H;
+                wm_move(w->id,w->x,w->y); w->snap=0; g_backdrop_dirty=true; damage_whole();
             }
         }
     }
-    /* clicking outside any window releases input focus */
-    {
-        bool inside = false;
-        for (int i=0;i<WM_MAX_WIN;i++) {
-            win_t *w = &G_wins[i];
-            if (!w->active) continue;
-            int ty = w->y - 24;
-            if (ty < PANEL_H) ty = PANEL_H;
-            if (x >= w->x && x < w->x + w->w &&
-                y >= ty && y < ty + 24 + w->h) { inside = true; break; }
-        }
-        if (!inside) wm_focus(0);
-    }
-    /* Tray */
-    for (int i=0;i<G_tray_n;i++) {
-        if (x>=G_tray[i].x0 && x<G_tray[i].x1 && y>=G_tray[i].y0 && y<G_tray[i].y1) {
-            /* For now: toggle audio / visual feedback only.
-             * Real actions (popup menus, etc.) come later. */
-            if (G_tray[i].icon == ICON_TRAY_AUDIO_HI ||
-                G_tray[i].icon == ICON_TRAY_AUDIO_MUTE) G_audio_up ^= 1;
-            else if (G_tray[i].icon == ICON_TRAY_NET_WIRED ||
-                     G_tray[i].icon == ICON_TRAY_NET_IDLE) G_net_up ^= 1;
-            G_panel_dirty = 1;
-            return;
-        }
-    }
-    /* Workspace plus button */
-    if (y < PANEL_H) {
-        int wx = 24 + sf_text_width("Yart") + 20;
-        int plus_x = wx + G_ws_count*12 + 6;
-        if (G_ws_count<MAX_WS && abs_int(x-plus_x)<4 && abs_int(y-PANEL_H/2)<6) {
-            G_ws_count++; G_panel_dirty=1; return;
-        }
-        /* Workspace dot click -> switch */
-        for (int i=0;i<G_ws_count;i++) {
-            int cx = wx+i*12, cy=PANEL_H/2;
-            if ((x-cx)*(x-cx)+(y-cy)*(y-cy) <= 16) { G_ws_active=i; G_panel_dirty=1; return; }
-        }
-    }
-    /* Dock icon click: launch the real app / act on the concept. */
-    if (y >= G_dock_y-4 && y <= G_dock_y+G_dock_h) {
-        int start_x = G_dock_x + G_dock_w/2 - (DOCK_N-1)*DOCK_MW/2;
-        for (int i=0;i<DOCK_N;i++) {
-            int cx = start_x + i*DOCK_MW;
-            if (abs_int(x-cx) < DOCK_MW/2) {
-                G_slot_bounce[i] = 16;   /* initial upward velocity */
-                G_slot_bounce_t0[i] = time_ms();
-                G_dock_dirty = 1;
-                if (i == 0) {
-                    launch_settings();           /* the REAL app */
-                } else {
-                    /* Trash: a real concept, currently always empty */
-                    const char *msg = "Trash is empty";
-                    int k=0; const char *p=msg;
-                    while (*p && k<(int)sizeof(G_osd_text)-1) G_osd_text[k++]=*p++;
-                    G_osd_text[k]=0;
-                    G_osd_t0 = time_ms();
+    if(G_resize_win>=0){G_resize_win=-1;}
+    if(G_icon_drag){
+        G_icon_drag=false;
+        if(G_drag_icon>=0){
+            /* snap to 104x100 grid */
+            int gx=(G_desk[G_drag_icon].gx+52*G_scale)/(104*G_scale)*(104*G_scale)+18;
+            int gy=((G_desk[G_drag_icon].gy-PANEL_H-18*G_scale+50*G_scale)/(100*G_scale))*(100*G_scale)+PANEL_H+18*G_scale;
+            if(gx<18){gx=18;} if(gy<PANEL_H+18*G_scale){gy=PANEL_H+18*G_scale;}
+            if(gx>G_fb.w-104*G_scale){gx=G_fb.w-104*G_scale;} if(gy>G_dock_y-100*G_scale){gy=G_dock_y-100*G_scale;}
+            /* avoid overlap with other icons */
+            for(int attempt=0;attempt<60;attempt++){
+                int clash=0;
+                for(int j=0;j<G_desk_n;j++) if(j!=G_drag_icon){
+                    int dx=gx-G_desk[j].gx, dy=gy-G_desk[j].gy;
+                    if(dx>-80&&dx<80&&dy>-80&&dy<80){clash=1;break;}
                 }
-                return;
+                if(!clash)break;
+                gx+=104*G_scale; if(gx>G_fb.w-104*G_scale){gx=18;gy+=100*G_scale;}
             }
+            G_desk[G_drag_icon].gx=gx; G_desk[G_drag_icon].gy=gy;
+            save_config();
         }
+        G_drag_icon=-1;
     }
+    if(G_desktop_drag){ if(!G_marquee&&G_sel_desk<0){} G_desktop_drag=false; }
 }
-
-/* ================================================================
- * Real apps: window surfaces (composited by this wm)
- * ================================================================ */
-static win_t *win_find(u32 id) {
-    for (int i=0;i<WM_MAX_WIN;i++)
-        if (G_wins[i].active && G_wins[i].id == id) return &G_wins[i];
-    return NULL;
-}
-static win_t *win_alloc(void) {
-    for (int i=0;i<WM_MAX_WIN;i++)
-        if (!G_wins[i].active) return &G_wins[i];
-    return NULL;
-}
-
-/* Ask the kernel for the current surfaces; track + focus new ones. */
-static void wm_scan_windows(void) {
-    wm_surf_info_t arr[WM_MAX_WIN];
-    int n = (int)wm_scan(arr, WM_MAX_WIN);
-    if (n < 0) return;
-    /* mark all as unseen this pass */
-    for (int i=0;i<WM_MAX_WIN;i++) G_wins[i].seen = false;
-    for (int i=0;i<n;i++) {
-        wm_surf_info_t *si = &arr[i];
-        win_t *w = win_find(si->id);
-        if (!w) {
-            w = win_alloc();
-            if (!w) continue;
-            w->active = true; w->id = si->id;
-            w->owner = si->owner_pid;
-            w->dirty = true;
-            G_win_dirty = 1;
-            /* new window: give it input focus */
-            wm_focus(si->owner_pid);
-            if (G_app_pid == 0) G_app_pid = (int)si->owner_pid;
-            klog("wm: new app window (surface ");
-            { char b[8]; itoa0((int)si->id,b,0); klog(b); }
-            klog(") pid ");
-            { char b[8]; itoa0((int)si->owner_pid,b,0); klog(b); klog("\n"); }
-        }
-        w->seen = true;
-        w->misses = 0;
-        w->x = (int)si->win_x; w->y = (int)si->win_y;
-        w->w = (int)si->w;     w->h = (int)si->h;
-        w->va = si->app_va;                 /* wm-side mapping           */
-        if (si->dirty) { w->dirty = true; G_win_dirty = 1; }
-    }
-    /* windows that vanished: the app exited - clear state.  Require two
-     * consecutive misses so a single empty/failed scan cannot nuke a live
-     * window and trigger a full repaint that erases it. */
-    for (int i=0;i<WM_MAX_WIN;i++) {
-        if (G_wins[i].active && !G_wins[i].seen) {
-            if (++G_wins[i].misses < 2) continue;
-            if (G_app_pid == (int)G_wins[i].owner) G_app_pid = 0;
-            G_wins[i].active = false;
-            G_wins[i].dirty = false;
-            G_win_dirty = 1;
-            G_full_repaint = 1;      /* scrub its old pixels */
-        }
-    }
-}
-
-static void draw_one_window(win_t *w);   /* defined below */
-
-/* Draw every window that needs it (called from the paint path). */
-/* Erase every DIRTY window's old rect back to wallpaper (drag moves the
- * window; without this the old position keeps its pixels and smears). */
-static void restore_dirty_windows(void) {
-    for (int i=0;i<WM_MAX_WIN;i++) {
-        win_t *w = &G_wins[i];
-        if (!w->active || !w->dirty) continue;
-        int ty = w->y - 24;
-        if (ty < PANEL_H) ty = PANEL_H;
-        restore_rect(&G_fb, w->x - 6, ty - 6, w->w + 12,
-                     (ty + 24 + w->h) - (ty - 6));
-    }
-}
-
-static void draw_windows(void) {
-    if (!G_win_dirty && !G_full_repaint) return;
-    int drew = 0;
-    for (int i=0;i<WM_MAX_WIN;i++) {
-        if (!G_wins[i].active) continue;
-        if (!G_wins[i].dirty && !G_full_repaint) continue;
-        draw_one_window(&G_wins[i]);
-        drew++;
-    }
-    if (drew) G_win_dirty = 0;
-}
-
-/* Dock click on Settings: launch /bin/settings if it isn't running, else
- * refocus it.  fork() + exec() - the child becomes the app. */
-static void launch_settings(void) {
-    if (G_app_pid != 0) {
-        /* ghost check: if the app is alive but has NO window anymore
-         * (it was closed via the title-bar X), kill the leftover and
-         * relaunch fresh */
-        bool has_win = false;
-        for (int i=0;i<WM_MAX_WIN;i++)
-            if (G_wins[i].active && G_wins[i].owner == (u32)G_app_pid)
-                { has_win = true; break; }
-        if (!has_win) {
-            kill((long)G_app_pid);
-            G_app_pid = 0;
-        } else if (wm_focus((unsigned)G_app_pid) != 0) {
-            /* app died but we hadn't noticed: relaunch */
-            G_app_pid = 0;
-        } else {
-            return;
-        }
-    }
-    long pid = fork();
-    if (pid == 0) {
-        char *argv[] = { "/bin/settings", 0 };
-        char *envp[] = { "HOME=/home/yart", 0 };
-        long r = exec("/bin/settings", argv, envp);
-        (void)r;
-        klog("wm: exec /bin/settings failed\n");
-        exit(1);
-    } else if (pid > 0) {
-        G_app_pid = (int)pid;
-        klog("wm: launched settings (pid ");
-        { char b[8]; itoa0((int)pid,b,0); klog(b); }
-        klog(")\n");
-    }
-}
-
-/* Reap our app child when it exits (WNOHANG - never blocks the wm) so
- * G_app_pid doesn't point at a zombie and the dock can relaunch. */
-static void poll_app_child(void) {
-    if (G_app_pid <= 0) return;
-    int st = 0;
-    long r = waitpid_nohang((long)G_app_pid, &st);
-    if (r == G_app_pid || r == -1)
-        G_app_pid = 0;         /* reaped or already gone */
-}
-
-/* Poll /home/yart/cursor.conf once a second; the Settings app writes it
- * when the user picks a cursor theme. */
-static void poll_cursor_config(long now_ms) {
-    if (now_ms - G_cfg_last_check < 1000) return;
-    G_cfg_last_check = now_ms;
-    int fd = open("/home/yart/cursor.conf", 0);          /* O_RDONLY */
-    if (fd < 0) return;
-    char buf[96];
-    long n = read(fd, buf, (long)sizeof buf - 1);
-    close(fd);
-    if (n <= 0) return;
-    buf[n] = 0;
-    /* parse "theme=NAME" */
-    char *p = buf;
-    while (*p) {
-        if (p[0]=='t' && p[1]=='h' && p[2]=='e' && p[3]=='m' && p[4]=='e' && p[5]=='=') {
-            char name[24];
-            int i = 0;
-            p += 6;
-            while (*p && *p!='\n' && *p!='\r' && i<23) name[i++] = *p++;
-            name[i] = 0;
-            if (strcmp(name, G_theme_name) != 0) {
-                int t = 0;
-                if (strcmp(name, "classic") != 0) {
-                    int idx = cursors_theme_by_name(name);
-                    t = (idx >= 0) ? idx + 1 : 0;
-                }
-                cursor_apply_theme(t);
-                strncpy(G_theme_name, name, sizeof G_theme_name - 1);
-                G_last_cursor = -1;          /* force a repaint of the cursor */
-                klog("wm: cursor theme -> ");
-                klog(G_theme_name);
-                klog("\n");
+static void handle_key(int ev){
+    int ascii=ev&255, make=!(ev&WM_KEY_RELEASE), sc=(ev>>8)&255;
+    /* Track Super as a modifier (it arrives as an E0-prefixed 5B/5C). */
+    if((ev&WM_KEY_EXT) && (sc==0x5B || sc==0x5C)) G_super_held = make;
+    if(!make)return;
+    /* Locked: real password auth.  Enter opens the password field, the
+     * password is verified against the account hash (SYS_AUTH_VERIFY —
+     * no elevation), Esc cancels. */
+    if(G_locked){
+        if(!G_lock_prompt){
+            if(ascii==13 || ascii==10){
+                G_lock_prompt=true; G_lock_pw_len=0; G_lock_pw[0]=0; G_lock_bad=false;
+                damage_whole();
             }
             return;
         }
-        p++;
-    }
-}
-
-/* ================================================================
- * Input
- * ================================================================ */
-static void draw_one_window(win_t *w) {
-    int ty = w->y - 24;                 /* title bar above the surface  */
-    if (ty < PANEL_H) ty = PANEL_H;
-    int x0 = w->x - 6, y0 = ty - 6;
-    int x1 = w->x + w->w + 6, y1 = w->y + w->h + 6;
-    if (x0 < 0) x0 = 0;
-    if (y0 < 0) y0 = 0;
-    if (x1 > G_fb.w) x1 = G_fb.w;
-    if (y1 > G_fb.h) y1 = G_fb.h;
-    /* restore the wallpaper under the window first */
-    sf_blit(&G_fb, x0, y0, &G_wp, x0, y0, x1-x0, y1-y0);
-
-    /* drop shadow */
-    sf_round_rect_blend(&G_fb, w->x-3, ty-3, w->w+6, w->h+ty-w->y+6, 10,
-                        ARGB(90,0,0,0));
-    sf_round_rect_blend(&G_fb, w->x-2, ty-2, w->w+4, w->h+ty-w->y+4, 10,
-                        ARGB(50,0,0,0));
-    /* title bar */
-    sf_round_rect(&G_fb, w->x, ty, w->w, 24, 8, RGB(0x1E,0x21,0x28));
-    sf_fill_rect(&G_fb, w->x, ty+10, w->w, 14, RGB(0x1E,0x21,0x28));
-    sf_text(&G_fb, w->x+10, ty+5,
-            w->title[0] ? w->title : "App", RGB(0xEC,0xEE,0xF1));
-    /* close button (right) */
-    int cx = w->x + w->w - 18, cy = ty + 12;
-    sf_round_rect(&G_fb, cx-9, cy-9, 18, 18, 9, RGB(0x3A,0x3E,0x46));
-    sf_hline(&G_fb, cx-4, cy, 8, RGB(0xEC,0xEE,0xF1));
-    sf_vline(&G_fb, cx, cy-4, 8, RGB(0xEC,0xEE,0xF1));
-    /* body */
-    sf_fill_rect(&G_fb, w->x, ty+24, w->w, w->h, RGB(0x14,0x16,0x1B));
-    /* app content: the surface is mapped into OUR address space (the
-     * scan returned the wm-side VA) */
-    surface_t src;
-    src.px = (u32 *)w->va;
-    src.w = w->w; src.h = w->h; src.pitch = w->w;
-    if (src.px)
-        sf_blit(&G_fb, w->x, ty+24, &src, 0, 0, w->w, w->h);
-    w->dirty = false;
-}
-
-static void poll_input(void) {
-    int ev;
-    while ((ev = poll_key()) != 0) {
-        int scancode=(ev>>8)&0xFF, make=!(ev&0x80);
-        if (!make) continue;
-        /* F1..F12 and Super combos reserved for future; for now, just
-         * workspace switching with F1/F2/F3 and the existing bindings. */
-        if (scancode==0x3B && G_ws_count<MAX_WS) { G_ws_count++; G_panel_dirty=1; }
-        else if (scancode==0x3C && G_ws_count>1) {
-            G_ws_count--;
-            if (G_ws_active>=G_ws_count) G_ws_active=G_ws_count-1;
-            G_panel_dirty=1;
-        } else if (scancode==0x4D && G_ws_active+1<G_ws_count) { G_ws_active++; G_panel_dirty=1; }
-        else if (scancode==0x4B && G_ws_active>0) { G_ws_active--; G_panel_dirty=1; }
-        /* F5 = cycle wallpaper */
-        else if (scancode==0x3F) {
-            int n = wallpaper_count();
-            if (n > 0) {
-                G_wp_index = (G_wp_index + 1) % n;
-                wallpaper_load_index(G_wp_index);
-                wallpaper_bind(&G_wp);
-                G_full_repaint = 1;
-                G_panel_dirty = 1; G_dock_dirty = 1;
-                /* OSD: show wallpaper name */
-                const char *name = (G_wp_index < WP_NAMES_N) ? WP_NAMES[G_wp_index] : "Wallpaper";
-                int k=0; const char *p=name; while (*p && k<(int)sizeof(G_osd_text)-1) G_osd_text[k++]=*p++; G_osd_text[k]=0;
-                G_osd_t0 = time_ms();
-            }
+        if(ascii==27){
+            G_lock_prompt=false; G_lock_pw_len=0; G_lock_pw[0]=0; G_lock_bad=false;
+            damage_whole(); return;
         }
-    }
-    mouse_ev_t m;
-    int moved=0, clicked=0;
-    while (poll_mouse(&m)) {
-        G_cx+=m.dx; G_cy+=m.dy;
-        if (G_cx<0) G_cx=0;
-        if (G_cy<0) G_cy=0;
-        if (G_cx>=G_fb.w) G_cx=G_fb.w-1;
-        if (G_cy>=G_fb.h) G_cy=G_fb.h-1;
-        /* Detect a click: any button transition 0 -> 1 */
-        unsigned char prev = G_mb;
-        G_mb = m.buttons;
-        if ((G_mb & 1) && !(prev & 1)) { handle_click(G_cx, G_cy, 1); clicked=1; }
-        if ((G_mb & 2) && !(prev & 2)) { handle_click(G_cx, G_cy, 3); clicked=1; }
-        if ((G_mb & 4) && !(prev & 4)) { handle_click(G_cx, G_cy, 2); clicked=1; }
-        moved=1;
-    }
-    if (moved || clicked) G_dock_dirty = 1;
-}
-
-static void update_status(void) {
-    unsigned ni[5];
-    G_net_up = (net_info(ni)==0 && ni[4]!=0)?1:0;
-    G_audio_up = 1;
-    G_bat_up = 1;
-}
-
-/* ================================================================
- * Entry
- * ================================================================ */
-void wm_run(void) {
-    fb_info_t fi;
-    void *fb_px = fb_info(&fi);
-    if (!fb_px) { klog("wm: fb_info failed\n"); return; }
-    G_fb.px=(u32*)fb_px;
-    G_fb.w=(int)fi.w; G_fb.h=(int)fi.h; G_fb.pitch=(int)fi.pitch;
-    G_cx=G_fb.w/2; G_cy=G_fb.h/2;
-
-    assets_init();
-    cursors_init();                 /* photo cursor themes (from the web) */
-    cursor_build_all();
-    strncpy(G_theme_name, "classic", sizeof G_theme_name - 1);
-    for (int i=0;i<DOCK_N;i++) {
-        G_slot_size[i]=ICON_SZ; G_slot_lift[i]=0;
-        G_slot_target_sz[i]=ICON_SZ; G_slot_target_lift[i]=0;
-        G_slot_bounce[i]=0; G_slot_bounce_t0[i] = 0;
-    }
-
-    if (wallpaper_load(&G_wp)!=0 || G_wp.w!=G_fb.w || G_wp.h!=G_fb.h) {
-        klog("wm: wallpaper load failed\n"); return;
-    }
-    int n_wp = wallpaper_count();
-    sf_blit(&G_fb,0,0,&G_wp,0,0,G_fb.w,G_fb.h);
-    (void)n_wp;
-
-    build_icon_cache();
-    build_panel_sprite();
-    build_dock_sprite();
-    G_panel_dirty = 1; G_dock_dirty = 1;
-
-    G_start_ms = time_ms();
-    long wt = wall_time();
-    if (wt>0) format_wallclock(wt, G_clk_text);
-
-    klog("wm: ring-3 compositor up [cached chrome, single-icon tween, cursors, tray clicks]\n");
-
-    /* Auto-launch hook: if /home/yart/autolaunch exists, open the Settings
-     * app immediately (used by the boot test / headless verification). */
-    {
-        int af = open("/home/yart/autolaunch", 0);   /* O_RDONLY */
-        if (af >= 0) {
-            close(af);
-            klog("wm: autolaunch file present - launching Settings\n");
-            launch_settings();
-        }
-    }
-
-    unsigned long frames=0;
-    long fps_start=G_start_ms;
-    for (;;) {
-        poll_input();
-        update_status();
-        long now = time_ms();
-        long uptime = now - G_start_ms;
-        poll_cursor_config(now);        /* pick up Settings changes ~1s */
-        poll_app_child();               /* reap the app when it exits    */
-        wm_scan_windows();              /* new app windows -> focus+draw */
-
-        unsigned long s = (unsigned long)(uptime/1000);
-        if (s != G_last_clock_s) {
-            long wt2 = wall_time();
-            if (wt2>0) format_wallclock(wt2, G_clk_text);
-            else {
-                long secs=uptime/1000;
-                int h=(int)((secs/3600)%24),m_=(int)((secs/60)%60),s_=(int)(secs%60);
-                G_clk_text[0]='0'+h/10;G_clk_text[1]='0'+h%10;G_clk_text[2]=':';
-                G_clk_text[3]='0'+m_/10;G_clk_text[4]='0'+m_%10;G_clk_text[5]=':';
-                G_clk_text[6]='0'+s_/10;G_clk_text[7]='0'+s_%10;G_clk_text[8]=0;
-            }
-            G_panel_dirty=1; G_last_clock_s=s;
-        }
-
-        int cur_id = cursor_pick(G_cx, G_cy);
-        int cursor_moved = (G_last_cx!=G_cx || G_last_cy!=G_cy || G_last_cursor!=cur_id);
-        int pressed = (G_mb & 1) ? 1 : 0;
-        long osd_age = now - G_osd_t0;
-        int osd_visible = (osd_age >= 0 && osd_age < 1800);
-        static int s_osd_was_visible = 0;
-        int osd_just_gone = (s_osd_was_visible && !osd_visible);
-        s_osd_was_visible = osd_visible;
-
-        int tweening=0;
-        for (int i=0;i<DOCK_N;i++)
-            if (G_slot_size[i]!=G_slot_target_sz[i] || G_slot_lift[i]!=G_slot_target_lift[i])
-                { tweening=1; break; }
-        long dt = now - G_tooltip_t0;
-        int tooltip_anim = (G_tooltip_item>=0) &&
-            (dt < (long)(TOOLTIP_DELAY_MS+TOOLTIP_FADE_MS));
-
-        int need_paint = G_panel_dirty || G_dock_dirty || cursor_moved || tweening || tooltip_anim || G_full_repaint || osd_visible || osd_just_gone || G_win_dirty;
-        if (osd_just_gone) {
-            /* Clear the OSD area back to wallpaper so it doesn't linger. */
-            int tw = sf_text_width(G_osd_text);
-            int padx=18, w=tw+padx*2, h=32;
-            int x = G_fb.w/2 - w/2;
-            int y = G_fb.h - DOCK_H - DOCK_MARGIN - h - 30;
-            if (y < PANEL_H+10) y = PANEL_H+10;
-            restore_rect_win(&G_fb, x-6, y-6, w+12, h+12);
-        }
-        if (need_paint) {
-            if (G_full_repaint) {
-                /* Wallpaper switched: blit the entire wallpaper back */
-                sf_blit(&G_fb, 0, 0, &G_wp, 0, 0, G_fb.w, G_fb.h);
-                G_full_repaint = 0;
-                build_panel_sprite();
-                build_dock_sprite();
-                /* erase-without-redraw fix: mark every active window dirty */
-                for (int i=0;i<WM_MAX_WIN;i++)
-                    if (G_wins[i].active) {
-                        G_wins[i].dirty = true;
-                        G_win_dirty = 1;
-                    }
+        if(ascii==13 || ascii==10){
+            G_lock_pw[G_lock_pw_len]=0;
+            if(auth_verify(G_lock_pw)==0){
+                G_locked=false; G_lock_prompt=false; G_lock_bad=false;
+                G_lock_pw_len=0; G_lock_pw[0]=0; G_super_held=false;
             } else {
-                /* 1. Restore wallpaper under dirty regions */
-                restore_cursor(&G_fb);
-                restore_tooltip(&G_fb);
-                if (G_dock_dirty || tweening || tooltip_anim) restore_dock_region(&G_fb);
-                if (G_panel_dirty) restore_panel(&G_fb);
-                if (G_win_dirty) restore_dirty_windows();
+                G_lock_bad=true; G_lock_pw_len=0; G_lock_pw[0]=0;
             }
-            /* 2. Blit cached chrome */
-            sf_blit(&G_fb, 0, 0, &G_panel_spr, 0, 0, G_panel_spr.w, G_panel_spr.h);
-            sf_blit(&G_fb, G_dock_spr_x0, G_dock_spr_y0, &G_dock_spr,
-                    0, 0, G_dock_spr_w, G_dock_spr_h);
-            /* 3. Dynamic content */
-            draw_panel_content(&G_fb, now);
-            draw_dock_content(&G_fb, now, pressed);
-            /* 4. App windows (title bars + surfaces) */
-            draw_windows();
-            if (osd_visible) {
-                /* Wallpaper+chrome already painted under it; draw OSD on top.
-                 * We also need to have restored the OSD area from wallpaper,
-                 * which happens implicitly because osd_visible -> need_paint
-                 * and we re-blit the panel/dock sprites which cover the top/
-                 * bottom edges. For the desktop area the cursor restore /
-                 * dock_region restore doesn't cover it, so erase by blitting
-                 * wallpaper at OSD location first. */
-                int tw = sf_text_width(G_osd_text);
-                int padx=18, w=tw+padx*2, h=32;
-                int x = G_fb.w/2 - w/2;
-                int y = G_fb.h - DOCK_H - DOCK_MARGIN - h - 30;
-                if (y < PANEL_H+10) y = PANEL_H+10;
-                /* Clear prior frame (wallpaper + any window underneath) */
-                restore_rect_win(&G_fb, x-4, y-4, w+8, h+8);
-                /* Re-blit any dock shadow that overlaps that area (none at 30px above dock) */
-                draw_osd(&G_fb, now);
+            damage_whole(); return;
+        }
+        if(ascii==8 || ascii==127){
+            if(G_lock_pw_len>0){ G_lock_pw_len--; G_lock_pw[G_lock_pw_len]=0; }
+            damage_whole(); return;
+        }
+        if(ascii>=32 && ascii<127 && G_lock_pw_len < (int)sizeof(G_lock_pw)-1){
+            G_lock_pw[G_lock_pw_len++]=(char)ascii; G_lock_pw[G_lock_pw_len]=0;
+            damage_whole();
+        }
+        return;
+    }
+    /* Super+L -> lock screen (Skift parity). */
+    if(G_super_held && sc==0x26){ G_locked=true; G_super_held=false; damage_whole(); return; }
+    /* Ctrl+W -> close the focused window (standard enterprise-OS shortcut). */
+    if((ev&WM_KEY_CTRL) && sc==0x11){ win_t *fw=focused_win(); if(fw) close_win(fw); return; }
+    if(G_dockmenu){ if(ascii>=32&&ascii<127&&G_search_len<(int)sizeof(G_search)-1){G_search[G_search_len++]=(char)ascii;G_search[G_search_len]=0;} else if(ascii==8||ascii==127){if(G_search_len>0){G_search_len--;G_search[G_search_len]=0;}} else if(ascii==27){G_dockmenu=false;G_search_len=0;G_search[0]=0;} else if(ascii==13||ascii==10){ for(int i=0;i<G_apps;i++) if(search_match(G_app[i].name)){launch_app(G_app[i].path);G_dockmenu=false;G_search_len=0;G_search[0]=0;break;} } return; }
+    if(G_grid){ if(ascii>=32&&ascii<127&&G_search_len<(int)sizeof(G_search)-1){G_search[G_search_len++]=(char)ascii;G_search[G_search_len]=0;} else if(ascii==8||ascii==127){if(G_search_len>0){G_search_len--;G_search[G_search_len]=0;}} else if(ascii==27){G_grid=false;G_search_len=0;G_search[0]=0;} else if(ascii==13||ascii==10){ for(int i=0;i<G_apps;i++) if(search_match(G_app[i].name)){launch_app(G_app[i].path);G_grid=false;break;} } return; }
+    if(ascii==27){ if(G_switcher){ if(G_switcher_idx>=0&&G_switcher_idx<MAX_WIN){win_t*w=&G_win[G_switcher_idx]; if(w->active){bring_front(w); wm_focus(w->owner); G_focus_win=G_switcher_idx; if(w->minimized)restore_win(w);}} G_switcher=false; g_backdrop_dirty=true; damage_whole(); return; } close_all_overlays();return;}
+    /* Super (Meta) opens the launcher — Skift: Super+Space / search pill */
+    if((ev&WM_KEY_EXT) && (sc==0x5B || sc==0x5C)){ G_grid=!G_grid; if(G_grid){G_search_len=0; G_search[0]=0;} return; }
+    if(sc==0x3B||sc==0x3F){ G_grid=!G_grid; if(G_grid){G_search_len=0; G_search[0]=0;} return; }
+    if(sc==0x3C||sc==0x3D){ show_desktop_toggle(); }
+    if(sc==0x3E){ theme_reset_defaults(); if(theme_load("/home/yart/theme.ini")==0) osd("Theme reloaded (F4)"); else osd("Theme reset (F4)"); g_backdrop_dirty=true; damage_whole(); return; }
+    /* Workspace switching: Super+1..4 or Ctrl+Alt+Left/Right */
+    if((ev&WM_KEY_CTRL) && sc>=0x03 && sc<=0x06){ int ws=sc-0x03; if(ws<MAX_WORKSPACES && ws!=G_workspace){ G_workspace=ws; char b[32]; int k=0; const char*q="Workspace "; while(q[k]){b[k]=q[k];k++;} b[k++]='0'+1+ws; b[k]=0; osd(b); g_backdrop_dirty=true; damage_whole(); wm_focus(0); } return; }
+    if((ev&WM_KEY_CTRL) && sc==0x4B){ if(G_workspace>0){G_workspace--; osd("Workspace left"); g_backdrop_dirty=true; damage_whole();} return; }
+    if((ev&WM_KEY_CTRL) && sc==0x4D){ if(G_workspace<MAX_WORKSPACES-1){G_workspace++; if(G_workspace>=G_ws_count)G_ws_count=G_workspace+1; char b[32];int k=0;const char*q="Workspace ";while(q[k]){b[k]=q[k];k++;} b[k++]='0'+1+G_workspace; b[k]=0; osd(b); g_backdrop_dirty=true; damage_whole();} return; }
+    /* Ctrl+Alt+Up/Down -> Mission-Control-style overview */
+    if((ev&WM_KEY_CTRL) && (ev&WM_KEY_ALT) && (sc==0x48 || sc==0x50)){ G_overview=!G_overview; return; }
+    /* Alt+Tab window switcher (with live previews) */
+    if((ev&WM_KEY_ALT) && sc==0x0F && make){
+        if(!G_switcher) G_switcher_idx = -1;      /* first press: start fresh */
+        G_switcher=true;
+        int start=G_switcher_idx;
+        for(int step=0;step<MAX_WIN;step++){ G_switcher_idx=(G_switcher_idx+1)%MAX_WIN;
+            win_t*c=&G_win[G_switcher_idx];
+            if(c->active&&!c->minimized&&!c->closing&&(c->workspace==G_workspace||c->workspace<0)) break;
+        }
+        if(start==G_switcher_idx && !(G_win[G_switcher_idx].active&&!G_win[G_switcher_idx].minimized&&!G_win[G_switcher_idx].closing&&(G_win[G_switcher_idx].workspace==G_workspace||G_win[G_switcher_idx].workspace<0))){ G_switcher=false; }
+        damage_whole(); return;
+    }
+}
+static int cursor_pick(void){
+    int x=G_cx,y=G_cy;
+    if(G_menu){ if(menu_hit(x,y)>=-2) return 1; }
+    win_t *w=win_at(x,y);
+    if(w){
+        int ty=w->y-TB_H; if(ty<PANEL_H)ty=PANEL_H;
+        if(ptin(x,y,w->x,ty,w->x+w->w,ty+TB_H)) return 1;
+        /* resize cursor over the window edges (Skift ResizeCursor) */
+        if(!w->maximized){
+            int onl=x>=w->x-4&&x<=w->x+6, onr=x<=w->x+w->w+4&&x>=w->x+w->w-6;
+            int onb=y<=ty+TB_H+w->h+4&&y>=ty+TB_H+w->h-6;
+            int ont=y>=ty-4&&y<=ty+4;
+            if(onl||onr||onb||ont) return 2;
+        }
+    }
+    if(tray_hit(x,y)>=0||dock_hit(x,y)>=0||desk_hit(x,y)>=0) return 1;
+    if(y<PANEL_H) return 1;  /* entire panel is interactive */
+    if(G_grid||G_quick||G_calendar||G_overview) return 1;
+    return 0;
+}
+/* Cursor compositing (Skift-style): every frame we damage the rectangle the
+ * cursor occupied last frame (so the scene under it is recomposited from the
+ * backdrop + windows) and the rectangle it will occupy this frame (so it is
+ * presented to the scanout).  No pixel save/restore buffer is needed: the
+ * per-rect repaint re-derives the pixels under the cursor from the scene. */
+static int G_cursor_last_x, G_cursor_last_y, G_cursor_last_w, G_cursor_last_h;
+static bool G_cursor_moved = false;
+/* Cursor render scale: the photo cursors are packed at 48px; 4/5 draws them
+ * at ~38px — a touch smaller, Skift's own vector cursors are 28-32px. */
+#define CURSOR_SCALE_NUM 4
+#define CURSOR_SCALE_DEN 5
+/* Bilinear-downscaled alpha-blend of a cursor image (straight-alpha ARGB). */
+static void cursor_blit_raw(surface_t *dst, int dx, int dy, const cursor_img_t *im){
+    const int SN = CURSOR_SCALE_NUM, SD = CURSOR_SCALE_DEN;
+    int dw = (im->w * SN) / SD; if(dw < 1) dw = 1;
+    int dh = (im->h * SN) / SD; if(dh < 1) dh = 1;
+    for(int y = 0; y < dh; y++){
+        int yy = dy + y; if(yy < 0 || yy >= dst->h) continue;
+        int sy = (y * SD * 256) / SN;
+        int iy = sy >> 8, fy = sy & 255;
+        int iy1 = iy + 1; if(iy1 >= im->h) iy1 = im->h - 1;
+        for(int x = 0; x < dw; x++){
+            int xx = dx + x; if(xx < 0 || xx >= dst->w || !sf_clip_ok(xx, yy)) continue;
+            int sx = (x * SD * 256) / SN;
+            int ix = sx >> 8, fx = sx & 255;
+            int ix1 = ix + 1; if(ix1 >= im->w) ix1 = im->w - 1;
+            u32 c00 = im->px[iy  * im->w + ix];
+            u32 c10 = im->px[iy  * im->w + ix1];
+            u32 c01 = im->px[iy1 * im->w + ix];
+            u32 c11 = im->px[iy1 * im->w + ix1];
+            /* premultiplied bilinear (avoids dark fringing on the edges) */
+            int a00 = (int)(c00 >> 24), r00 = (int)(u8)(c00 >> 16) * a00, g00 = (int)(u8)(c00 >> 8) * a00, b00 = (int)(u8)c00 * a00;
+            int a10 = (int)(c10 >> 24), r10 = (int)(u8)(c10 >> 16) * a10, g10 = (int)(u8)(c10 >> 8) * a10, b10 = (int)(u8)c10 * a10;
+            int a01 = (int)(c01 >> 24), r01 = (int)(u8)(c01 >> 16) * a01, g01 = (int)(u8)(c01 >> 8) * a01, b01 = (int)(u8)c01 * a01;
+            int a11 = (int)(c11 >> 24), r11 = (int)(u8)(c11 >> 16) * a11, g11 = (int)(u8)(c11 >> 8) * a11, b11 = (int)(u8)c11 * a11;
+            int r0 = r00 + (((r10 - r00) * fx) >> 8);
+            int g0 = g00 + (((g10 - g00) * fx) >> 8);
+            int b0 = b00 + (((b10 - b00) * fx) >> 8);
+            int al0 = a00 + (((a10 - a00) * fx) >> 8);
+            int r1 = r01 + (((r11 - r01) * fx) >> 8);
+            int g1 = g01 + (((g11 - g01) * fx) >> 8);
+            int b1 = b01 + (((b11 - b01) * fx) >> 8);
+            int al1 = a01 + (((a11 - a01) * fx) >> 8);
+            int pr = r0 + (((r1 - r0) * fy) >> 8);
+            int pg = g0 + (((g1 - g0) * fy) >> 8);
+            int pb = b0 + (((b1 - b0) * fy) >> 8);
+            int pa = al0 + (((al1 - al0) * fy) >> 8);   /* straight alpha (0..255) */
+            if(pa <= 0) continue;
+            int A = pa; if(A > 255) A = 255;
+            if(A == 0) continue;
+            int R = (pr * 255 + pa / 2) / pa;
+            int G = (pg * 255 + pa / 2) / pa;
+            int B = (pb * 255 + pa / 2) / pa;
+            if(R > 255) R = 255;
+            if(G > 255) G = 255;
+            if(B > 255) B = 255;
+            u32 bg = dst->px[yy * dst->pitch + xx];
+            u8 br = (u8)bg, bg2 = (u8)(bg >> 8), bb = (u8)(bg >> 16);
+            if(A == 255) dst->px[yy * dst->pitch + xx] = ARGB(255, R, G, B);
+            else {
+                u8 rr = (u8)((R * A + br * (255 - A)) / 255);
+                u8 gg = (u8)((G * A + bg2 * (255 - A)) / 255);
+                u8 bb2 = (u8)((B * A + bb * (255 - A)) / 255);
+                dst->px[yy * dst->pitch + xx] = 0xFF000000u | (bb2 << 16) | (gg << 8) | rr;
             }
-            cursor_draw(&G_fb, cur_id, G_cx, G_cy);
-            G_last_cx=G_cx; G_last_cy=G_cy; G_last_cursor=cur_id;
-            fb_flip(fb_px);
-            frames++;
+        }
+    }
+}
+static void cursor_damage_prev(void){
+    if(G_cursor_last_w > 0) damage_add((GfxRect){G_cursor_last_x, G_cursor_last_y, G_cursor_last_w, G_cursor_last_h});
+}
+
+/* Footprint of the cursor at its current position/kind.  Used to damage the
+ * cursor region BEFORE the compositing pass so the cursor is presented in
+ * the SAME frame it moved to (Skift draws the cursor in the render pass;
+ * damaging it only for the next frame made it trail 16ms + ghost). */
+static GfxRect cursor_rect(void){
+    if(G_cur_theme<0){ G_cur_theme=cursors_theme_by_name("roblox"); if(G_cur_theme<0) G_cur_theme=0; }
+    int kind=cursor_pick();
+    cursor_theme_t *t=cursors_theme(G_cur_theme);
+    int dx=G_cx,dy=G_cy,cw=24,ch=24;
+    int k=kind;
+    if(t && !t->img[k].present && k==2) k=0;
+    if(t && t->img[k].present){
+        cursor_img_t *im=&t->img[k];
+        cw = (im->w  * CURSOR_SCALE_NUM) / CURSOR_SCALE_DEN;
+        ch = (im->h  * CURSOR_SCALE_NUM) / CURSOR_SCALE_DEN;
+        dx = G_cx - (im->hotx * CURSOR_SCALE_NUM) / CURSOR_SCALE_DEN;
+        dy = G_cy - (im->hoty * CURSOR_SCALE_NUM) / CURSOR_SCALE_DEN;
+    } else {
+        cw=28; ch=28; dx=G_cx-14; dy=G_cy-14;
+    }
+    return (GfxRect){dx,dy,cw,ch};
+}
+
+static void cursor_draw(surface_t*s){
+    if(G_cur_theme<0){ G_cur_theme=cursors_theme_by_name("roblox"); if(G_cur_theme<0) G_cur_theme=0; }
+    int kind=cursor_pick();
+    cursor_theme_t *t=cursors_theme(G_cur_theme);
+    int dx=G_cx,dy=G_cy,cw=24,ch=24;
+    /* resize falls back to the arrow when the theme has no resize cursor */
+    int k = kind;
+    if(t && !t->img[k].present && k==2) k=0;
+    if(t && t->img[k].present){
+        cursor_img_t *im=&t->img[k];
+        cw = (im->w  * CURSOR_SCALE_NUM) / CURSOR_SCALE_DEN;
+        ch = (im->h  * CURSOR_SCALE_NUM) / CURSOR_SCALE_DEN;
+        dx = G_cx - (im->hotx * CURSOR_SCALE_NUM) / CURSOR_SCALE_DEN;
+        dy = G_cy - (im->hoty * CURSOR_SCALE_NUM) / CURSOR_SCALE_DEN;
+        cursor_blit_raw(s,dx,dy,im);
+    } else {
+        icon_t ic=icon_get(k==1?ICON_CURSOR_HAND:ICON_CURSOR_ARROW);
+        sf_icon_scaled(s,G_cx,G_cy,ic,0,24,48);
+        cw=28; ch=28; dx=G_cx-14; dy=G_cy-14;
+    }
+    G_cursor_last_x=dx; G_cursor_last_y=dy; G_cursor_last_w=cw; G_cursor_last_h=ch;
+}
+
+/* ---------- Skift-style compositor core ---------- */
+/* The backdrop buffer holds the static base scene (wallpaper + desktop
+ * icons).  It is rebuilt only when g_backdrop_dirty is set; the per-frame
+ * repaint blits just the damaged rectangles out of it, exactly like Skift's
+ * backbuffer/frontbuffer split. */
+static void rebuild_backdrop(void){
+    if(!G_backdrop.px) return;
+    sf_blit(&G_backdrop, 0, 0, &G_wp, 0, 0, G_fb.w, G_fb.h);
+    draw_desktop_icons(&G_backdrop);
+    /* frosted-glass dock: blur the backdrop region behind the dock pill */
+    if(G_blur_w > 0 && G_blur_h > 0){
+        if(!G_dock_blur.px || G_dock_blur.w != G_blur_w || G_dock_blur.h != G_blur_h){
+            if(G_dock_blur.px) sf_free(&G_dock_blur);
+            G_dock_blur = sf_alloc(G_blur_w, G_blur_h);
+        }
+        if(G_dock_blur.px){
+            sf_blit(&G_dock_blur, 0, 0, &G_backdrop, G_blur_x, G_blur_y, G_blur_w, G_blur_h);
+            sf_blur_rect(&G_dock_blur, 0, 0, G_blur_w, G_blur_h, 12, 2);
+            /* frosted-glass: lighten the blurred region */
+            sf_fill_rect_blend(&G_dock_blur, 0, 0, G_blur_w, G_blur_h, ARGB(28,255,255,255));
+        }
+    }
+    g_backdrop_dirty = false;
+}
+/* Repaint a single damaged rectangle with the global clip set to it, so no
+ * draw call can bleed outside the damaged region (Skift g.clip(r) model).
+ * Called once per dirty rect. */
+static void composite_rect(GfxRect r, long now){
+    sf_set_clip(r.x, r.y, r.w, r.h);
+    sf_blit(&G_fb, 0, 0, &G_backdrop, 0, 0, G_fb.w, G_fb.h);
+    /* live chrome, each gated to the dirty rect so a small cursor repaint
+     * does NOT redraw the whole panel/dock (the old code did, every rect) */
+    GfxRect pr = {0, 0, G_fb.w, PANEL_H};
+    if(rect_colide(r, pr)) draw_panel(&G_fb);
+    GfxRect dr = {G_dock_x-30, G_dock_y-80, G_dock_w+60, G_dock_h+170};
+    if(rect_colide(r, dr)) draw_dock(&G_fb, now);
+    GfxRect der = {0, PANEL_H, G_fb.w, G_fb.h-PANEL_H};
+    if(rect_colide(r, der)) draw_desktop_live(&G_fb);
+    /* windows in z-order, only those intersecting this rect */
+    for(int z=0; z<=G_z_top; z++){
+        for(int i=0;i<MAX_WIN;i++){
+            win_t *w=&G_win[i];
+            if(!w->active || w->z!=z) continue;
+            if(w->workspace!=G_workspace && w->workspace>=0) continue;
+            if(w->minimized || w->hidden) continue;
+            GfxRect wr; win_draw_rect(w, &wr);
+            if(!rect_colide(r, wr)) continue;
+            draw_window(w);
+        }
+    }
+    /* overlays, topmost (gated by rect where bounds are known) */
+    if(G_quick && rect_colide(r,(GfxRect){G_quick_x,G_quick_y,G_quick_w,G_quick_h})) draw_quick(&G_fb);
+    if(G_calendar && rect_colide(r,(GfxRect){G_cal_x,G_cal_y,G_cal_w,G_cal_h})) draw_calendar(&G_fb);
+    if(G_clip_open && rect_colide(r,(GfxRect){G_clip_x,G_clip_y,G_clip_w,G_clip_h})) draw_clipboard(&G_fb);
+    if(G_netlist_open && rect_colide(r,(GfxRect){G_nl_x,G_nl_y,G_nl_w,G_nl_h})) draw_netlist(&G_fb);
+    if(G_dockmenu && rect_colide(r,(GfxRect){G_dockmenu_x,G_dockmenu_y,G_dockmenu_w,G_dockmenu_h})) draw_dockmenu(&G_fb);
+    if(G_grid) draw_app_grid(&G_fb);
+    if(G_overview) draw_overview(&G_fb);
+    if(G_switcher) draw_switcher(&G_fb);
+    draw_menu(&G_fb);
+    draw_osd(&G_fb, now);
+    if(G_locked) draw_lock(&G_fb, now);
+    sf_clear_clip();
+}
+
+/* ---------- entry / render loop ---------- */
+void wm_run(void){
+    fb_info_t fi; void*fb=fb_info(&fi); if(!fb)return;
+    G_fb.px=fb; G_fb.w=fi.w; G_fb.h=fi.h; G_fb.pitch=fi.pitch; G_cx=G_fb.w/2; G_cy=G_fb.h/2;
+    G_backdrop=sf_alloc(G_fb.w,G_fb.h);
+    if(!G_backdrop.px){ klog("wm: backdrop alloc failed\n"); return; }
+    g_backdrop_dirty=true; damage_whole();
+    assets_init(); cursors_init();
+    { int gs=gfx_selftest(); klog(gs==0?"gfx: SIMD blit selftest ok (bit-exact)":"gfx: SIMD blit selftest FAILED"); }
+    if(wallpaper_load(&G_wp)!=0||G_wp.w!=G_fb.w||G_wp.h!=G_fb.h){ klog("wm: wallpaper failed\n"); return; }
+    load_all(); rebuild_dock_cache();
+    theme_reset_defaults();
+    theme_load("/home/yart/theme.ini");
+    settings_load();          /* apply persisted accent/cursor/wallpaper/dock/volume */
+    mkdir("/home/yart/.trash"); /* ensure the trash dir exists (real Trash) */
+    G_start_ms=time_ms();
+    long wt=wall_time(); if(wt>0){
+        format_wallclock(wt,G_clk);format_date(wt,G_date);
+        /* calendar opens on the REAL month/year, not a hardcoded date */
+        long ds=wt/1000000ULL;
+        G_cal_year=(int)(ds/10000);
+        G_cal_month=(int)((ds/100)%100);
+        if(G_cal_month<1||G_cal_month>12)G_cal_month=1;
+    }
+    osd("YartOS ready");
+    bool first_frame=true;
+    int prev_overlay_state=-1;
+    bool osd_was_visible=false;
+    static bool s_overlay_focus=false;
+    long next_frame=time_ms();
+    for(;;){
+        /* ---- input ---- */
+        bool moved=false;
+        int ev; while((ev=poll_key())!=0){ handle_key(ev); moved=true; }
+        mouse_ev_t m;
+        while(poll_mouse(&m)){
+            int oldx=G_cx, oldy=G_cy;
+            G_cx+=m.dx; G_cy+=m.dy;
+            if(G_cx<0) G_cx=0;
+            if(G_cy<0) G_cy=0;
+            if(G_cx>=G_fb.w) G_cx=G_fb.w-1;
+            if(G_cy>=G_fb.h) G_cy=G_fb.h-1;
+            unsigned char prev=G_mb; G_mb=m.buttons;
+            if((G_mb&1)&&!(prev&1))handle_press(G_cx,G_cy,1);
+            if((G_mb&2)&&!(prev&2))handle_press(G_cx,G_cy,3);
+            if((G_mb&4)&&!(prev&4))handle_press(G_cx,G_cy,2);
+            if(G_mb&1)handle_drag(G_cx,G_cy);
+            if((prev&1)&&!(G_mb&1))handle_release(G_cx,G_cy,1);
+            if(G_cx!=oldx || G_cy!=oldy) G_cursor_moved = true;
+            moved=true;
         }
 
-        if (now - fps_start >= 5000) {
-            char m[64],b[8]; int k=0;
-            const char *p="wm: "; while(*p)m[k++]=*p++;
-            itoa0((int)(frames*1000/(unsigned long)(now-fps_start)),b,0);
-            const char *q=b; while(*q)m[k++]=*q++;
-            const char *e=" fps\n"; while(*e)m[k++]=*e++; m[k]=0;
-            klog(m);
-            frames=0; fps_start=now;
+        /* ---- cursor damage: ONLY when it moved (or the scene under a
+         * stationary cursor was repainted).  Damaging the cursor rect every
+         * frame unconditionally made the compositor redraw forever even when
+         * completely idle -> a core pinned at 100% (the "heavy" feel). ---- */
+        if(G_cursor_moved){
+            cursor_damage_prev();        /* repaint what was under the old pos */
+            damage_add(cursor_rect());   /* paint the cursor this same frame  */
+            G_cursor_moved = false;
+        } else if(G_ndirty > 0){
+            damage_add(cursor_rect());   /* scene changed under the cursor    */
         }
 
-        /* --- pacing: bounded yields, mid-slice input poll ---
-         * THE FREEZE FIX: the old loop spun on `time_ms() < target` with
-         * yield() inside; every yield parks us until the next timer tick,
-         * so a slow/stopped tick made the loop never converge (and mouse
-         * movement made it exit WITHOUT yielding, monopolizing the CPU).
-         * Now we yield a FIXED 2 times per frame (~50 fps max on a
-         * 100 Hz tick) and poll the mouse in the slices - the frame
-         * ALWAYS completes and the compositor ALWAYS gives the CPU back,
-         * no matter what the clock does. */
-        for (int slice = 0; slice < 2; slice++) {
-            yield();
-            mouse_ev_t me;
-            while (poll_mouse(&me)) {
-                G_cx+=me.dx; G_cy+=me.dy;
-                if (G_cx<0) G_cx=0;
-                if (G_cy<0) G_cy=0;
-                if (G_cx>=G_fb.w) G_cx=G_fb.w-1;
-                if (G_cy>=G_fb.h) G_cy=G_fb.h-1;
-                unsigned char prev = G_mb;
-                G_mb = me.buttons;
-                if ((G_mb & 1) && !(prev & 1)) handle_click(G_cx,G_cy,1);
-                if ((G_mb & 2) && !(prev & 2)) handle_click(G_cx,G_cy,3);
-                if ((G_mb & 4) && !(prev & 4)) handle_click(G_cx,G_cy,2);
-                G_dock_dirty=1;
-            }
+        /* ---- housekeeping (throttled: these are syscalls) ---- */
+        {
+            static long ln=0;
+            long nnow=time_ms();
+            if(nnow-ln >= 500){ unsigned ni[5]; G_net_up=(net_info(ni)==0&&ni[4]!=0); ln=nnow; }
         }
+        static int hf=0;
+        pid_forget_dead();
+        if((hf++ & 1)==0) scan_windows();   /* every other frame (32ms) */
+        /* drain the kernel notification ring: toast + calendar list */
+        char nb[128];
+        long nr;
+        while((nr=notify_poll(nb,sizeof nb))>0){
+            osd(nb);
+
+            if(G_notif_n < 16) copy_str(G_notifs[G_notif_n++], nb, 128);
+            else { for(int q=0;q<15;q++) copy_str(G_notifs[q], G_notifs[q+1], 128); copy_str(G_notifs[15], nb, 128); }
+        }
+        (void)nr;
+        long now=time_ms(),up=now-G_start_ms; unsigned long sec=up/1000;
+
+        /* ---- panel clock ---- */
+        if(sec!=G_last_sec){
+            long wt2=wall_time(); if(wt2>0)format_wallclock(wt2,G_clk);
+            else {int h=(int)((up/3600000)%24),mi=(int)((up/60000)%60); G_clk[0]='0'+h/10;G_clk[1]='0'+h%10;G_clk[2]=':';G_clk[3]='0'+mi/10;G_clk[4]='0'+mi%10;G_clk[5]=0;}
+            G_last_sec=sec;
+            int cw=sf_text_width(G_date)+sf_text_width(G_clk)+24;   /* + ", " */
+            int cx=G_fb.w/2-cw/2;
+            damage_add((GfxRect){cx-8,0,cw+16,PANEL_H});
+            if(G_locked) damage_whole();   /* keep the lock-screen clock fresh */
+        }
+
+        /* ---- persisted settings (Settings app writes settings.conf) ---- */
+        settings_poll(now);
+
+        /* ---- dock animation/hover ---- */
+        dock_update(now);
+
+        /* ---- window animation + damage ---- */
+        windows_update_and_damage(now);
+
+        /* ---- overlay open/close: full damage + keyboard focus routing ----
+         * While any overlay is up, the wm owns the keyboard (search typing,
+         * Esc); when the last overlay closes, focus returns to the top
+         * window so apps get their typing back. */
+        int overlay_state = G_grid | (G_overview<<1) | (G_switcher<<2) |
+                           (G_quick<<3) | (G_calendar<<4) |
+                           (G_dockmenu<<5) | (G_menu<<6);
+        if(overlay_state != prev_overlay_state){
+            damage_whole();
+            prev_overlay_state = overlay_state;
+            if(overlay_state && !s_overlay_focus){
+                s_overlay_focus = true;
+                wm_focus(0);                      /* overlays own the keys */
+            } else if(!overlay_state && s_overlay_focus){
+                s_overlay_focus = false;
+                if(G_focus_win>=0 && G_focus_win<MAX_WIN){
+                    win_t *fw=&G_win[G_focus_win];
+                    if(fw->active && !fw->minimized && (fw->workspace==G_workspace||fw->workspace<0))
+                        wm_focus(fw->owner);      /* restore typing to app  */
+                }
+            }
+        } else if(moved){
+            bool overlay_full = G_grid || G_overview || G_switcher;
+            bool overlay_small = G_quick || G_calendar || G_dockmenu || G_menu || G_clip_open || G_netlist_open;
+            if(overlay_full) damage_whole();
+            else if(overlay_small) damage_overlay_small();
+        }
+
+        /* ---- OSD toast (has a fade animation; keep damaging while live) ---- */
+        bool osd_visible = G_osd[0] && (now-G_osd_t0)<1800;
+        if(osd_visible || osd_was_visible){
+            damage_add(osd_rect());
+        }
+        osd_was_visible = osd_visible;
+
+        /* ---- first frame + backdrop ---- */
+        if(first_frame){ g_backdrop_dirty=true; damage_whole(); first_frame=false; }
+        if(g_backdrop_dirty) rebuild_backdrop();
+
+        /* ---- repaint every damaged rect, clipped ---- */
+        for(int d=0; d<G_ndirty; d++) composite_rect(G_dirty[d], now);
+
+        /* ---- cursor on top ---- */
+        cursor_draw(&G_fb);
+
+        /* ---- present only the damaged rectangles (Skift blitUnsafe) ---- */
+        fb_present(fb, (const fb_rect_t*)G_dirty, G_ndirty);
+        G_ndirty = 0;
+
+        /* ---- fixed 60 Hz frame pacing (Skift: sleepAsync(lastFrame+16ms)) ---- */
+        next_frame += 16;
+        now = time_ms();
+        if(next_frame > now) sleep(next_frame - now);
+        else if(now - next_frame > 100) next_frame = now;
     }
 }

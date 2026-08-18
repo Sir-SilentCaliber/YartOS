@@ -14,6 +14,10 @@ bool blk_uses_msix(void);
 u64  blk_disk_sectors(void);
 int  blk_read_sectors(u64 sector, u32 count, void *dst);
 int  blk_write_sectors(u64 sector, u32 count, const void *src);
+/* Flush the device's write cache to stable storage (VIRTIO_BLK_T_FLUSH).
+ * fsync() durability REQUIRES this: QEMU's writeback cache only reaches the
+ * backing file on a flush (or a graceful exit). */
+int  blk_flush(void);
 
 /* ---------- YartFS v4: ADVANCED MAXIMUM filesystem, real OS level ---------- */
 /* Design v4 - pushed to absolute max, like ext4/btrfs simplified:

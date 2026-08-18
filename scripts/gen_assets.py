@@ -86,16 +86,16 @@ ALIASES = {
     # Mimetypes where Kora only ships -symbolic or uses different names
     "application-x-compressed":  ("application-archive",     None),
     "package-x-generic":         ("application-archive",     None),
-    "text-x-generic":            ("text-x-generic",          None),
-    "application-x-executable":  ("application-x-executable",None),
-    "video-x-generic":           ("video-x-generic",         None),
-    "audio-x-generic":           ("audio-x-generic",         None),
-    "x-office-calendar":         ("x-office-calendar",       None),
-    "x-office-spreadsheet":      ("x-office-spreadsheet",    None),
-    "x-office-document":         ("x-office-document",       None),
-    "x-office-presentation":     ("x-office-presentation",   None),
+    "text-x-generic":            ("text-x-c++",             "mimetypes"),
+    "application-x-executable":  ("application-executable",      "mimetypes"),
+    "video-x-generic":           ("application-video",      "mimetypes"),
+    "audio-x-generic":           ("audio-mp3",              "mimetypes"),
+    "x-office-calendar":         ("calendar",              "apps"),
+    "x-office-spreadsheet":      ("freeoffice-planmaker",   "apps"),
+    "x-office-document":         ("freeoffice-textmaker",   "apps"),
+    "x-office-presentation":     ("freeoffice-presentations","apps"),
     # Settings
-    "preferences-desktop":       ("preferences-desktop",     None),
+    "preferences-desktop":       ("preferences-system",    "apps"),
 }
 
 # Procedurally-drawn builtin icons (RGBA tuples) keyed by name
@@ -388,13 +388,13 @@ add("tray_airplane",     "airplane-mode",                  "status", SZ_TRAY, sy
 add("tray_microphone",   "audio-input-microphone-high",    "panel",  SZ_TRAY, sym=True)
 
 # Dock
-add("dock_terminal",     "utilities-terminal",             "apps",   SZ_DOCK)
-add("dock_files",        "system-file-manager",            "apps",   SZ_DOCK)
+add("dock_terminal",     "terminal",             "apps",   SZ_DOCK)
+add("dock_files",        "file-manager-blue",            "apps",   SZ_DOCK)
 add("dock_browser",      "web-browser",                    "apps",   SZ_DOCK)
 add("dock_editor",       "accessories-text-editor",        "apps",   SZ_DOCK)
 add("dock_settings",     "preferences-system",             "categories", SZ_DOCK)
 add("dock_launcher",    "applications-all",               "apps",   SZ_DOCK)
-add("dock_apps_grid",   "view-app-grid",                  "actions",SZ_DOCK)
+add("dock_apps_grid",   "view-grid",                  "actions",SZ_DOCK)
 add("dock_trash",       "user-trash",                     "places", SZ_DOCK)
 
 # Places

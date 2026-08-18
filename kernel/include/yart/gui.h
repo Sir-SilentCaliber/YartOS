@@ -23,8 +23,17 @@ typedef struct {
 
 extern fb_ctx_t g_fb;
 
+/* A damaged rectangle, in framebuffer pixels (Skift-style _damage(r)). */
+typedef struct {
+    u32 x, y, w, h;
+} fb_rect_t;
+
 void fb_init(struct limine_framebuffer *lfb);
 void fb_present(void);
+
+/* Copy only the given damaged rectangles from the back buffer to the real
+ * scanout -- the Skift equivalent of blitUnsafe(front.clip(r), back.clip(r)). */
+void fb_present_rects(const fb_rect_t *rects, u32 count);
 
 /* Primitive helpers kept in the kernel for boot-time recovery painting
  * (e.g. watchdog reset splash).  Compositor uses its own drawing code. */

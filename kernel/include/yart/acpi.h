@@ -27,3 +27,16 @@ typedef struct {
 
 extern madt_info_t g_madt;
 void acpi_init(void *rsdp);
+
+/* ACPI Control-Method Battery (PNP0C0A) + AC adapter (ACPI0003).
+ * Populated from the firmware DSDT/SSDTs by acpi_battery_scan().
+ * This is the exact mechanism Windows/Linux use to read battery state. */
+typedef struct {
+    bool present;      /* PNP0C0A battery device found in the namespace   */
+    bool ac_present;   /* ACPI0003 AC adapter device found                */
+    bool charging;     /* from _BST state (bit 1)                         */
+    int  level;        /* 0..100 from _BST remaining / _BIF design, -1 = ?*/
+} acpi_battery_t;
+
+extern acpi_battery_t g_acpi_battery;
+void acpi_battery_scan(void);

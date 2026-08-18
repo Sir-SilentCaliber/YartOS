@@ -87,6 +87,18 @@ enum {
     SYS_WM_RESIZE   = 77, /* WM: resize window id to w,h (wm or owner)                  */
     SYS_WIFI_DISCONNECT = 78, /* WiFi: disconnect                                         */
     SYS_TASK_LIST   = 79, /* List tasks pids (ps)                                        */
+    SYS_FB_PRESENT  = 80, /* WM: copy only the given damaged rects to the scanout        */
+    SYS_AUDIO_VOL   = 81, /* set (a0>=0) / get (a0<0) output volume 0..100               */
+    SYS_AUTH_VERIFY = 82, /* check a password without elevating (session unlock)         */
+    SYS_NOTIFY      = 83, /* push a notification string (read by the WM)                 */
+    SYS_NOTIFY_POLL = 84, /* WM: pop the oldest notification (0 = none)                 */
+    SYS_BATTERY     = 85, /* battery: present / charging / level% (honest report)       */
+    SYS_CLIPBOARD_SET = 86, /* copy a string into the system clipboard (ring-3)        */
+    SYS_CLIPBOARD_GET = 87, /* read the system clipboard out (ring-3)                  */
+    SYS_MOUSE_POS    = 88, /* absolute cursor position (x,y) in framebuffer pixels     */
+    SYS_PASSWD       = 89, /* change the account password (old,new) - real rehash     */
+    SYS_REBOOT       = 90, /* reset the machine (ACPI, 8042 fallback)                  */
+    SYS_DUP2         = 91, /* duplicate an fd onto a specific number (POSIX dup2)      */
     SYS_MAX
 };
 

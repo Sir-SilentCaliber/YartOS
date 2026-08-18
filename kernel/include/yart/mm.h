@@ -20,6 +20,7 @@ void *mmio_map(paddr_t p, size_t n);
 void    pmm_init(struct limine_memmap_response *mm);
 paddr_t pmm_alloc_page(void);
 paddr_t pmm_alloc_pages(size_t n);
+paddr_t pmm_alloc_pages_below(size_t n, paddr_t limit); /* 32-bit DMA */
 void    pmm_free_page(paddr_t p);          /* == pmm_unref_page           */
 void    pmm_mark_page_used(paddr_t p);     /* reserve a specific frame      */
 void    pmm_mark_range_used(paddr_t base, size_t npages); /* reserve N frames */

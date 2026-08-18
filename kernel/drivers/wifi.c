@@ -14,6 +14,11 @@
 #include <yart/pci.h>
 #include <yart/net.h>
 #include <yart/hal.h>
+#include <yart/rtw88.h>
+#include <yart/rtw_phy.h>
+#include <yart/rtw_io.h>
+#include <yart/fw.h>
+#include <yart/wifi_session.h>
 
 static wifi_iface_t g_ifaces[WIFI_MAX_IFACE];
 static int g_iface_n=0;
@@ -26,6 +31,26 @@ static char g_connected_ssid[WIFI_SSID_MAX+1];
 static char g_connected_psk[64];
 
 static bool g_hw_detected=false;
+
+/* Real rtw88 device + frame transport, populated by wifi_pci_notify() when an
+ * RTL8822CE comes up.  Only when g_rtw_ready is a 802.11 scan REAL (frames
+ * over the DMA rings); otherwise scan honestly returns zero networks. */
+static bool g_rtw_ready = false;
+static rtw_dev_t g_rtw;
+static rtw_io_t g_rtw_io;
+static wifi_session_t g_session;
+static bool g_session_ok = false;
+
+static int rtw_tr_tx(void *ctx, const u8 *frame, u32 len){
+    (void)ctx; return rtw_io_tx(&g_rtw, &g_rtw_io, frame, len);
+}
+static int rtw_tr_rx(void *ctx, u8 *frame, u32 cap, u32 *out_len){
+    (void)ctx; return rtw_io_rx_poll(&g_rtw, &g_rtw_io, frame, cap, out_len);
+}
+static void rtw_tr_delay(void *ctx, u32 ms){
+    (void)ctx;
+    for(volatile u32 i = 0; i < ms * 4000; i++) __asm__ volatile("pause");
+}
 
 static const char *sec_str(wifi_sec_t s){
     switch(s){ case WIFI_SEC_OPEN: return "OPEN"; case WIFI_SEC_WEP: return "WEP"; case WIFI_SEC_WPA: return "WPA"; case WIFI_SEC_WPA2: return "WPA2"; case WIFI_SEC_WPA3: return "WPA3"; default: return "UNKNOWN"; }
@@ -46,41 +71,73 @@ void wifi_pci_notify(u16 vendor, u16 device, u8 bus, u8 dev, u8 fn, u8 class_, u
 
     if (!is_wireless) return;
     g_hw_detected=true;
-    if (g_iface_n >= WIFI_MAX_IFACE) return;
-    wifi_iface_t *iface=&g_ifaces[g_iface_n++];
-    memset(iface,0,sizeof *iface);
-    iface->present=true;
-    iface->hw_present=true;
-    iface->vendor=vendor; iface->device=device; iface->bus=bus; iface->dev=dev; iface->fn=fn;
-    strncpy(iface->name,"wlan0",sizeof iface->name-1);
-    iface->state=WIFI_DISCONNECTED;
-    /* fake MAC from bus/dev */
-    iface->mac[0]=0x02; iface->mac[1]=0x57; iface->mac[2]=0x69; iface->mac[3]=0x46; iface->mac[4]=bus; iface->mac[5]=dev;
-    kprintf("wifi: found wireless controller %04x:%04x at %u:%u.%u -> %s (hw)\n", vendor, device, bus, dev, fn, iface->name);
-}
 
-static void wifi_add_fake_aps(void){
-    /* Provide realistic AP list for QEMU/virtual environment */
-    struct { const char *ssid; int sig; u8 ch; wifi_sec_t sec; } list[] = {
-        {"YartNet", -42, 6, WIFI_SEC_WPA2},
-        {"HomeFiber-5G", -55, 36, WIFI_SEC_WPA2},
-        {"CoffeeShop_WiFi", -68, 1, WIFI_SEC_OPEN},
-        {"Office-Lab", -61, 11, WIFI_SEC_WPA3},
-        {"IoT-Devices", -73, 6, WIFI_SEC_WPA2},
-        {"FreeAirportWiFi", -80, 3, WIFI_SEC_OPEN},
-    };
-    g_ap_n=0;
-    for(u32 i=0;i<sizeof(list)/sizeof(list[0]) && g_ap_n<WIFI_MAX_AP;i++){
-        wifi_ap_t *ap=&g_aps[g_ap_n++];
-        memset(ap,0,sizeof *ap);
-        strncpy(ap->ssid, list[i].ssid, WIFI_SSID_MAX);
-        ap->signal=list[i].sig;
-        ap->channel=list[i].ch;
-        ap->sec=list[i].sec;
-        ap->present=true;
-        ap->bssid[0]=0x02; ap->bssid[1]=0x11; ap->bssid[2]=0x22; ap->bssid[3]=list[i].ch; ap->bssid[4]=0x33; ap->bssid[5]=i;
+    /* ---- rtw88 bring-up: RTL8822CE on the user's laptop ---- */
+    if (vendor==0x10EC && device==0xC822) {
+        rtw_dev_t rtw;
+        memset(&rtw, 0, sizeof rtw);
+        if (rtw_pci_probe(&rtw, vendor, device, bus, dev, fn) == 0) {
+            u8 *blob = NULL; size_t len = 0;
+            if (fw_load("/lib/firmware/rtw8822c_fw.bin", &blob, &len) == 0 && blob && len) {
+                if (rtw_download_firmware(&rtw, blob, (u32)len) == 0) {
+                    kprintf("wifi: RTL8822CE firmware running - ready for 802.11 association\n");
+                    u8 mac[6];
+                    if (rtw_read_mac(&rtw, mac) == 0) {
+                        memcpy(rtw.mac, mac, 6);
+                        kprintf("wifi: RTL8822CE MAC %02x:%02x:%02x:%02x:%02x:%02x (from EFUSE)\n",
+                                mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+                    } else {
+                        kprintf("wifi: RTL8822CE MAC read from EFUSE FAILED (unprogrammed?)\n");
+                    }
+                    const rtw_pwr_seq_cmd_t *seq[] = {
+                        rtw8822ce_pwr_on_cardemu, rtw8822ce_pwr_on_act, NULL
+                    };
+                    if (rtw_pwr_seq_parser(&rtw, seq) == 0) {
+                        if (rtw_phy_load_tables(&rtw, "/lib/firmware/rtw8822c_phy.bin") == 0) {
+                            kprintf("wifi: RTL8822CE PHY tables loaded (radio init done)\n");
+                            /* power on + load the PHY register tables (radio bring-up) */
+                            if (rtw_io_init(&rtw, &g_rtw_io) == 0) {
+                                const wifi_transport_t tr = { rtw_tr_tx, rtw_tr_rx, rtw_tr_delay };
+                                g_rtw = rtw;                       /* persist the device */
+                                wifi_session_init(&g_session, &tr, NULL, rtw.mac);
+                                g_rtw_ready = true;
+                                g_session_ok = true;
+                                kprintf("wifi: RTL8822CE frame transport ready - real 802.11 scan/association active\n");
+                            } else {
+                                kprintf("wifi: RTL8822CE TX/RX ring init FAILED\n");
+                            }
+                        } else {
+                            kprintf("wifi: RTL8822CE PHY table load FAILED\n");
+                        }
+                    } else {
+                        kprintf("wifi: RTL8822CE power-on sequence FAILED\n");
+                    }
+                    /* register the REAL interface (no virtual stand-in) */
+                    if (g_iface_n < WIFI_MAX_IFACE) {
+                        wifi_iface_t *iface = &g_ifaces[g_iface_n++];
+                        memset(iface, 0, sizeof *iface);
+                        iface->present = true;
+                        iface->hw_present = true;
+                        iface->vendor = vendor; iface->device = device;
+                        iface->bus = bus; iface->dev = dev; iface->fn = fn;
+                        strncpy(iface->name, "wlan0", sizeof iface->name - 1);
+                        memcpy(iface->mac, rtw.mac, 6);
+                        iface->state = g_rtw_ready ? WIFI_DISCONNECTED : WIFI_DISCONNECTED;
+                    }
+                } else
+                    kprintf("wifi: RTL8822CE firmware download FAILED\n");
+                fw_free(blob);
+            } else {
+                kprintf("wifi: RTL8822CE firmware blob not found (/lib/firmware/rtw8822c_fw.bin)\n");
+            }
+        }
+        kprintf("wifi: Realtek RTL8822CE (%04x:%04x) at %u:%u.%u detected\n",
+                vendor, device, bus, dev, fn);
+        return;
     }
-    kprintf("wifi: scan found %d APs (virtual)\n", g_ap_n);
+    /* Other detected-but-undriven controllers: honest report, no fake iface */
+    kprintf("wifi: wireless controller %04x:%04x at %u:%u.%u - driver NOT ported, unusable\n",
+            vendor, device, bus, dev, fn);
 }
 
 int wifi_scan(void){
@@ -88,10 +145,31 @@ int wifi_scan(void){
     g_last_scan=pit_ticks();
     g_state=WIFI_SCANNING;
     g_last_state_change=pit_ticks();
-    kprintf("wifi: scanning...\n");
-    /* Simulate scan delay */
-    for(volatile int i=0;i<1000000;i++) __asm__ volatile("pause");
-    wifi_add_fake_aps();
+    g_ap_n=0;
+    if(!g_rtw_ready || !g_session_ok){
+        /* No wireless radio in this machine (QEMU has none).  Honest result:
+         * zero networks — exactly what a real OS reports inside a VM. */
+        kprintf("wifi: scan - no wireless radio in this machine (0 networks)\n");
+        g_state=WIFI_DISCONNECTED;
+        return 0;
+    }
+    /* REAL 802.11 active scan: broadcast probe request over the rtw88 DMA
+     * rings, collect probe responses. */
+    kprintf("wifi: scanning (real 802.11 probe over rtw88)...\n");
+    wifi_bss_t results[WIFI_MAX_AP];
+    int n = wifi_session_scan(&g_session, results, WIFI_MAX_AP, 400);
+    for(int i=0;i<n && g_ap_n<WIFI_MAX_AP;i++){
+        wifi_ap_t *ap=&g_aps[g_ap_n];
+        memset(ap,0,sizeof *ap);
+        strncpy(ap->ssid, results[i].ssid, WIFI_SSID_MAX);
+        memcpy(ap->bssid, results[i].bssid, 6);
+        ap->signal  = results[i].signal;
+        ap->channel = results[i].channel;
+        ap->sec     = results[i].has_rsn ? WIFI_SEC_WPA2 : WIFI_SEC_OPEN;
+        ap->present = true;
+        g_ap_n++;
+    }
+    kprintf("wifi: scan found %d network(s)\n", g_ap_n);
     g_state=WIFI_DISCONNECTED;
     return g_ap_n;
 }
@@ -101,28 +179,39 @@ wifi_ap_t *wifi_get_ap(int idx){ if(idx<0||idx>=g_ap_n) return NULL; return &g_a
 
 int wifi_connect(const char *ssid, const char *psk){
     if(!ssid || !ssid[0]) return -1;
+    if(!g_rtw_ready || !g_session_ok){
+        kprintf("wifi: no wireless radio - cannot connect to '%s'\n", ssid);
+        return -1;
+    }
     wifi_ap_t *found=NULL;
     for(int i=0;i<g_ap_n;i++) if(strcmp(g_aps[i].ssid, ssid)==0) { found=&g_aps[i]; break; }
-    if(!found){ kprintf("wifi: AP '%s' not found in scan\n", ssid); return -1; }
+    if(!found){ kprintf("wifi: AP '%s' not in scan results - scan first\n", ssid); return -1; }
     if(found->sec!=WIFI_SEC_OPEN && (!psk || strlen(psk)<8)){
         kprintf("wifi: WPA2 requires passphrase >=8 chars\n"); return -1;
     }
-    kprintf("wifi: connecting to '%s' (%s) ...\n", ssid, sec_str(found->sec));
+    /* Real 802.11 association: auth -> assoc -> EAPOL 4-way handshake ->
+     * CCMP key install, driven through the frame transport. */
+    wifi_bss_t bss; memset(&bss, 0, sizeof bss);
+    strncpy(bss.ssid, found->ssid, sizeof bss.ssid - 1);
+    bss.ssid_len  = (int)strlen(found->ssid);
+    memcpy(bss.bssid, found->bssid, 6);
+    bss.channel   = found->channel;
+    bss.signal    = found->signal;
+    bss.has_rsn   = (found->sec == WIFI_SEC_WPA2 || found->sec == WIFI_SEC_WPA || found->sec == WIFI_SEC_WPA3);
+    bss.rsn_cipher= 4;   /* CCMP */
+    kprintf("wifi: connecting to '%s' (%s) via 802.11 auth/assoc/EAPOL ...\n", ssid, sec_str(found->sec));
     g_state=WIFI_AUTHENTICATING; g_last_state_change=pit_ticks();
-    /* Simulate auth delay */
-    for(volatile int i=0;i<2000000;i++) __asm__ volatile("pause");
-    g_state=WIFI_ASSOCIATING;
-    kprintf("wifi: authenticated, associating...\n");
-    for(volatile int i=0;i<2000000;i++) __asm__ volatile("pause");
+    if(wifi_session_join(&g_session, &bss, psk ? psk : "") != 0){
+        kprintf("wifi: association to '%s' FAILED\n", ssid);
+        g_state=WIFI_DISCONNECTED;
+        return -1;
+    }
     g_state=WIFI_CONNECTED;
     strncpy(g_connected_ssid, ssid, WIFI_SSID_MAX);
     if(psk) strncpy(g_connected_psk, psk, sizeof(g_connected_psk)-1);
     if(g_iface_n>0){
         g_ifaces[0].state=WIFI_CONNECTED;
         g_ifaces[0].current_ap=*found;
-        /* IP will come from DHCP via e1000 backend - copy current net config */
-        u32 ip,mask,gw,dns; net_get_addrs(&ip,&mask,&gw,&dns);
-        g_ifaces[0].ip=ip; g_ifaces[0].mask=mask; g_ifaces[0].gw=gw; g_ifaces[0].dns=dns;
     }
     kprintf("wifi: connected to '%s' channel %u signal %d dBm sec %s\n", ssid, found->channel, found->signal, sec_str(found->sec));
     return 0;
@@ -183,18 +272,9 @@ int wifi_status_syscall(char *out, u32 cap){
 void wifi_init(void){
     g_iface_n=0; g_ap_n=0; g_state=WIFI_DISCONNECTED;
     kprintf("wifi: subsystem init\n");
-    /* If no HW was detected via PCI notify, create virtual wlan0 over e1000 */
-    if(g_iface_n==0){
-        wifi_iface_t *iface=&g_ifaces[g_iface_n++];
-        memset(iface,0,sizeof *iface);
-        iface->present=true;
-        iface->hw_present=false;
-        iface->vendor=0; iface->device=0;
-        strncpy(iface->name,"wlan0",sizeof iface->name-1);
-        iface->state=WIFI_DISCONNECTED;
-        iface->mac[0]=0x02; iface->mac[1]=0x57; iface->mac[2]=0x69; iface->mac[3]=0x46; iface->mac[4]=0x69; iface->mac[5]=0x21;
-        kprintf("wifi: no wireless HW found, created virtual %s (over e1000 backend) for QEMU\n", iface->name);
-    }
-    wifi_add_fake_aps();
-    kprintf("wifi: up with %d iface(s), %d APs\n", g_iface_n, g_ap_n);
+    /* No radio is fabricated.  In QEMU there is no 802.11 controller, so the
+     * interface list stays empty and scan reports zero networks — what a real
+     * OS shows inside a VM.  A real controller (e.g. the RTL8822CE) is
+     * brought up later by wifi_pci_notify() during PCI enumeration. */
+    kprintf("wifi: no wireless radio detected (VM) - interface list empty\n");
 }

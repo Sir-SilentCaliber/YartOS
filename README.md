@@ -12,6 +12,14 @@ its own window surface (per-window input routing).
 
 ## Quick start
 
+The project is fully **portable**: clone it anywhere, install the host
+dependencies, and `make iso` builds a bootable image.  No absolute paths,
+no committed build artifacts, all assets vendored in the tree.
+
+```bash
+git clone <url> yartos && cd yartos
+```
+
 **1. Install host dependencies** (one-time):
 
 ```bash
@@ -41,10 +49,12 @@ userland/              Ring-3 compositor/wm + freestanding libc
   sys.h                Syscalls + freestanding libc helpers
   init.c               Entry point
 kora/                  All visual assets
-  icons/kora/          Vendored Kora icon theme SVGs (the build renders the
-                       ~115 icons the compositor uses into an embedded atlas)
-  wallpapers/          default.png (+ more when added)
-  cursors/             (reserved for cursor themes)
+  icons/kora/          Kora icon theme SVGs — trimmed to exactly the ~102
+                       SVGs the build resolves (the full theme is ~6.5k
+                       files; restore from the upstream Kora repo to add
+                       more icons)
+  wallpapers/          generated procedurally at build time
+  cursors/             cursor source PNGs (tracked build inputs)
 scripts/               Asset generators, Limine bootstrap, QEMU runner
 initrd_root/           Skeleton filesystem (bin/, etc/, home/yart/)
 build/                 (generated) compiled objects, kora.bin, init.elf
@@ -60,6 +70,20 @@ yart.iso               (generated) bootable hybrid ISO
 - `make run`             — build ISO and boot in QEMU
 - `make clean`           — remove build artifacts
 - `make distclean`       — also remove the downloaded Limine checkout
+- `make portable-check`  — verify the tree carries no build/scratch cruft
+
+## Portability notes
+
+- All generated artifacts (`build/`, `iso_root/`, `yart.iso`,
+  `yart-disk.img`, `runlogs/`, `limine/`, `initrd_root/bin/*`,
+  screenshots) are `.gitignore`d and removed by `make clean`.
+- `kora/icons/` (SVG sources), the embedded font, the cursor source PNGs,
+  and the WiFi firmware blobs under `initrd_root/lib/firmware/` are
+  **tracked**, so the build is self-contained (no Linux source tree needed).
+- Limine is fetched automatically by `make` on first run.
+- `bootstrap.sh` installs host deps on Debian/Ubuntu, Arch, Fedora and
+  macOS; QEMU + OVMF paths are auto-detected; KVM is used when available
+  (TCG fallback otherwise).
 
 ## In-OS runtime paths
 | Asset                  | Path                |

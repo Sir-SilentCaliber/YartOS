@@ -48,6 +48,7 @@ void pic_eoi_careful(u8 irq);   /* spurious-IRQ aware EOI */
 void pic_disable_all(void);     /* stop the legacy 8259s */
 
 /* APIC / IOAPIC / APIC timer (apic.c).  Falls back to PIC + PIT. */
+bool apic_available(void);
 void apic_init(void);
 bool apic_active(void);
 void interrupt_eoi(u8 vector);          /* LAPIC or (careful) PIC EOI */

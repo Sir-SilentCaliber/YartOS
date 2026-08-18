@@ -190,6 +190,33 @@ paddr_t pmm_alloc_pages(size_t n) {
     kpanic("pmm: out of contiguous memory (%lu pages)", n);
 }
 
+
+/* Allocate n contiguous pages whose physical addresses are all < `limit`
+ * (used for 32-bit DMA devices).  Returns 0 instead of panicking so callers
+ * can fail cleanly. */
+paddr_t pmm_alloc_pages_below(size_t n, paddr_t limit) {
+    if (n == 0) return 0;
+    size_t max_idx = limit / PAGE_SIZE;
+    if (max_idx > total_pages) max_idx = total_pages;
+    if (n > max_idx) return 0;
+    spin_lock(&pmm_lock);
+    size_t run = 0, run_start = 0;
+    for (size_t i = 0; i < max_idx; i++) {
+        if (!BIT_TST(i)) {
+            if (run == 0) run_start = i;
+            if (++run == n) {
+                for (size_t k = 0; k < n; k++) alloc_idx(run_start + k);
+                spin_unlock(&pmm_lock);
+                return (paddr_t)run_start * PAGE_SIZE;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    spin_unlock(&pmm_lock);
+    return 0;
+}
+
 /* An extra reference on an allocated page (CoW sharing, aliased mappings). */
 void pmm_ref_page(paddr_t p) {
     spin_lock(&pmm_lock);

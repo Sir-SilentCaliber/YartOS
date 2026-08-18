@@ -30,12 +30,33 @@ CUR_BIN  := build/cursors.bin
 CUR_H    := build/cursor_assets.h
 BMP_WALL := initrd_root/YartOS/kora/wallpaper.bmp
 
-C_SRCS   := $(shell find kernel -name '*.c')
-ASM_SRCS := $(shell find kernel -name '*.asm' ! -name 'smp_tramp.asm')
-C_OBJS   := $(C_SRCS:%.c=build/%.o)
-ASM_OBJS := $(ASM_SRCS:%.asm=build/%.o)
+# Portable source enumeration. Some hosts/distros have a non-GNU or oddly
+# configured `find` in PATH; $(wildcard ...) is built into make and cannot
+# silently produce an empty kernel object list.
+KERNEL_C_SRCS := \
+  $(wildcard kernel/*.c) \
+  $(wildcard kernel/arch/*/*.c) \
+  $(wildcard kernel/drivers/*.c) \
+  $(wildcard kernel/fs/*.c) \
+  $(wildcard kernel/gui/*.c) \
+  $(wildcard kernel/lib/*.c) \
+  $(wildcard kernel/mm/*.c) \
+  $(wildcard kernel/net/*.c) \
+  $(wildcard kernel/sched/*.c)
+KERNEL_ASM_SRCS := $(wildcard kernel/arch/*/*.asm)
+# smp_tramp.asm is included/generated separately; do not link it directly.
+KERNEL_ASM_SRCS := $(filter-out %/smp_tramp.asm,$(KERNEL_ASM_SRCS))
+C_OBJS   := $(patsubst %.c,build/%.o,$(KERNEL_C_SRCS))
+ASM_OBJS := $(patsubst %.asm,build/%.o,$(KERNEL_ASM_SRCS))
 OBJS     := $(C_OBJS) $(ASM_OBJS)
 DEPS     := $(C_OBJS:.o=.d)
+
+ifeq ($(strip $(KERNEL_C_SRCS)),)
+  $(error ERROR: no kernel C sources found under kernel/ -- check the repository checkout)
+endif
+ifeq ($(strip $(OBJS)),)
+  $(error ERROR: kernel object list is empty; cannot link build/yart.elf)
+endif
 
 CFLAGS := -std=gnu11 -ffreestanding -fno-stack-protector -fno-stack-check       \
           -fno-pic -fno-pie -mno-red-zone -mno-80387 -mno-mmx -mno-sse -mno-sse2 \
@@ -49,7 +70,7 @@ LDFLAGS := -nostdlib -static -m elf_x86_64 -z max-page-size=0x1000 \
 
 ASFLAGS := -f elf64 -Ikernel/arch/x86_64/
 
-UCFLAGS := -std=gnu11 -ffreestanding -fno-stack-protector -fPIC -fPIE \
+UCFLAGS := -std=gnu11 -ffreestanding -fno-stack-protector -fPIC -fPIE -msse2 \
            -mno-red-zone -O3 -Wall -Wextra -Iuserland -Ibuild
 ULDFLAGS := -nostdlib -static -pie -m elf_x86_64 -z max-page-size=0x1000 \
             -T userland/init.ld
@@ -74,8 +95,8 @@ ifneq ($(PIL_OK),OK)
   $(error Aborting)
 endif
 
-.PHONY: all iso run clean distclean limine assets
-all: $(KERNEL) $(USER_ELF) build/nyra.elf
+.PHONY: all iso run clean distclean limine assets portable-check
+all: $(KERNEL) $(USER_ELF) build/nyra.elf build/files.elf build/settings.elf build/editor.elf build/browser.elf
 
 assets: $(KORA_BIN) $(KORA_H) $(WP_BIN) $(CUR_BIN) $(CUR_H)
 
@@ -94,7 +115,7 @@ $(WP_BIN): scripts/gen_wallpaper_pack.py
 $(WP_PNG): $(WP_BIN)
 	@: default.png side-effect
 
-$(CUR_BIN) $(CUR_H): scripts/gen_cursors.py $(wildcard kora/cursors/*.png)
+$(CUR_BIN) $(CUR_H): scripts/gen_cursors.py $(wildcard kora/cursors/*.png) $(wildcard kora/cursors/*.hot)
 	@mkdir -p build
 	@chmod +x scripts/gen_cursors.py 2>/dev/null || true
 	python3 scripts/gen_cursors.py
@@ -124,9 +145,23 @@ build/start.o: userland/start.c userland/sys.h
 build/init.o: userland/init.c userland/sys.h userland/wm.c userland/gfx.h $(KORA_H)
 	@mkdir -p build
 	$(CC) $(UCFLAGS) -c userland/init.c -o build/init.o
-build/wm.o: userland/wm.c userland/sys.h userland/gfx.h userland/cursors.h $(KORA_H) $(CUR_H) assets
+build/theme.o: userland/theme/theme.c userland/theme/theme.h userland/sys.h
+	$(CC) $(UCFLAGS) -Iuserland/theme -c userland/theme/theme.c -o build/theme.o
+build/wm.o: userland/wm.c userland/wm.h userland/sys.h userland/gfx.h userland/cursors.h userland/theme/theme.h $(KORA_H) $(CUR_H) assets
 	@mkdir -p build
 	$(CC) $(UCFLAGS) -c userland/wm.c -o build/wm.o
+build/wm_damage.o: userland/wm_damage.c userland/wm.h
+	$(CC) $(UCFLAGS) -c userland/wm_damage.c -o build/wm_damage.o
+build/wm_windows.o: userland/wm_windows.c userland/wm.h
+	$(CC) $(UCFLAGS) -c userland/wm_windows.c -o build/wm_windows.o
+build/wm_dock.o: userland/wm_dock.c userland/wm.h
+	$(CC) $(UCFLAGS) -c userland/wm_dock.c -o build/wm_dock.o
+build/wm_panel.o: userland/wm_panel.c userland/wm.h
+	$(CC) $(UCFLAGS) -c userland/wm_panel.c -o build/wm_panel.o
+build/wm_launcher.o: userland/wm_launcher.c userland/wm.h
+	$(CC) $(UCFLAGS) -c userland/wm_launcher.c -o build/wm_launcher.o
+build/wm_overlays.o: userland/wm_overlays.c userland/wm.h
+	$(CC) $(UCFLAGS) -c userland/wm_overlays.c -o build/wm_overlays.o
 build/gfx.o: userland/gfx.c userland/gfx.h userland/sys.h $(KORA_H) assets
 	@mkdir -p build
 	$(CC) $(UCFLAGS) -c userland/gfx.c -o build/gfx.o
@@ -140,8 +175,8 @@ build/cursors.o: $(CUR_BIN)
 	@mkdir -p build
 	cd build && $(LD) -r -b binary -o cursors.o cursors.bin
 
-$(USER_ELF): build/start.o build/init.o build/wm.o build/cursors_lib.o build/gfx.o build/assets.o build/wallpaper.o build/cursors.o userland/init.ld
-	$(LD) $(ULDFLAGS) build/start.o build/init.o build/wm.o build/cursors_lib.o build/gfx.o build/assets.o build/wallpaper.o build/cursors.o -o $@
+$(USER_ELF): build/start.o build/init.o build/wm.o build/wm_damage.o build/wm_windows.o build/wm_dock.o build/wm_panel.o build/wm_launcher.o build/wm_overlays.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/init.o build/wm.o build/wm_damage.o build/wm_windows.o build/wm_dock.o build/wm_panel.o build/wm_launcher.o build/wm_overlays.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o -o $@
 
 # /bin/hello
 build/hello.o: userland/hello.c userland/sys.h
@@ -151,6 +186,44 @@ build/hello.elf: build/start.o build/hello.o userland/init.ld
 	@mkdir -p build
 	$(LD) $(ULDFLAGS) build/start.o build/hello.o -o $@
 
+
+# Simple bundled GUI apps
+build/gui_apps_%.o: userland/gui_apps.c userland/sys.h userland/gfx.h
+	@mkdir -p build
+	$(CC) $(UCFLAGS) -DAPP_NAME=\"$*\" $< -c -o $@
+
+build/gui_files.o: userland/gui_apps.c userland/sys.h userland/gfx.h userland/cursors.h $(CUR_H)
+	@mkdir -p build
+	$(CC) $(UCFLAGS) -DAPP_FILES -DAPP_NAME=\"Files\" -c $< -o $@
+build/gui_settings.o: userland/gui_apps.c userland/sys.h userland/gfx.h userland/cursors.h $(CUR_H)
+	@mkdir -p build
+	$(CC) $(UCFLAGS) -DAPP_SETTINGS -DAPP_NAME=\"Settings\" -c $< -o $@
+build/gui_editor.o: userland/gui_apps.c userland/sys.h userland/gfx.h userland/cursors.h $(CUR_H)
+	@mkdir -p build
+	$(CC) $(UCFLAGS) -DAPP_EDITOR -DAPP_NAME=\"Text\" -c $< -o $@
+build/gui_browser.o: userland/gui_apps.c userland/sys.h userland/gfx.h userland/cursors.h $(CUR_H)
+	@mkdir -p build
+	$(CC) $(UCFLAGS) -DAPP_BROWSER -DAPP_NAME=\"About\" -c $< -o $@
+
+build/files.elf: build/start.o build/gui_files.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/gui_files.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o -o $@
+build/settings.elf: build/start.o build/gui_settings.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/gui_settings.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o -o $@
+build/editor.elf: build/start.o build/gui_editor.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/gui_editor.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o -o $@
+build/browser.elf: build/start.o build/gui_browser.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/gui_browser.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o -o $@
+
+initrd_root/bin/files: build/files.elf
+	@mkdir -p initrd_root/bin
+	cp build/files.elf initrd_root/bin/files; chmod 755 initrd_root/bin/files
+initrd_root/bin/settings: build/settings.elf
+	cp build/settings.elf initrd_root/bin/settings; chmod 755 initrd_root/bin/settings
+initrd_root/bin/editor: build/editor.elf
+	cp build/editor.elf initrd_root/bin/editor; chmod 755 initrd_root/bin/editor
+initrd_root/bin/browser: build/browser.elf
+	cp build/browser.elf initrd_root/bin/browser; chmod 755 initrd_root/bin/browser
+
 # /bin/nyra - Nyra Terminal (unique shell replacing settings)
 build/nyra.o: userland/nyra.c userland/sys.h userland/gfx.h $(CUR_H)
 	@mkdir -p build
@@ -158,8 +231,8 @@ build/nyra.o: userland/nyra.c userland/sys.h userland/gfx.h $(CUR_H)
 build/cursors_lib.o: userland/cursors.c userland/cursors.h $(CUR_H)
 	@mkdir -p build
 	$(CC) $(UCFLAGS) -c userland/cursors.c -o build/cursors_lib.o
-build/nyra.elf: build/start.o build/nyra.o build/cursors_lib.o build/gfx.o build/assets.o build/wallpaper.o build/cursors.o userland/init.ld
-	$(LD) $(ULDFLAGS) build/start.o build/nyra.o build/cursors_lib.o build/gfx.o build/assets.o build/wallpaper.o build/cursors.o -o $@
+build/nyra.elf: build/start.o build/nyra.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/nyra.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o -o $@
 
 initrd_root/bin/init: $(USER_ELF)
 	@mkdir -p initrd_root/bin
@@ -192,7 +265,7 @@ $(LIMINE):
 	@chmod +x scripts/get-limine.sh 2>/dev/null || true
 	bash ./scripts/get-limine.sh
 
-build/initrd.tar: initrd_root/etc/motd initrd_root/etc/yart.conf initrd_root/home/yart/cursor.conf $(BMP_WALL) initrd_root/bin/init initrd_root/bin/hello initrd_root/bin/nyra
+build/initrd.tar: initrd_root/etc/motd initrd_root/etc/yart.conf initrd_root/home/yart/cursor.conf $(BMP_WALL) initrd_root/bin/init initrd_root/bin/hello initrd_root/bin/nyra initrd_root/bin/files initrd_root/bin/settings initrd_root/bin/editor initrd_root/bin/browser
 	@mkdir -p build
 	cd initrd_root && tar --format=ustar -cf ../build/initrd.tar .
 
@@ -227,11 +300,27 @@ run-bios: $(ISO)
 	    -cdrom $(ISO) -boot d -serial stdio
 
 clean:
-	rm -rf build $(ISO_ROOT) $(ISO) initrd_root/bin/init initrd_root/bin/hello \
-	           initrd_root/bin/nyra initrd_root/bin/settings $(BMP_WALL) initrd_root/etc/motd \
-	           initrd_root/etc/yart.conf initrd_root/home/yart/cursor.conf \
-	           initrd_root/YartOS
+	rm -rf build $(ISO_ROOT) $(ISO) \
+	           initrd_root/bin/init initrd_root/bin/hello initrd_root/bin/nyra \
+	           initrd_root/bin/files initrd_root/bin/settings \
+	           initrd_root/bin/editor initrd_root/bin/browser \
+	           $(BMP_WALL) initrd_root/etc/motd initrd_root/etc/yart.conf \
+	           initrd_root/home/yart/cursor.conf initrd_root/YartOS \
+	           yart-disk.img runlogs *.ppm *.png audio-out.wav
+	rmdir initrd_root/bin 2>/dev/null || true
 distclean: clean
 	rm -rf $(LIMINE)
+
+# ---- portability check: fail if the tree carries any non-source cruft ----
+portable-check:
+	@ok=1; \
+	for f in yart.iso yart-disk.img; do \
+	  if [ -e "$$f" ]; then echo "NOT PORTABLE: $$f present (run 'make clean')"; ok=0; fi; \
+	done; \
+	for f in *.ppm *.png; do \
+	  if [ -e "$$f" ]; then echo "NOT PORTABLE: $$f present (run 'make clean')"; ok=0; fi; \
+	done; \
+	if [ -n "$$(ls runlogs/ 2>/dev/null)" ]; then echo "NOT PORTABLE: runlogs/ not empty"; ok=0; fi; \
+	if [ "$$ok" = 1 ]; then echo "portable: tree is clean"; else exit 1; fi
 
 -include $(DEPS)

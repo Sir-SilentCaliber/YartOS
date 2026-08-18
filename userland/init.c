@@ -58,6 +58,9 @@ static void boot_counter(void) {
         write(fd, b, strlen(b));
         close(fd);
     }
+    /* durability: flush to disk NOW, otherwise the counter lives only in
+     * the page cache and "survived from last boot" would be a lie. */
+    _sc(SYS_FSYNC, 0, 0, 0);
     {
         char msg[80];
         char num[16];
@@ -76,13 +79,13 @@ static void boot_counter(void) {
 /* The "app crash = kernel panic" claim, tested: a user task doing a
  * div-by-zero must be killed (SIGSEGV), and the kernel + parent keep going. */
 static void fault_isolation_demo(void) {
-    klog("iso: forking a child that will DIVIDE BY ZERO...\n");
+    klog("selftest: [isolation] deliberately crashing a child with div-by-zero (this is SAFE and expected)...\n");
     long pid = fork();
     if (pid == 0) {
         volatile int d = 0;
         volatile int r = 1234 / d;      /* #DE in user mode               */
         (void)r;
-        klog("iso: child SURVIVED div-by-zero (BUG!)\n");
+        klog("selftest: [isolation] FAIL: child survived div-by-zero!\n");
         exit(0);
     } else if (pid > 0) {
         int status = 0;
@@ -91,8 +94,8 @@ static void fault_isolation_demo(void) {
         if (r == pid && status != 0) {
             char num[16]; my_itoa(status, num);
             char msg[80]; int i = 0;
-            const char *a = "iso: child died with status ";
-            const char *c = " - kernel + parent SURVIVED (no panic!)\n";
+            const char *a = "selftest: [isolation] child terminated with signal/status ";
+            const char *c = " (PASS - the OS isolated the crash; no kernel panic)\n";
             while (*a) msg[i++] = *a++;
             for (char *p = num; *p;) msg[i++] = *p++;
             while (*c) msg[i++] = *c++;
@@ -194,7 +197,7 @@ static void smp_demo(void) {
 /* Entry: real crt0 in start.c calls main_entry(argc, argv, envp) with the
  * SysV process image the kernel placed on our stack. */
 int main_entry(int argc, char **argv, char **envp) {
-    (void)envp;
+    
     klog("init: hello from ring 3\n");
     if (argc > 0 && argv[0])
         klog(argv[0]);
@@ -202,6 +205,20 @@ int main_entry(int argc, char **argv, char **envp) {
     puts("init(1) booted in user mode.");
     boot_counter();
 
+    /* Developer self-tests are OFF by default. They fork children, write
+     * test files and can fill a small disk, producing scary-looking log
+     * lines on every normal boot. Set YART_SELFTEST=1 in the environment
+     * to run them. */
+    int run_selftest = 0;
+    if (envp) for (int ei=0; envp[ei]; ei++) {
+        const char *e = envp[ei];
+        if (e[0]=='Y'&&e[1]=='A'&&e[2]=='R'&&e[3]=='T'&&e[4]=='_'&&
+            e[5]=='S'&&e[6]=='E'&&e[7]=='L'&&e[8]=='F'&&e[9]=='T'&&
+            e[10]=='='&&e[11]=='1') run_selftest = 1;
+    }
+    if (!run_selftest) klog("init: self-tests skipped (set YART_SELFTEST=1 to run)\n");
+
+    if (run_selftest) {
     klog("fpu: testing SSE float math in ring 3...\n");
     {
         double x = 3.14159;
@@ -988,6 +1005,9 @@ int main_entry(int argc, char **argv, char **envp) {
     /* ---- SMP: 6 children load-balanced onto the cores ---- */
     smp_demo();
 
+    }
+
+    if (run_selftest) {
     /* ---- exec: fork, then the child replaces itself with /bin/hello ---- */
     klog("exec: forking a child that will exec /bin/hello...\n");
     {
@@ -1162,6 +1182,8 @@ int main_entry(int argc, char **argv, char **envp) {
                 tcp_close(c);
             }
         }
+    }
+
     }
 
     klog("init: boot tests complete; entering ring-3 compositor loop\n");

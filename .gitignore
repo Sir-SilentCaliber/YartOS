@@ -13,6 +13,13 @@ stable.png
 probe.png
 fixed_max.png
 screenshot.png
+*.ppm
+*.png
+*.wav
+runlogs/
+
+# ---- EXCEPTIONS: PNGs that are BUILD INPUTS (tracked source assets) ----
+!kora/cursors/*.png
 
 # ---- editor / OS cruft ----
 *.swp
@@ -23,10 +30,18 @@ screenshot.png
 #      portability - `make iso` regenerates all of these) ----
 initrd_root/bin/init
 initrd_root/bin/hello
+initrd_root/bin/nyra
+initrd_root/bin/files
 initrd_root/bin/settings
+initrd_root/bin/editor
+initrd_root/bin/browser
 initrd_root/etc/motd
 initrd_root/etc/yart.conf
 initrd_root/etc/wallpaper.bmp
 initrd_root/home/yart/cursor.conf
 initrd_root/YartOS/
 kora/wallpapers/*.png
+
+# ---- NOT ignored: initrd_root/lib/firmware/*.bin are TRACKED runtime
+#      blobs (stand-in firmware + generated PHY tables) so the OS is
+#      self-contained for real hardware without the Linux source tree ----

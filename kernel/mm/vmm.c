@@ -43,6 +43,13 @@ static ALWAYS_INLINE u64 *cur_pml4(void) {
 static user_region_t g_boot_regions[MAX_USER_REGIONS];
 static int g_boot_region_count;
 
+/* Per-fault tracing.  Demand-fault and CoW-split happen on EVERY page of
+ * every app's text/data/stack, so logging each one (kprintf -> serial, one
+ * busy-wait per character) turned the page-fault hot path into a serial
+ * bottleneck and drowned the log.  Real kernels use off-by-default
+ * tracepoints here; so do we.  Flip to true only when debugging the VMM. */
+static bool g_vmm_trace = false;
+
 /* ---------------- page-table walk ---------------- */
 
 static u64 *next_table(u64 *table, int idx, bool create, u64 prop_flags) {
@@ -329,8 +336,9 @@ bool vmm_resolve_user_fault(u64 va, bool write) {
             return false;
         }
         vmm_map(page, p, r->flags);
-        kprintf("vmm: demand-fault 0x%lx -> %p mapped (region %p flags=%x)\n",
-                page, (void *)p, (void *)r->start, r->flags);
+        if (g_vmm_trace)
+            kprintf("vmm: demand-fault 0x%lx -> %p mapped (region %p flags=%x)\n",
+                    page, (void *)p, (void *)r->start, r->flags);
         return true;
     }
 
@@ -346,8 +354,9 @@ bool vmm_resolve_user_fault(u64 va, bool write) {
         memcpy(phys_to_virt(copy), phys_to_virt(phys), PAGE_SIZE);
         pmm_unref_page(phys);
         vmm_map(page, copy, PTE_RW | PTE_US);
-        kprintf("vmm: CoW copy 0x%lx old=%p new=%p\n",
-                page, (void *)phys, (void *)copy);
+        if (g_vmm_trace)
+            kprintf("vmm: CoW copy 0x%lx old=%p new=%p\n",
+                    page, (void *)phys, (void *)copy);
         return true;
     }
     return false;
@@ -397,6 +406,40 @@ void vmm_cow_fork(u64 *child_pml4) {
             u64 *cp = walk(child_pml4, a, true, PTE_US);
             *cp = entry;                         /* child  -> RO           */
             invlpg(a);
+        }
+    }
+    /* Pass 2: NOSHR pages mapped OUTSIDE any region.  The wm-side window
+     * canvases (WM_SURF_WM_BASE + id*stride) are mapped straight into the
+     * compositor's PML4 via vmm_map_in() - no region covers them, so the
+     * loop above never visits them.  But vmm_clone_pml4() copies the whole
+     * user half VERBATIM, so the child DOES get a PTE for every canvas.
+     * Without this pass the child's copy is unaccounted, and the exec path
+     * (vmm_free_pml4) unrefs it with no matching ref: every app launch
+     * under-counted every live/deferred surface frame, the slot-reuse
+     * reclaim then freed a still-mapped frame ("free of non-allocated
+     * page" wall), and the freed frame corrupted whatever task reused it -
+     * the real root cause of the intermittent SMP frame-corruption panics. */
+    u64 *pml4 = cur_pml4();
+    if (pml4[0] & PTE_PRESENT) {
+        u64 *pdpt = phys_to_virt(pml4[0] & ~0xFFFULL & ~PTE_NX);
+        for (u32 i3 = 0; i3 < 512; i3++) {          /* PDPT index (bits 30-38) */
+            if (!(pdpt[i3] & PTE_PRESENT)) continue;
+            u64 *pd = phys_to_virt(pdpt[i3] & ~0xFFFULL & ~PTE_NX);
+            for (u32 i2 = 0; i2 < 512; i2++) {      /* PD index   (bits 21-29) */
+                if (!(pd[i2] & PTE_PRESENT) || (pd[i2] & PTE_HUGE)) continue;
+                u64 *pt = phys_to_virt(pd[i2] & ~0xFFFULL & ~PTE_NX);
+                for (u32 i1 = 0; i1 < 512; i1++) {  /* PT index   (bits 12-20) */
+                    u64 *pte = &pt[i1];
+                    if (!(*pte & PTE_PRESENT)) continue;
+                    if (!(*pte & PTE_NOSHR) || (*pte & PTE_SWAP)) continue;
+                    u64 va = ((u64)i3 << 30) | ((u64)i2 << 21) |
+                             ((u64)i1 << 12);
+                    /* region-resident NOSHR pages (the fb) already got
+                     * their ref in the loop above - skip them here */
+                    if (find_region(va)) continue;
+                    pmm_ref_page(*pte & ~0xFFFULL & ~PTE_NX);
+                }
+            }
         }
     }
 }

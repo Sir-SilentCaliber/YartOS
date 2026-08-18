@@ -22,6 +22,7 @@
 #include <yart/console.h>
 #include <yart/string.h>
 #include <yart/hal.h>   /* apic_local_id, irq_register */
+#include <yart/spinlock.h>
 
 /* virtio legacy PCI register offsets (Linux/QEMU legacy layout) */
 #define VQ_HOST_FEAT    0x00
@@ -52,6 +53,7 @@ typedef struct PACKED { u16 flags; u16 idx; struct PACKED { u32 id; u32 len; } r
 typedef struct PACKED { u32 type; u32 ioprio; u64 sector; } blk_req_hdr_t;
 #define BLK_T_IN  0
 #define BLK_T_OUT 1
+#define BLK_T_FLUSH 4
 
 /* modern common-config register offsets (within the common region) */
 #define C_DEV_FEAT_SEL   0x00
@@ -128,6 +130,17 @@ static volatile bool g_io_done;
 static volatile u32  g_irq_count;
 static bool          g_uses_msix;
 #define BLK_MSIX_VEC 61
+
+/* The request path uses ONE bounce buffer, ONE request header, ONE
+ * descriptor chain and ONE g_last_used counter - so exactly one request may
+ * be in flight at a time.  On SMP, two CPUs issuing requests concurrently
+ * stomp each other's buffer/chain and each consume the OTHER's completion:
+ * both "succeed" while only one write actually reached the device.  That
+ * is what silently dropped DATA-area writes at runtime (boot-time inode/
+ * swap writes are single-CPU and never raced).  Serialize the whole
+ * request under this lock, with interrupts off so the holder cannot be
+ * preempted onto a task that also needs the lock (self-deadlock). */
+static spinlock_t g_blk_lock;
 
 static void cpu_relax(void) { __asm__ volatile("pause"); }
 
@@ -207,14 +220,20 @@ u32 blk_irq_count(void) { return g_irq_count; }
 /* ---------------- the request path (shared by both modes) ------- */
 static int vq_request(u32 type, u64 sector, void *data, u32 bytes) {
     if (!g_present) return -1;
-    if (bytes == 0 || bytes % BLK_SECTOR_SIZE || bytes > 4 * KB(1)) return -1;
+    if (bytes == 0 || bytes % BLK_SECTOR_SIZE || bytes > PAGE_SIZE) return -1;
 
+    u64 fl = irq_save();
+    spin_lock(&g_blk_lock);
+
+    int rc = -1;
+    u8 status = 0xFF;
     if (type == BLK_T_OUT)
         memcpy(g_data, data, bytes);            /* bounce out              */
 
     g_req->type   = type;
     g_req->ioprio = 0;
     g_req->sector = sector;
+    *(volatile u8 *)((u8 *)g_req + 4080) = 0xFF;   /* reset status byte   */
 
     u16 head = (u16)(g_avail->idx & (VQ_SIZE - 1));
     g_desc[0] = (vq_desc_t){ g_req_phys,  sizeof(blk_req_hdr_t), VIRTQ_DESC_F_NEXT, 1 };
@@ -233,29 +252,88 @@ static int vq_request(u32 type, u64 sector, void *data, u32 bytes) {
 
     u64 tries = 0;
     while (g_used->idx == g_last_used && !g_io_done) {
-        if (++tries > 300000000ULL) return -1;
+        if (++tries > 300000000ULL) { rc = -1; goto out; }
         cpu_relax();
     }
+    __asm__ volatile("mfence" ::: "memory");   /* used-ring DMA is visible */
     u16 old = g_last_used;
     g_last_used = g_used->idx;
 
-    u8 status = 0xFF;
+    status = 0xFF;
     for (u16 s = old; s != g_last_used; s = (u16)(s + 1)) {
         u16 slot = s & (VQ_SIZE - 1);
         if (g_used->ring[slot].id == 0)
             status = *(volatile u8 *)((u8 *)g_req + 4080);
     }
-    if (status != 0) return -1;
+    if (status != 0) { rc = -1; goto out; }
     if (type == BLK_T_IN)
         memcpy(data, g_data, bytes);            /* bounce in               */
-    return 0;
+    rc = 0;
+out:
+    spin_unlock(&g_blk_lock);
+    irq_restore(fl);
+    return rc;
 }
 
 int blk_read_sectors(u64 sector, u32 count, void *dst) {
-    return vq_request(BLK_T_IN, sector, dst, count * BLK_SECTOR_SIZE);
+    u32 bytes=count*BLK_SECTOR_SIZE; u8 *d=(u8*)dst;
+    for(u32 off=0;off<bytes;off+=PAGE_SIZE){ u32 n=bytes-off; if(n>PAGE_SIZE)n=PAGE_SIZE;
+        if(vq_request(BLK_T_IN,sector+off/BLK_SECTOR_SIZE,d+off,n)!=0)return -1; }
+    return 0;
 }
 int blk_write_sectors(u64 sector, u32 count, const void *src) {
-    return vq_request(BLK_T_OUT, sector, (void *)src, count * BLK_SECTOR_SIZE);
+    u32 bytes=count*BLK_SECTOR_SIZE; const u8 *d=(const u8*)src;
+    for(u32 off=0;off<bytes;off+=PAGE_SIZE){ u32 n=bytes-off; if(n>PAGE_SIZE)n=PAGE_SIZE;
+        if(vq_request(BLK_T_OUT,sector+off/BLK_SECTOR_SIZE,(u8*)d+off,n)!=0)return -1; }
+    return 0;
+}
+
+/* VIRTIO_BLK_T_FLUSH: barrier the device's write cache out to stable
+ * storage.  The chain is just [header][status] - no data descriptor. */
+int blk_flush(void) {
+    if (!g_present) return 0;
+    u64 fl = irq_save();
+    spin_lock(&g_blk_lock);
+    int rc = -1;
+    u8 status = 0xFF;
+
+    g_req->type   = BLK_T_FLUSH;
+    g_req->ioprio = 0;
+    g_req->sector = 0;
+    *(volatile u8 *)((u8 *)g_req + 4080) = 0xFF;
+
+    u16 head = (u16)(g_avail->idx & (VQ_SIZE - 1));
+    g_desc[0] = (vq_desc_t){ g_req_phys, sizeof(blk_req_hdr_t), VIRTQ_DESC_F_NEXT, 1 };
+    g_desc[1] = (vq_desc_t){ g_req_phys + 4080, 1, VIRTQ_DESC_F_WRITE, 0 };
+
+    __asm__ volatile("mfence" ::: "memory");
+    g_avail->ring[head] = 0;
+    __asm__ volatile("mfence" ::: "memory");
+    g_avail->idx++;
+
+    g_io_done = false;
+    if (g_modern) notify_queue();
+    else          vq_write(VQ_QUEUE_NOTIFY, 0);
+
+    u64 tries = 0;
+    while (g_used->idx == g_last_used && !g_io_done) {
+        if (++tries > 300000000ULL) { rc = -1; goto out; }
+        cpu_relax();
+    }
+    __asm__ volatile("mfence" ::: "memory");
+    u16 old = g_last_used;
+    g_last_used = g_used->idx;
+    status = 0xFF;
+    for (u16 s = old; s != g_last_used; s = (u16)(s + 1)) {
+        u16 slot = s & (VQ_SIZE - 1);
+        if (g_used->ring[slot].id == 0)
+            status = *(volatile u8 *)((u8 *)g_req + 4080);
+    }
+    rc = (status == 0) ? 0 : -1;
+out:
+    spin_unlock(&g_blk_lock);
+    irq_restore(fl);
+    return rc;
 }
 bool blk_disk_present(void) { return g_present; }
 u64  blk_disk_sectors(void) { return g_capacity_sectors; }
@@ -447,6 +525,7 @@ static bool modern_setup(u8 bus, u8 dev, u8 fn) {
 /* ---------------- probe + init ---------------- */
 void blk_init(void) {
     if (g_present) return;
+    spin_init(&g_blk_lock);
     int found = -1;
     u8 fbus = 0, fdev = 0, ffn = 0;
     for (int bus = 0; bus < 4 && found < 0; bus++)

@@ -400,8 +400,12 @@ bool user_exec(vnode_t *v, char *const kargv[], int argc,
     int nrs = 0;
 
     /* CR3 must point at the new tables BEFORE any byte is copied into the
-     * new image (the old address space is about to be destroyed anyway). */
+     * new image (the old address space is about to be destroyed anyway).
+     * Record the NEW tables on the task BEFORE the switch, so there is no
+     * window where t->pml4 (what the scheduler and other CPUs read) is
+     * stale while CR3 already points at the new tables. */
     u64 *old_pml4 = t->pml4;
+    t->pml4 = new_pml4;
     vmm_switch_pml4(new_pml4);
 
     seed_aslr((u64)(u64)v ^ ((u64)t->pid << 32));
@@ -416,11 +420,10 @@ bool user_exec(vnode_t *v, char *const kargv[], int argc,
                                          kargv, argc, kenvp, envc);
     if (!user_rsp) goto fail;
 
-    /* drop the old address space */
+    /* drop the old address space (t->pml4 already points at the new one) */
     if (old_pml4 && old_pml4 != vmm_kernel_pml4())
         vmm_free_pml4(old_pml4);
 
-    t->pml4 = new_pml4;
     memcpy(t->regions, rs, sizeof rs);
     t->region_count = nrs;
     /* fresh dynamic-memory arena + memory accounting for the new image */
@@ -444,12 +447,23 @@ bool user_exec(vnode_t *v, char *const kargv[], int argc,
     frame->rcx = 0;
     frame->r11 = 0;
 
+    /* exec(2) replaces the program, so the task NAME becomes the new
+     * program's (POSIX comm).  Skipping this kept every app named after
+     * its parent ("wm"), which made `ps` and the watchdog report every
+     * application as the compositor. */
+    char old_name[TASK_NAME_LEN];
+    strncpy(old_name, t->name, TASK_NAME_LEN - 1);
+    old_name[TASK_NAME_LEN - 1] = 0;
+    strncpy(t->name, v->name, TASK_NAME_LEN - 1);
+    t->name[TASK_NAME_LEN - 1] = 0;
+
     kprintf("exec: pid %u '%s' -> %s entry=%p rsp=%p argc=%d env=%d\n",
-            t->pid, t->name, v->name, (void *)entry, (void *)user_rsp,
+            t->pid, old_name, v->name, (void *)entry, (void *)user_rsp,
             argc, envc);
     return true;
 fail:
     /* restore the OLD tables and keep running the old image */
+    t->pml4 = old_pml4;
     vmm_switch_pml4(old_pml4 ? old_pml4 : vmm_kernel_pml4());
     vmm_free_pml4(new_pml4);
     return false;

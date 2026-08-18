@@ -108,6 +108,18 @@ enum {
     SYS_WM_RESIZE   = 77,
     SYS_WIFI_DISCONNECT = 78,
     SYS_TASK_LIST   = 79,
+    SYS_FB_PRESENT  = 80,
+    SYS_AUDIO_VOL   = 81,
+    SYS_AUTH_VERIFY = 82,
+    SYS_NOTIFY      = 83,
+    SYS_NOTIFY_POLL = 84,
+    SYS_BATTERY     = 85,
+    SYS_CLIPBOARD_SET = 86,
+    SYS_CLIPBOARD_GET = 87,
+    SYS_MOUSE_POS    = 88,
+    SYS_PASSWD       = 89,
+    SYS_REBOOT       = 90,
+    SYS_DUP2         = 91,
 };
 
 #define O_RDONLY 0x0
@@ -133,6 +145,7 @@ static inline int open(const char *p, int f) { return _sc(SYS_OPEN, (long)p, f, 
 static inline int close(int fd) { return _sc(SYS_CLOSE, fd, 0, 0); }
 static inline int klog(const char *s) { return _sc(SYS_KLOG, (long)s, 0, 0); }
 static inline int unlink(const char *p) { return _sc(SYS_UNLINK, (long)p, 0, 0); }
+static inline int mkdir(const char *p) { return (int)_sc(SYS_MKDIR, (long)p, 0, 0); }
 static inline int yield(void) { return _sc(SYS_YIELD, 0, 0, 0); }
 static inline long getpid(void) { return _sc(SYS_GETPID, 0, 0, 0); }
 static inline long fork(void) { return _sc(SYS_FORK, 0, 0, 0); }
@@ -176,6 +189,17 @@ static inline long wifi_status(char *out, long cap) { return _sc(SYS_WIFI_STATUS
 static inline long wm_move(unsigned id, int x, int y) { return _sc(SYS_WM_MOVE, id, x, y); }
 static inline long wm_resize(unsigned id, unsigned w, unsigned h) { return _sc(SYS_WM_RESIZE, id, w, h); }
 static inline long task_list(unsigned *pids, long max) { return _sc(SYS_TASK_LIST, (long)pids, max, 0); }
+static inline long audio_vol(long v) { return _sc(SYS_AUDIO_VOL, v, 0, 0); }      /* v>=0 set & return old; v<0 get */
+static inline long auth_verify(const char *pw) { return _sc(SYS_AUTH_VERIFY, (long)pw, 0, 0); }
+static inline long notify(const char *m) { return _sc(SYS_NOTIFY, (long)m, 0, 0); }
+static inline long notify_poll(char *buf, long cap) { return _sc(SYS_NOTIFY_POLL, (long)buf, cap, 0); }
+static inline long battery(int *out) { return _sc(SYS_BATTERY, (long)out, 0, 0); }
+static inline long clipboard_set(const char *text) { return _sc(SYS_CLIPBOARD_SET, (long)text, 0, 0); }
+static inline long clipboard_get(char *out, long cap) { return _sc(SYS_CLIPBOARD_GET, (long)out, cap, 0); }
+static inline long mouse_pos(int *out) { return _sc(SYS_MOUSE_POS, (long)out, 0, 0); }
+static inline long passwd(const char *oldpw, const char *newpw) { return _sc(SYS_PASSWD, (long)oldpw, (long)newpw, 0); }
+static inline long reboot(void) { return _sc(SYS_REBOOT, 0, 0, 0); }
+static inline long dup2(long oldfd, long newfd) { return _sc(SYS_DUP2, oldfd, newfd, 0); }
 static inline long mmap(long len) { return _sc(SYS_MMAP, len, 0, 0); }
 static inline long munmap(long addr) { return _sc(SYS_MUNMAP, addr, 0, 0); }
 static inline long setuid(long uid) { return _sc(SYS_SETUID, uid, 0, 0); }
@@ -202,6 +226,8 @@ typedef struct { unsigned w, h, pitch, bpp, rgb; } fb_info_t;
 typedef struct { int dx, dy, wheel; unsigned char buttons; } mouse_ev_t;
 static inline void *fb_info(fb_info_t *i) { return (void *)(u64)_sc(SYS_FB_INFO, (long)i, 0, 0); }
 static inline long fb_flip(void *p) { return _sc(SYS_FB_FLIP, (long)p, 0, 0); }
+typedef struct { int x, y, w, h; } fb_rect_t;
+static inline long fb_present(void *p, const fb_rect_t *rects, long count) { return _sc(SYS_FB_PRESENT, (long)p, (long)rects, count); }
 static inline int  poll_key(void) { return (int)_sc(SYS_POLL_KEY, 0, 0, 0); }
 static inline int  poll_mouse(mouse_ev_t *m) { return (int)_sc(SYS_POLL_MOUSE, (long)m, 0, 0); }
 static inline long time_ms(void) { return _sc(SYS_TIME_MS, 0, 0, 0); }

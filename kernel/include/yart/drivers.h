@@ -30,6 +30,9 @@ bool kbd_alt_held(void);
 
 /* PS/2 mouse */
 void mouse_init(void);
+/* Absolute cursor position tracked by the driver (framebuffer pixels).
+ * Ring-3 apps use SYS_MOUSE_POS to sync their local pointer on focus. */
+void mouse_get_pos(int *x, int *y);
 typedef struct {
     int dx, dy;
     u8  buttons;       /* bit0=left, bit1=right, bit2=middle */

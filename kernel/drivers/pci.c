@@ -12,7 +12,7 @@
 #define PCI_CFG_ADDR 0xCF8
 #define PCI_CFG_DATA 0xCFC
 
-static u32 pci_cfg_read32(u8 bus, u8 dev, u8 fn, u8 off) {
+u32 pci_cfg_read32(u8 bus, u8 dev, u8 fn, u8 off) {
     u32 addr = (1U << 31) | ((u32)bus << 16) | ((u32)dev << 11)
              | ((u32)fn << 8)  | (off & 0xFC);
     outl(PCI_CFG_ADDR, addr);

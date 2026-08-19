@@ -5,6 +5,11 @@
 #include <yart/mm.h>       /* user_region_t */
 
 #define USER_VBASE   0x40000000UL    /* matches userland/init.ld          */
+/* Lowest legal user VA.  YartOS's own code/stack/mmap all live at or above
+ * USER_VBASE, but foreign LINUX ET_EXEC binaries load at their fixed low
+ * address (classically 0x400000).  Everything below USER_VBASE is otherwise
+ * unused, so the low gigabyte is safe for those binaries. */
+#define USER_VFLOOR  0x1000UL
 #define USER_STACK_TOP 0x80000000UL
 #define USER_STACK_PAGES 32
 

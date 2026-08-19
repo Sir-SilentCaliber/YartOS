@@ -9,8 +9,61 @@
 #include <yart/mm.h>
 #include <yart/string.h>
 #include <yart/console.h>
+#include <yart/kfont.h>
 
 fb_ctx_t g_fb;
+
+/* Draw one 8x16 glyph of the embedded font at pixel (x, y) in `fg`.  The
+ * back buffer uses the same u32 format the ring-3 compositor writes
+ * (ARGB bytes = B,G,R,A in little-endian memory), so `fg` is written raw. */
+static void fb_put_char(int x, int y, char ch, color_t fg) {
+    unsigned char c = (unsigned char)ch;
+    if (c < KFONT_BASE || c >= KFONT_BASE + KFONT_COUNT) c = '?';
+    const unsigned char *glyph = kfont8x16[c - KFONT_BASE];
+    for (int row = 0; row < KFONT_H; row++) {
+        int yy = y + row;
+        if (yy < 0 || yy >= (int)g_fb.height) continue;
+        u32 *dst = g_fb.pixels + (long)yy * g_fb.pitch_px + x;
+        u8 bits = glyph[row];
+        for (int col = 0; col < KFONT_W; col++) {
+            if (!(bits & (1u << col))) continue;
+            int xx = x + col;
+            if (xx < 0 || xx >= (int)g_fb.width) continue;
+            dst[col] = fg;
+        }
+    }
+}
+
+void fb_draw_text(int x, int y, const char *s, color_t fg) {
+    if (!s) return;
+    int cx = x;
+    while (*s) {
+        fb_put_char(cx, y, *s++, fg);
+        cx += KFONT_W;
+    }
+}
+
+/* Text fallback screen, painted by the kernel when the ring-3 compositor
+ * dies (the "text only when the graphical session stops" part of the session
+ * model).  No window system survives a dead wm, so this is drawn directly to
+ * the back buffer and presented to the scanout. */
+void fb_fallback_screen(void) {
+    fb_clear(0xFF10141A);                     /* dark, matches boot clear */
+    u32 white = 0xFFFFFFFF;
+    u32 dim   = 0xFF9A9AA0;
+    u32 accent = 0xFF3B82F6;
+    int cx = 24;
+    int cy = 24;
+
+    fb_draw_text(cx, cy, "YartOS", accent);   cy += 40;
+    fb_draw_text(cx, cy, "The graphical session has ended.", white); cy += 24;
+    fb_draw_text(cx, cy, "The compositor exited or crashed.", dim); cy += 36;
+    fb_draw_text(cx, cy, "You are now in text fallback mode.", white); cy += 24;
+    fb_draw_text(cx, cy, "No shell is running in this build yet.", dim); cy += 24;
+    fb_draw_text(cx, cy, "Reboot to restart the desktop.", white);
+
+    fb_present();
+}
 
 void fb_init(struct limine_framebuffer *lfb) {
     g_fb.fb       = (u32 *)lfb->address;

@@ -17,8 +17,8 @@
 #include <yart/hal.h>      /* pit_ticks()                          */
 #include <yart/sched.h>    /* task_t / sched_tasks() for the scan  */
 
-#define WATCHDOG_TIMEOUT_TICKS  300   /* ~3 s at 100 Hz (APIC timer) */
-#define HUNG_TASK_TIMEOUT_TICKS 1000  /* ~10 s                      */
+#define WATCHDOG_TIMEOUT_TICKS  MS_TO_TICKS(3000)   /* ~3 s  */
+#define HUNG_TASK_TIMEOUT_TICKS MS_TO_TICKS(10000)  /* ~10 s */
 
 typedef struct {
     char name[WATCHDOG_NAME_LEN];
@@ -139,7 +139,7 @@ void watchdog_tick(void) {
      * having to call fsync() explicitly.  Runs on the BSP timer path;
      * blkfs_sync() is IRQ-safe and a no-op when no disk is present. */
     static u64 g_last_wb = 0;
-    if (now - g_last_wb >= 200) {
+    if (now - g_last_wb >= MS_TO_TICKS(2000)) {
         g_last_wb = now;
         extern int blkfs_sync(void);
         int n = blkfs_sync();

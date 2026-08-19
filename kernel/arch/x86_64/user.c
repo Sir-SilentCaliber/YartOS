@@ -28,6 +28,7 @@
 #define ELF_MAGIC 0x464C457FU
 #define EM_X86_64 62
 #define ET_DYN    3
+#define ET_EXEC   2   /* a foreign (Linux) static binary: fixed VA, not PIE */
 typedef struct PACKED {
     u32 magic; u8 cls,data,ver,osabi; u8 pad[8];
     u16 type, machine; u32 version;
@@ -40,6 +41,8 @@ typedef struct PACKED {
     u64 offset, vaddr, paddr, filesz, memsz, align;
 } phdr_t;
 #define PT_LOAD 1
+#define PT_DYNAMIC 2
+#define PT_INTERP 3
 #define SHT_RELA 4          /* .rela.dyn section type (NOT DT_RELA=7!) */
 #define R_X86_64_RELATIVE 8
 
@@ -150,6 +153,47 @@ static void seed_aslr(u64 extra) {
     g_aslr_state = tsc ^ ((u64)pit_ticks() << 32) ^ extra;
 }
 
+static u64 rdtsc_now(void) {
+    u64 lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+    return (hi << 32) | lo;
+}
+
+/* Find a PT_INTERP program header's path string (the dynamic-linker path,
+ * e.g. "/lib/ld-musl-x86_64.so.1").  Returns 0 on success, -1 if none. */
+static int find_interp_path(vnode_t *v, char *out, int cap) {
+    if (!v || v->type != VN_FILE || v->size < sizeof(ehdr_t)) return -1;
+    ehdr_t *eh = (ehdr_t *)v->data;
+    if (eh->magic != ELF_MAGIC || eh->phoff + (u64)eh->phnum * sizeof(phdr_t) > v->size)
+        return -1;
+    phdr_t *ph = (phdr_t *)((u8 *)v->data + eh->phoff);
+    for (int i = 0; i < eh->phnum; i++) {
+        if (ph[i].type != PT_INTERP) continue;
+        u64 off = ph[i].offset, sz = ph[i].filesz;
+        if (off + sz > v->size || sz == 0 || sz > (u64)cap - 1) return -1;
+        memcpy(out, (u8 *)v->data + off, sz);
+        out[sz] = 0;
+        return 0;
+    }
+    return -1;
+}
+
+/* Is this vnode a foreign (Linux) binary?  YartOS builds everything as PIE
+ * (ET_DYN) with NO interpreter.  A Linux binary is EITHER a static ET_EXEC,
+ * OR an ET_DYN (PIE) with a PT_INTERP (dynamically-linked) — the PT_INTERP
+ * presence is the marker that distinguishes a Linux PIE from a YartOS one. */
+static bool elf_is_linux(vnode_t *v) {
+    if (!v || v->type != VN_FILE || v->size < sizeof(ehdr_t)) return false;
+    const ehdr_t *eh = (const ehdr_t *)v->data;
+    if (eh->magic != ELF_MAGIC || eh->cls != 2 || eh->machine != EM_X86_64)
+        return false;
+    if (eh->type == ET_EXEC) return true;
+    if (eh->type != ET_DYN) return false;
+    /* ET_DYN: Linux PIE iff it names an interpreter */
+    char tmp[VFS_MAX_PATH];
+    return find_interp_path(v, tmp, sizeof tmp) == 0;
+}
+
 /* A malicious or corrupt ELF must not map pages over kernel memory: every
  * segment's virtual range is checked to stay inside the user VA region and
  * every file range is checked against the on-disk size.  Each segment is
@@ -158,15 +202,16 @@ static void seed_aslr(u64 extra) {
  * from the ELF p_flags: writable -> RW, non-executable -> NX.  Everything
  * is mapped into `pml4` (a fresh, not-yet-active table) via vmm_map_in. */
 static u64 load_user_elf_into(vnode_t *v, u64 bias, u64 *pml4,
-                              user_region_t *rs, int *nrs) {
+                              user_region_t *rs, int *nrs, u64 *span_end_out) {
+    if (span_end_out) *span_end_out = 0;
     if (!v || v->type != VN_FILE || v->size < sizeof(ehdr_t)) return 0;
     ehdr_t *eh = v->data;
     if (eh->magic != ELF_MAGIC || eh->cls != 2 || eh->machine != EM_X86_64) {
         kprintf("user: bad ELF header (magic/cls/machine)\n");
         return 0;
     }
-    if (eh->type != ET_DYN) {
-        kprintf("user: ELF must be PIE (ET_DYN) for ASLR, got type %u\n",
+    if (eh->type != ET_DYN && eh->type != ET_EXEC) {
+        kprintf("user: ELF type %u unsupported (want PIE, or Linux ET_EXEC)\n",
                 eh->type);
         return 0;
     }
@@ -185,7 +230,11 @@ static u64 load_user_elf_into(vnode_t *v, u64 bias, u64 *pml4,
      * reserve a single region (the segments share page boundaries, and the
      * region model forbids overlapping reservations).  BSS tails fault in
      * with the safe default RW+NX, which matches how compilers lay out
-     * zero-filled data. */
+     * zero-filled data.  A Linux ET_EXEC binary loads at its FIXED low VA
+     * (classically 0x400000); YartOS PIE binaries land in [USER_VBASE, ...).
+     * The low 1 GB below USER_VBASE is otherwise unused by YartOS, so it is
+     * safe to place foreign binaries there. */
+    u64 min_va = (eh->type == ET_EXEC) ? 0x1000 : USER_VBASE;
     u64 span_first = ~0ULL, span_last = 0;
     for (int i = 0; i < eh->phnum; i++) {
         if (ph[i].type != PT_LOAD) continue;
@@ -195,7 +244,7 @@ static u64 load_user_elf_into(vnode_t *v, u64 bias, u64 *pml4,
             kprintf("user: ELF segment overflow\n");
             return 0;
         }
-        if (va < USER_VBASE || va + mem > USER_STACK_TOP) {
+        if (va < min_va || va + mem > USER_STACK_TOP) {
             kprintf("user: ELF segment outside user region (va=0x%lx)\n", va);
             return 0;
         }
@@ -216,6 +265,7 @@ static u64 load_user_elf_into(vnode_t *v, u64 bias, u64 *pml4,
         kprintf("user: ELF span reserve failed (va=0x%lx)\n", span_first);
         return 0;
     }
+    if (span_end_out) *span_end_out = span_last;
 
     /* Pass 2: map each page of the span ONCE (pages can be shared between
      * segments - the boundary page holds the tail of the text segment and
@@ -275,9 +325,25 @@ static u64 load_user_elf_into(vnode_t *v, u64 bias, u64 *pml4,
  *
  * _start reads argc at (%rsp), argv at 8(%rsp), envp at
  * 16(%rsp)+argc*8.  Returns the user RSP (pointing AT argc). */
+/* Linux auxiliary vector entries (x86_64 ABI).  A Linux static binary's
+ * _start (musl/glibc) reads the auxv right after envp to find AT_PHDR,
+ * AT_ENTRY, AT_PAGESZ, AT_RANDOM, etc.  Without it, real binaries fault
+ * immediately; our own YartOS binaries don't use it (auxv==NULL). */
+#define AT_NULL     0
+#define AT_PHDR     3
+#define AT_PHENT    4
+#define AT_PHNUM    5
+#define AT_PAGESZ   6
+#define AT_BASE     7
+#define AT_ENTRY    9
+#define AT_CLKTCK   17
+#define AT_RANDOM   25
+#define AT_SYSINFO_EHDR 33
+
 static u64 build_user_stack_into(u64 *pml4, user_region_t *rs, int *nrs,
                                  u64 top, char *const kargv[], int argc,
-                                 char *const kenvp[], int envc) {
+                                 char *const kenvp[], int envc,
+                                 const u64 *auxv, int auxc) {
     u64 base = top - USER_STACK_PAGES * PAGE_SIZE;
     /* EAGER reserve: the process image (argc/argv/envp + strings) is
      * written into the stack right now, so the pages must exist. */
@@ -286,22 +352,34 @@ static u64 build_user_stack_into(u64 *pml4, user_region_t *rs, int *nrs,
         kprintf("user: stack region reserve failed\n");
         return 0;
     }
-    /* total string bytes */
-    u64 strbytes = 0;
+    /* total string bytes (plus a 16-byte AT_RANDOM blob when auxv present) */
+    u64 strbytes = (auxv ? 16 : 0);
     for (int i = 0; i < argc; i++) strbytes += strlen(kargv[i]) + 1;
     for (int i = 0; i < envc; i++) strbytes += strlen(kenvp[i]) + 1;
     /* argv strings byte count (envp strings follow them in memory) */
     u64 argv_bytes = 0;
     for (int i = 0; i < argc; i++) argv_bytes += strlen(kargv[i]) + 1;
 
+    /* SysV layout (low -> high address): argc, argv[], NULL, envp[], NULL,
+     * auxv pairs, AT_NULL, then the string area at the very top.  The auxv
+     * MUST sit ABOVE envp so a standard _start / dynamic linker that walks
+     * UP from %rsp (argc) reaches it — the old code placed it BELOW argc,
+     * which made any auxv reader walk off the top of the stack. */
     u64 strings = top - 8 - strbytes;        /* grows DOWN from top-8 */
-    u64 envp_va = strings - (u64)(envc + 1) * 8;
+    u64 auxv_va = auxv ? (strings - (u64)(auxc + 1) * 16) : strings;
+    u64 envp_va = auxv_va - (u64)(envc + 1) * 8;
     u64 argv_va = envp_va - (u64)(argc + 1) * 8;
     u64 argc_va = argv_va - 8;
 
     stac();
     /* strings */
     char *p = (char *)strings;
+    /* 16-byte AT_RANDOM source (weak PRNG from TSC; good enough for a canary) */
+    if (auxv) {
+        u64 x = rdtsc_now() ^ 0x9E3779B97F4A7C15ULL;
+        for (int i = 0; i < 16; i++) { p[i] = (char)(x & 0xFF); x = x * 6364136223846793005ULL + 1442695040888963407ULL; }
+        p += 16;
+    }
     for (int i = 0; i < argc; i++) {
         size_t n = strlen(kargv[i]) + 1;
         memcpy(p, kargv[i], n);
@@ -316,7 +394,7 @@ static u64 build_user_stack_into(u64 *pml4, user_region_t *rs, int *nrs,
      * top makes envp[0] point at argv[0]'s string - exec'd programs saw
      * env = "/bin/hello") */
     u64 *ep = (u64 *)envp_va;
-    p = (char *)strings + argv_bytes;
+    p = (char *)strings + (auxv ? 16 : 0) + argv_bytes;
     for (int i = 0; i < envc; i++) {
         ep[i] = (u64)p;
         p += strlen(kenvp[i]) + 1;
@@ -324,7 +402,7 @@ static u64 build_user_stack_into(u64 *pml4, user_region_t *rs, int *nrs,
     ep[envc] = 0;
     /* argv pointers */
     u64 *ap = (u64 *)argv_va;
-    p = (char *)strings;
+    p = (char *)strings + (auxv ? 16 : 0);
     for (int i = 0; i < argc; i++) {
         ap[i] = (u64)p;
         p += strlen(kargv[i]) + 1;
@@ -332,6 +410,17 @@ static u64 build_user_stack_into(u64 *pml4, user_region_t *rs, int *nrs,
     ap[argc] = 0;
     /* argc */
     *(u64 *)argc_va = (u64)argc;
+    /* auxv (rewrite AT_RANDOM to point at the blob on the stack) */
+    if (auxv) {
+        u64 *av = (u64 *)auxv_va;
+        for (int i = 0; i < auxc; i++) {
+            av[2 * i]     = auxv[2 * i];
+            av[2 * i + 1] = (auxv[2 * i] == AT_RANDOM) ? (u64)strings
+                                                       : auxv[2 * i + 1];
+        }
+        av[2 * auxc] = AT_NULL;
+        av[2 * auxc + 1] = 0;
+    }
     clac();
     return argc_va;                          /* _start sees argc at %rsp */
 }
@@ -354,7 +443,7 @@ bool user_prepare_elf(vnode_t *v, u64 *entry_out, u64 *rsp_out,
     seed_aslr((u64)(u64)v);
     u64 bias = pick_code_base();
     u64 top  = pick_stack_top();
-    u64 entry = load_user_elf_into(v, bias, pml4, rs, &nrs);
+    u64 entry = load_user_elf_into(v, bias, pml4, rs, &nrs, NULL);
     if (!entry) goto fail;
     apply_relocations(v, (const ehdr_t *)v->data, bias);
     user_map_trampoline(pml4, rs, &nrs);       /* sigreturn helper page */
@@ -364,7 +453,7 @@ bool user_prepare_elf(vnode_t *v, u64 *entry_out, u64 *rsp_out,
     char *kargv[2] = { argv0, NULL };
     char *kenvp[1] = { NULL };
     u64 user_rsp = build_user_stack_into(pml4, rs, &nrs, top,
-                                         kargv, 1, kenvp, 0);
+                                         kargv, 1, kenvp, 0, NULL, 0);
     if (!user_rsp) goto fail;
 
     *entry_out = entry;
@@ -409,23 +498,85 @@ bool user_exec(vnode_t *v, char *const kargv[], int argc,
     vmm_switch_pml4(new_pml4);
 
     seed_aslr((u64)(u64)v ^ ((u64)t->pid << 32));
-    u64 bias = pick_code_base();
+    bool is_linux = elf_is_linux(v);
+    /* bias: 0 for a Linux STATIC ET_EXEC (fixed VA); otherwise a random PIE
+     * base (YartOS binaries AND Linux dynamically-linked PIEs load anywhere) */
+    u64 bias = ((const ehdr_t *)v->data)->type == ET_EXEC ? 0 : pick_code_base();
     u64 top  = pick_stack_top();
-    u64 entry = load_user_elf_into(v, bias, new_pml4, rs, &nrs);
+    u64 main_end = 0;
+    u64 entry = load_user_elf_into(v, bias, new_pml4, rs, &nrs, &main_end);
     if (!entry) goto fail;
     apply_relocations(v, (const ehdr_t *)v->data, bias);
+
+    /* ---- DYNAMIC LINKING: PT_INTERP ----
+     * A dynamically-linked ELF names an interpreter (the dynamic linker,
+     * e.g. /lib/ld-musl-x86_64.so.1).  Load the interpreter's PT_LOAD
+     * segments (it is a PIE .so) at a base placed AFTER the main image, and
+     * hand control to the interpreter's entry.  The interpreter finds the
+     * main program through the auxv (AT_PHDR/AT_ENTRY) and itself through
+     * AT_BASE, relocates, loads DT_NEEDED libs, and jumps to the program. */
+    u64 interp_base = 0, interp_entry = 0;
+    char ipath[VFS_MAX_PATH];
+    if (is_linux && find_interp_path(v, ipath, sizeof ipath) == 0) {
+        vnode_t *interp = vfs_lookup(ipath);
+        if (interp) {
+            interp_base = PAGE_ALIGN_UP(main_end + PAGE_SIZE);
+            if (interp_base < USER_VBASE) interp_base = USER_VBASE;
+            interp_entry = load_user_elf_into(interp, interp_base, new_pml4,
+                                              rs, &nrs, NULL);
+            if (!interp_entry) {
+                kprintf("user: failed to load interpreter %s\n", ipath);
+                interp_base = 0;
+            } else {
+                /* the interpreter is itself a relocatable PIE .so: apply its
+                 * R_X86_64_RELATIVE relocations so its own global pointers
+                 * are correct before it runs */
+                apply_relocations(interp, (const ehdr_t *)interp->data,
+                                  interp_base);
+                kprintf("user: dynamic: interpreter %s @%p entry=%p\n",
+                        ipath, (void *)interp_base, (void *)interp_entry);
+            }
+        } else {
+            kprintf("user: interpreter %s not found\n", ipath);
+        }
+    }
     user_map_trampoline(new_pml4, rs, &nrs);   /* sigreturn helper page */
 
+    /* Linux binaries get a real auxiliary vector (musl/glibc _start reads it
+     * for AT_PHDR/AT_ENTRY/AT_RANDOM; a dynamic program's interpreter reads
+     * AT_BASE for itself); YartOS binaries don't. */
+    u64 auxv[2 * 12]; int auxc = 0;
+    if (is_linux) {
+        const ehdr_t *eh = (const ehdr_t *)v->data;
+        u64 phdr = bias + eh->phoff;
+        auxv[auxc++] = AT_SYSINFO_EHDR; auxv[auxc++] = 0;
+        auxv[auxc++] = AT_PHDR;   auxv[auxc++] = phdr;
+        auxv[auxc++] = AT_PHENT;  auxv[auxc++] = eh->phentsize;
+        auxv[auxc++] = AT_PHNUM;  auxv[auxc++] = eh->phnum;
+        auxv[auxc++] = AT_PAGESZ; auxv[auxc++] = PAGE_SIZE;
+        auxv[auxc++] = AT_BASE;   auxv[auxc++] = interp_base;
+        auxv[auxc++] = AT_ENTRY;  auxv[auxc++] = entry;
+        auxv[auxc++] = AT_CLKTCK; auxv[auxc++] = 100;
+        auxv[auxc++] = AT_RANDOM; auxv[auxc++] = 0;   /* rewritten by the builder */
+    }
+    /* A dynamically-linked program starts in the INTERPRETER; it later jumps
+     * to AT_ENTRY (the main program's entry, still recorded above). */
+    if (interp_entry) entry = interp_entry;
     u64 user_rsp = build_user_stack_into(new_pml4, rs, &nrs, top,
-                                         kargv, argc, kenvp, envc);
+                                         kargv, argc, kenvp, envc,
+                                         auxv, auxc);
     if (!user_rsp) goto fail;
 
-    /* drop the old address space (t->pml4 already points at the new one) */
-    if (old_pml4 && old_pml4 != vmm_kernel_pml4())
+    /* drop the old address space (t->pml4 already points at the new one).
+     * If it is a SHARED thread PML4, unref (the last user frees it); else
+     * free it outright. */
+    if (old_pml4 && old_pml4 != vmm_kernel_pml4() &&
+        sched_pml4_unref(old_pml4))
         vmm_free_pml4(old_pml4);
 
     memcpy(t->regions, rs, sizeof rs);
     t->region_count = nrs;
+    t->linux_abi = is_linux;                 /* foreign binary: translate syscalls */
     /* fresh dynamic-memory arena + memory accounting for the new image */
     t->mmap_next = USER_MMAP_BASE;
     t->brk_base  = USER_MMAP_BASE;

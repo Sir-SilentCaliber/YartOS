@@ -9,7 +9,7 @@
  *   - pid 0 "desktop" : the kernel task that runs the GUI loop on the BSP.
  *     It is NOT preempted (its data structures are not re-entrant); it hands
  *     the CPU to user tasks only while sleeping in sched_idle_sleep().
- *   - user tasks      : time-sliced on the APIC timer (100 Hz), plus
+ *   - user tasks      : time-sliced on the APIC timer (TICK_HZ), plus
  *     cooperative yield().  They can run on ANY CPU.
  *
  * SMP model (what makes this a real SMP scheduler):
@@ -60,15 +60,210 @@ static u64 g_leaked_tasks;       /* task structs not freed (UAF safety)     */
  * flipping state to READY (release store); the sleeper's own switch path
  * reads rq_cpu with acquire, so it can never also queue itself. */
 static void rq_push(cpu_local_t *c, task_t *t);   /* defined below       */
+static void rq_remove(cpu_local_t *c, task_t *t); /* defined below       */
+static u64  alloc_kstack(void);                    /* defined below       */
+static void task_append(task_t *t);                /* defined below       */
+static void wake_waiting_parent(task_t *t);        /* defined below       */
 #define SLEEP_MAX 64
 static spinlock_t g_sleep_lock;
 static task_t    *g_sleepers[SLEEP_MAX];
 static u64        g_sleeper_wake[SLEEP_MAX];
 
+/* ---------------- Linux ABI: futex wait queue + shared-PML4 refcount ------
+ * (see sched.h).  A minimal but correct foundation for Linux threads. */
+
+#define FUTEX_MAX 64
+static spinlock_t g_futex_lock;
+static u64        g_futex_addr[FUTEX_MAX];
+static task_t    *g_futex_waiter[FUTEX_MAX];
+
+void sched_futex_wait(u64 addr) {
+    task_t *cur = sched_current();
+    if (!cur) return;
+    u64 fl = irq_save();
+    spin_lock(&g_futex_lock);
+    if (cur->state == TASK_ZOMBIE) {           /* killed mid-syscall */
+        spin_unlock(&g_futex_lock); irq_restore(fl); return;
+    }
+    for (int i = 0; i < FUTEX_MAX; i++) {
+        if (!g_futex_waiter[i]) {
+            g_futex_waiter[i] = cur;
+            g_futex_addr[i] = addr;
+            cur->state = TASK_BLOCKED;          /* sched_after_isr switches */
+            break;
+        }
+    }
+    spin_unlock(&g_futex_lock);
+    irq_restore(fl);
+}
+
+int sched_futex_wake(u64 addr, int max) {
+    int woken = 0;
+    u64 fl = irq_save();
+    spin_lock(&g_futex_lock);
+    for (int i = 0; i < FUTEX_MAX && woken < max; i++) {
+        task_t *t = g_futex_waiter[i];
+        if (t && g_futex_addr[i] == addr) {
+            g_futex_waiter[i] = NULL;
+            if (t->state == TASK_BLOCKED) {
+                cpu_local_t *target = smp_least_loaded();
+                if (!target) target = get_cpu_local();
+                rq_push(target, t);
+                __atomic_store_n(&t->state, TASK_READY, __ATOMIC_RELEASE);
+                lapic_send_ipi(target->ap_lapic_id, AP_WAKE_VEC);
+                woken++;
+            }
+        }
+    }
+    spin_unlock(&g_futex_lock);
+    irq_restore(fl);
+    return woken;
+}
+
+/* shared PML4 refcount: a thread clone shares the parent's page tables, so
+ * the PML4 must only be freed when the LAST task using it exits. */
+#define SHARED_PML4_MAX 64
+static spinlock_t g_pml4_lock;
+static u64       *g_shared_pml4[SHARED_PML4_MAX];
+static int        g_shared_refs[SHARED_PML4_MAX];
+
+void sched_pml4_ref(u64 *pml4) {
+    if (!pml4) return;
+    u64 fl = irq_save(); spin_lock(&g_pml4_lock);
+    for (int i = 0; i < SHARED_PML4_MAX; i++)
+        if (g_shared_pml4[i] == pml4) { g_shared_refs[i]++; spin_unlock(&g_pml4_lock); irq_restore(fl); return; }
+    for (int i = 0; i < SHARED_PML4_MAX; i++)
+        if (!g_shared_pml4[i]) { g_shared_pml4[i] = pml4; g_shared_refs[i] = 2; break; }
+    spin_unlock(&g_pml4_lock); irq_restore(fl);
+}
+
+int sched_pml4_unref(u64 *pml4) {
+    if (!pml4) return 1;
+    u64 fl = irq_save(); spin_lock(&g_pml4_lock);
+    for (int i = 0; i < SHARED_PML4_MAX; i++) {
+        if (g_shared_pml4[i] == pml4) {
+            int left = --g_shared_refs[i];
+            if (left <= 0) { g_shared_pml4[i] = NULL; spin_unlock(&g_pml4_lock); irq_restore(fl); return 1; }
+            spin_unlock(&g_pml4_lock); irq_restore(fl); return 0;
+        }
+    }
+    spin_unlock(&g_pml4_lock); irq_restore(fl);
+    return 1;    /* not shared: caller frees */
+}
+
+bool sched_pml4_is_shared(u64 *pml4) {
+    if (!pml4) return false;
+    u64 fl = irq_save(); spin_lock(&g_pml4_lock);
+    for (int i = 0; i < SHARED_PML4_MAX; i++)
+        if (g_shared_pml4[i] == pml4) { spin_unlock(&g_pml4_lock); irq_restore(fl); return true; }
+    spin_unlock(&g_pml4_lock); irq_restore(fl);
+    return false;
+}
+
+/* exit_group: a Linux process (a thread GROUP sharing one address space)
+ * terminates as a whole.  Mark every sibling that shares `pml4` as a
+ * zombie, wake their waiters, and (when not running) free the shared pages.
+ * The CALLING thread still goes through sched_exit() normally afterwards. */
+void sched_exit_group(u64 *pml4, int status) {
+    task_t *self = sched_current();
+    for (task_t *t = g_tasks; t; t = t->next) {
+        if (t == self) continue;
+        if (!t->is_user || t->pml4 != pml4) continue;
+        if (t->state == TASK_ZOMBIE) continue;
+        if (t->rq_cpu) rq_remove(t->rq_cpu, t);
+        for (u32 i = 0; i < 8; i++) {
+            cpu_local_t *o = (i == 0) ? bsp_cpu_local() : smp_get_ap_area(i);
+            if (o && o->ap_next == t) o->ap_next = NULL;
+        }
+        t->exit_status = status;
+        t->state = TASK_ZOMBIE;
+        u64 fl = irq_save();
+        spin_lock(&g_tasks_lock);
+        wake_waiting_parent(t);
+        spin_unlock(&g_tasks_lock);
+        irq_restore(fl);
+        /* free shared pages only when the last user exits; a sibling still
+         * running keeps them (the reap path refcounts the PML4). */
+        kprintf("sched: exit_group pid %u killed sibling thread %u '%s'\n",
+                self->pid, t->pid, t->name);
+    }
+}
+
+/* sched_clone_thread: a Linux CLONE_VM|CLONE_THREAD clone.  Shares the
+ * parent's PML4 (refcounted), fd table (refcounted), signal state and cwd;
+ * gets a fresh kernel stack and resumes at the SAME instruction as the
+ * parent (the clone() syscall), with rsp=child_stack, rax=0 in the child,
+ * and the TLS base recorded on the task (arch_prctl later applies it). */
+task_t *sched_clone_thread(task_t *parent, cpu_regs_t *frame,
+                           u64 child_stack, u64 tls) {
+    task_t *child = kzalloc(sizeof *child);
+    if (!child) return NULL;
+    child->pid = g_next_pid++;
+    child->ppid = parent->pid;
+    strncpy(child->name, parent->name, TASK_NAME_LEN - 1);
+    child->state = TASK_READY;
+    child->is_user = true;
+    child->uid = parent->uid; child->euid = parent->euid;
+    child->gid = parent->gid;
+    child->elev_allowed = parent->elev_allowed;
+    child->umask = parent->umask;
+    child->supp_gid_count = parent->supp_gid_count;
+    memcpy(child->supp_gids, parent->supp_gids, sizeof parent->supp_gids);
+    child->mmap_next = parent->mmap_next;      /* threads share the arena   */
+    child->brk = parent->brk; child->brk_base = parent->brk_base;
+    child->mem_limit_pages = parent->mem_limit_pages;
+    child->mem_pages = parent->mem_pages;      /* shared: same frames       */
+    child->linux_abi = parent->linux_abi;
+    child->linux_fs_base = tls;                /* the thread's TLS base     */
+    strncpy(child->account, parent->account, sizeof child->account - 1);
+
+    child->pml4 = parent->pml4;                /* SHARED address space      */
+    sched_pml4_ref(child->pml4);
+
+    memcpy(child->regions, parent->regions, sizeof parent->regions);
+    child->region_count = parent->region_count;
+
+    memcpy(child->fds, parent->fds, sizeof parent->fds);
+    for (int i = 3; i < MAX_FD; i++) {
+        if (!child->fds[i].in_use) continue;
+        if (child->fds[i].is_pipe && child->fds[i].pipe) {
+            yart_pipe_t *p = child->fds[i].pipe;
+            p->refs++;
+            if (child->fds[i].pipe_is_read_end) p->read_ends++;
+            else                                p->write_ends++;
+        } else {
+            vnode_ref(child->fds[i].vn);
+        }
+    }
+    child->cwd = parent->cwd;
+    if (child->cwd) vnode_ref(child->cwd);
+    memcpy(child->sig_handlers, parent->sig_handlers, sizeof child->sig_handlers);
+    child->sig_pending = 0;
+    child->sig_blocked = parent->sig_blocked;
+
+    child->kstack_top = alloc_kstack();
+    cpu_regs_t *f = (cpu_regs_t *)(child->kstack_top - sizeof(cpu_regs_t));
+    memcpy(f, frame, sizeof *f);               /* resume at the same RIP   */
+    f->rax = 0;                                /* child sees 0 from clone() */
+    f->rsp = child_stack;                      /* thread stack              */
+    child->saved_rsp = (u64)f;
+    fpu_save(child->fpu_area);
+
+    child->last_sched = pit_ticks();
+    task_append(child);
+    cpu_local_t *me = get_cpu_local();
+    cpu_local_t *target = smp_least_loaded();
+    if (target) { rq_push(target, child); lapic_send_ipi(target->ap_lapic_id, AP_WAKE_VEC); }
+    else rq_push(me, child);
+    kprintf("sched: clone() pid %u '%s' -> thread pid %u (shared PML4, tls=%p)\n",
+            parent->pid, parent->name, child->pid, (void *)tls);
+    return child;
+}
+
 void sched_sleep_ms(u32 ms) {
     task_t *cur = sched_current();
     if (!cur) return;
-    u64 wake = pit_ticks() + ((u64)ms + 9) / 10;   /* 100 Hz system tick */
+    u64 wake = pit_ticks() + MS_TO_TICKS(ms);      /* 1 ms resolution @ 1 kHz */
     u64 fl = irq_save();
     spin_lock(&g_sleep_lock);
     /* A task killed (ZOMBIE) on another CPU while this syscall was in
@@ -552,6 +747,15 @@ task_t *sched_fork(task_t *parent, cpu_regs_t *frame) {
     child->supp_gid_count = parent->supp_gid_count;
     memcpy(child->supp_gids, parent->supp_gids, sizeof parent->supp_gids);
     child->brk_base = parent->brk_base;
+    /* mem_limit_pages was NOT copied: a forked child kept 0 from kzalloc, so
+     * sched_mem_limit() returned 0 and ANY mmap/fb-reserve in the child hit
+     * "over memory cap" (limit=0).  This was latent while the compositor was
+     * the boot task (created via sched_create_user, which sets the cap), but
+     * it broke the moment the wm became a forked child (the init/wm split). */
+    child->mem_limit_pages = parent->mem_limit_pages;
+    child->mem_pages = parent->mem_pages;   /* CoW: shares the same frames */
+    child->linux_abi = parent->linux_abi;   /* a forked Linux task stays Linux */
+    child->linux_fs_base = parent->linux_fs_base;
     strncpy(child->account, parent->account, sizeof child->account - 1);
 
     child->pml4 = vmm_clone_pml4();          /* private user tables */
@@ -667,6 +871,10 @@ static u64 switch_to(task_t *next, u64 current_rsp) {
         vmm_switch_pml4(next->pml4 ? next->pml4 : vmm_kernel_pml4());
     else
         vmm_switch_pml4(vmm_kernel_pml4());
+    /* TLS: apply the task's %fs base (arch_prctl ARCH_SET_FS).  The kernel
+     * only uses %gs (swapgs -> per-CPU area), so %fs is free for user TLS.
+     * Linux binaries set it via arch_prctl; YartOS binaries leave it 0. */
+    wrmsr64(MSR_FS_BASE, next->is_user ? next->linux_fs_base : 0);
     /* ring3->ring0 must land on the task's kstack via THIS CPU's TSS
      * (BSP: selector 0x28; AP: its own 0x38 TSS - per-CPU RSP0). */
     tss_set_rsp0(next->kstack_top);
@@ -854,13 +1062,13 @@ static task_t *sched_steal_pop(cpu_local_t *c) {
                 if (cc && cc->ap_current == t) { running = true; break; }
             }
             if (running) {
-                kprintf("smp: steal SKIPPED task %u (still running on CPU %u)\\n",
+                kprintf("smp: steal SKIPPED task %u (still running on CPU %u)\n",
                         t->pid, o->cpu_id);
                 rq_push(o, t);           /* put it back where it was */
                 continue;
             }
             c->ap_steals++;
-            kprintf("smp: CPU %u stole task %u '%s' from CPU %u (load balance)\\n",
+            kprintf("smp: CPU %u stole task %u '%s' from CPU %u (load balance)\n",
                     c->cpu_id, t->pid, t->name, o->cpu_id);
             return t;
         }
@@ -897,7 +1105,7 @@ u64 sched_tick(u64 current_rsp) {
      * concurrent scans, and only once a second to keep it cheap. */
     if (c->cpu_id == 0) {
         sched_wake_sleepers(pit_ticks());        /* wake due sleepers */
-        if ((++g_wd_tick_cnt % 100) == 0)
+        if ((++g_wd_tick_cnt % MS_TO_TICKS(1000)) == 0)   /* ~1 Hz */
             watchdog_tick();
     }
     if (!cur) {
@@ -953,6 +1161,20 @@ u64 sched_fault_recover(u64 current_rsp) {
         kprintf("sched: fault-recover: task %u '%s' dropped (corrupt frame)\n",
                 cur->pid, cur->name);
         /* the parent (wm) polls waitpid and the orphan reaper will reap it */
+    } else {
+        /* The corrupt frame belongs to a KERNEL context: either the BSP's
+         * desktop task (pid 0) or an AP that was mid-switch-to-idle (cur
+         * already NULL).  There is no user task to drop, and the code below
+         * would return current_rsp / the same corrupt idle frame, which the
+         * ISR stub iretq's straight back into -> the fault repeats forever
+         * (the observed "SMEP fault" storm, hundreds of lines).  A corrupt
+         * kernel frame is a genuine kernel bug, not a recoverable user
+         * fault: panic with a clear message instead of looping. */
+        kprintf("sched: corrupt KERNEL frame in fault-recover "
+                "(cur=%s, cpu=%d) - unrecoverable\n",
+                cur ? (cur->pid == 0 ? "desktop" : cur->name) : "AP-idle",
+                c ? (int)c->cpu_id : -1);
+        kpanic("corrupt kernel frame (SMEP/iretq)");
     }
     if (c->cpu_id == 0) {
         if (g_idle_task && g_idle_task != cur)
@@ -1050,7 +1272,12 @@ void sched_exit(int status) {
     spin_lock(&g_tasks_lock);
     wake_waiting_parent(cur);          /* blocked parent: wake + requeue */
     spin_unlock(&g_tasks_lock);
-    vmm_user_teardown_all();           /* free this task's user memory */
+    /* THREAD exit: if this task shares its address space with a live sibling
+     * (clone), tearing down user memory here would unmap the SHARED pages
+     * out from under the sibling (the "Invalid Opcode after thread exit"
+     * corruption).  The last task to exit frees them via vmm_free_pml4. */
+    if (!sched_pml4_is_shared(cur->pml4))
+        vmm_user_teardown_all();       /* free this task's user memory */
     /* free any window surfaces the task owned IMMEDIATELY (not on reap):
      * the compositor sees the window vanish the moment the app exits */
     wm_surface_owner_died(cur->pid);
@@ -1096,7 +1323,8 @@ static bool reap(task_t *t) {
             irq_restore(fl);
             return false;              /* in-flight switch: try again later */
         }
-        if (t->pml4 && t->pml4 != vmm_kernel_pml4())
+        if (t->pml4 && t->pml4 != vmm_kernel_pml4() &&
+            sched_pml4_unref(t->pml4))
             vmm_free_pml4(t->pml4);
         free_kstack(t->kstack_top);
         spin_unlock(&g_switch_lock);
@@ -1213,7 +1441,8 @@ int sched_kill(u32 pid) {
             cpu_local_t *o = (i == 0) ? bsp_cpu_local() : smp_get_ap_area(i);
             if (o && o->ap_current == t) { running = true; break; }
         }
-        if (!running && t->pml4 && t->pml4 != vmm_kernel_pml4()) {
+        if (!running && t->pml4 && t->pml4 != vmm_kernel_pml4() &&
+            sched_pml4_unref(t->pml4)) {
             vmm_free_pml4(t->pml4);
             t->pml4 = NULL;
         }

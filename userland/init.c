@@ -14,8 +14,7 @@
  *   7) fork + waitpid demo (the classic)
  */
 #include "sys.h"
-
-void wm_run(void);
+#include "gfx.h"
 
 /* A REAL signal handler: prints, then returns - the kernel's trampoline
  * (SYS_SIGRETURN) restores the interrupted state.  The address is taken
@@ -191,6 +190,83 @@ static void smp_demo(void) {
         while (*b) msg[i++] = *b++;
         msg[i] = 0;
         klog(msg);
+    }
+}
+
+/* ---- text console (the getty / login-shell fallback) ----
+ * Runs when the graphical session ends.  Draws DIRECTLY to the framebuffer
+ * (no wm, no window surface) using the same gfx.c text renderer the wm uses.
+ * Supports: startwm / wm (restart the session), reboot, help, clear. */
+
+/* Draw the console frame: header + help + prompt + the in-progress line. */
+static void console_redraw(surface_t *s, const char *line) {
+    int y = 16;
+    sf_fill(s, RGB(0x0C,0x0E,0x12));       /* near-black */
+    sf_text(s, 16, y, "YartOS", RGB(0x3B,0x82,0xF6)); y += 30;
+    sf_text(s, 16, y, "The graphical session has ended.", RGB(0xFA,0xFA,0xFA)); y += 22;
+    sf_text(s, 16, y, "Type a command:", RGB(0xA1,0xA1,0xAA)); y += 30;
+    sf_text(s, 16, y, "  startwm | wm   - start a new graphical session", RGB(0xD4,0xD4,0xD8)); y += 22;
+    sf_text(s, 16, y, "  reboot         - restart the machine", RGB(0xD4,0xD4,0xD8)); y += 22;
+    sf_text(s, 16, y, "  help           - this list", RGB(0xD4,0xD4,0xD8)); y += 34;
+    sf_text(s, 16, y, "yart# ", RGB(0x3B,0x82,0xF6));
+    sf_text(s, 16 + sf_text_width("yart# "), y, line, RGB(0xFA,0xFA,0xFA));
+}
+
+static void text_console(void) {
+    fb_info_t fi;
+    void *fb = 0;
+    /* The dying compositor wakes us (waitpid) BEFORE the kernel finishes
+     * reaping it and clearing its framebuffer claim, so the first fb_info()
+     * can fail with g_wm_task still pointing at the dead wm.  Poll until the
+     * kernel reclaims it (like a login manager waiting for the old session
+     * to fully tear down), then claim. */
+    for (int i = 0; i < 200 && !fb; i++) {
+        fb = fb_info(&fi);
+        if (!fb) sleep(10);
+    }
+    if (!fb) { klog("init: text console: no framebuffer (timeout)\n"); return; }
+    klog("init: text console running (type startwm to restart)\n");
+
+    surface_t s;
+    s.px = (u32 *)fb;
+    s.w = (int)fi.w;
+    s.h = (int)fi.h;
+    s.pitch = (int)fi.pitch;
+
+    char line[128];
+    int len = 0;
+    line[0] = 0;
+
+    console_redraw(&s, line);
+    fb_flip(fb);
+
+    for (;;) {
+        int ev;
+        while ((ev = poll_key()) != 0) {
+            int ascii = ev & 0xFF;
+            int make = !(ev & (1 << 16));
+            if (!make) continue;
+            if (ascii == 13 || ascii == 10) {
+                line[len] = 0;
+                if (strcmp(line, "startwm") == 0 || strcmp(line, "wm") == 0) {
+                    klog("init: text console: starting session\n");
+                    return;                       /* supervisor re-spawns wm */
+                } else if (strcmp(line, "reboot") == 0) {
+                    klog("init: text console: reboot\n");
+                    reboot();                     /* never returns */
+                } else if (line[0]) {
+                    klog("init: text console: unknown command\n");
+                }
+                line[0] = 0; len = 0;
+            } else if (ascii == 8 || ascii == 127) {
+                if (len > 0) { len--; line[len] = 0; }
+            } else if (ascii >= 32 && ascii < 127) {
+                if (len < (int)sizeof(line) - 1) { line[len++] = (char)ascii; line[len] = 0; }
+            }
+            console_redraw(&s, line);
+            fb_flip(fb);
+        }
+        sleep(16);
     }
 }
 
@@ -399,7 +475,7 @@ int main_entry(int argc, char **argv, char **envp) {
         } else {
             klog("tcp: connected (conn ");
             {
-                char b[8]; my_itoa((int)c, b); klog(b);
+                char b[16]; my_itoa((int)c, b); klog(b);
             }
             klog(")\n");
             const char *msg = "ping-from-yart-tcp";
@@ -478,13 +554,13 @@ int main_entry(int argc, char **argv, char **envp) {
                 klog("www: DNS resolve FAILED\n");
             } else {
                 klog("www: example.com = ");
-                { char b[8]; my_itoa((int)((ip>>24)&255), b); klog(b); }
+                { char b[16]; my_itoa((int)((ip>>24)&255), b); klog(b); }
                 klog(".");
-                { char b[8]; my_itoa((int)((ip>>16)&255), b); klog(b); }
+                { char b[16]; my_itoa((int)((ip>>16)&255), b); klog(b); }
                 klog(".");
-                { char b[8]; my_itoa((int)((ip>>8)&255), b); klog(b); }
+                { char b[16]; my_itoa((int)((ip>>8)&255), b); klog(b); }
                 klog(".");
-                { char b[8]; my_itoa((int)(ip&255), b); klog(b); }
+                { char b[16]; my_itoa((int)(ip&255), b); klog(b); }
                 klog("\n");
                 long c = tcp_connect(0x0A000202, 9002);   /* host relay -> internet */
                 if (c < 0) {
@@ -513,7 +589,7 @@ int main_entry(int argc, char **argv, char **envp) {
                             if (got - lastlog >= 100) {
                                 lastlog = (int)got;
                                 klog("www: received so far: ");
-                                { char b[8]; my_itoa((int)got, b); klog(b); }
+                                { char b[16]; my_itoa((int)got, b); klog(b); }
                                 klog(" bytes\n");
                             }
                             /* scan the buffer for "200 OK" */
@@ -526,7 +602,7 @@ int main_entry(int argc, char **argv, char **envp) {
                     }
                     rbuf[got] = 0;
                     klog("www: got ");
-                    { char b[8]; my_itoa((int)got, b); klog(b); }
+                    { char b[16]; my_itoa((int)got, b); klog(b); }
                     klog(" bytes from the internet\n");
                     if (found200)
                         klog("www: REAL WEB FETCH WORK - HTTP 200 OK from the internet\n");
@@ -581,7 +657,7 @@ int main_entry(int argc, char **argv, char **envp) {
             }
             buf[got] = 0;
             klog("lo: child got ");
-            { char b[8]; my_itoa((int)got, b); klog(b); }
+            { char b[16]; my_itoa((int)got, b); klog(b); }
             klog(" bytes\n");
             long n = 0;
             const char *ack = "LO-BACK-OK";
@@ -591,7 +667,7 @@ int main_entry(int argc, char **argv, char **envp) {
                 n += r;
             }
             klog("lo: child sent ");
-            { char b[8]; my_itoa((int)n, b); klog(b); }
+            { char b[16]; my_itoa((int)n, b); klog(b); }
             klog(" bytes\n");
             tcp_close(c);
             tcp_close(lid);            /* free the listener slot */
@@ -619,7 +695,7 @@ int main_entry(int argc, char **argv, char **envp) {
                     klog("lo: loopback TCP round trip WORK (127.0.0.1:9999)\n");
                 else {
                     klog("lo: loopback TCP MISMATCH (got ");
-                    { char b[8]; my_itoa((int)got, b); klog(b); }
+                    { char b[16]; my_itoa((int)got, b); klog(b); }
                     klog(" bytes: [");
                     for (long i = 0; i < got && i < 12; i++) {
                         char h[3]; h[0]="0123456789ABCDEF"[(rbuf[i]>>4)&15];
@@ -651,7 +727,7 @@ int main_entry(int argc, char **argv, char **envp) {
             klog("fw: UDP loop before rule - WORK\n");
         else {
             klog("fw: UDP loop before rule FAILED (got ");
-            { char b[8]; my_itoa((int)got, b); klog(b); }
+            { char b[16]; my_itoa((int)got, b); klog(b); }
             klog(")\n");
         }
         fw_add(17, 0x7F000001, 7777, 1);   /* DROP udp -> 127.0.0.1:7777 */
@@ -666,7 +742,7 @@ int main_entry(int argc, char **argv, char **envp) {
             klog("fw: UDP blocked by firewall - WORK\n");
         else {
             klog("fw: firewall did NOT block (got ");
-            { char b[8]; my_itoa((int)got, b); klog(b); }
+            { char b[16]; my_itoa((int)got, b); klog(b); }
             klog(")\n");
         }
         fw_clear();
@@ -680,7 +756,7 @@ int main_entry(int argc, char **argv, char **envp) {
             klog("fw: UDP loop after clear - WORK\n");
         else {
             klog("fw: UDP after clear FAILED (got ");
-            { char b[8]; my_itoa((int)got, b); klog(b); }
+            { char b[16]; my_itoa((int)got, b); klog(b); }
             klog(")\n");
         }
     }
@@ -789,7 +865,7 @@ int main_entry(int argc, char **argv, char **envp) {
                     tries++;
                 }
                 klog("tls-srv: encrypted request received (");
-                { char b[8]; my_itoa((int)got, b); klog(b); }
+                { char b[16]; my_itoa((int)got, b); klog(b); }
                 klog(" bytes), sending encrypted response...\n");
                 const char *resp =
                     "HTTP/1.1 200 OK\r\n"
@@ -806,7 +882,7 @@ int main_entry(int argc, char **argv, char **envp) {
                     n += r;
                 }
                 klog("tls-srv: encrypted response sent (");
-                { char b[8]; my_itoa((int)n, b); klog(b); }
+                { char b[16]; my_itoa((int)n, b); klog(b); }
                 klog(" bytes)\n");
                 tls_close(h);
             }
@@ -1167,7 +1243,7 @@ int main_entry(int argc, char **argv, char **envp) {
                     tries++;
                 }
                 klog("tcp: HTTP request received (");
-                { char b[8]; my_itoa((int)got, b); klog(b); }
+                { char b[16]; my_itoa((int)got, b); klog(b); }
                 klog(" bytes), sending response...\n");
                 long n = 0;
                 long rl = 205;
@@ -1177,7 +1253,7 @@ int main_entry(int argc, char **argv, char **envp) {
                     n += r;
                 }
                 klog("tcp: HTTP response sent (");
-                { char b[8]; my_itoa((int)n, b); klog(b); }
+                { char b[16]; my_itoa((int)n, b); klog(b); }
                 klog(" bytes)\n");
                 tcp_close(c);
             }
@@ -1186,20 +1262,58 @@ int main_entry(int argc, char **argv, char **envp) {
 
     }
 
-    klog("init: boot tests complete; entering ring-3 compositor loop\n");
+    klog("init: boot tests complete; entering supervisor loop\n");
 
     /* =================================================================
-     * RING-3 COMPOSITOR (row 23)
+     * SUPERVISOR + SESSION MANAGER (the Linux init/getty model)
      *
-     * The kernel no longer owns the framebuffer.  We are a normal ring-3
-     * task with the compositor role (SYS_FB_INFO claimed us).  From here
-     * on we own the screen: we draw everything (wallpaper, status bar,
-     * dock, cursor) and flip to the real scanout via SYS_FB_FLIP.  The
-     * kernel only services drivers and scheduling.
+     * init no longer IS the compositor.  It supervises a session:
+     *   1. fork/exec /bin/wm (the ring-3 compositor) and wait for it.
+     *   2. When the wm exits (Ctrl+Alt+Backspace, a crash, or logout),
+     *      drop to a fullscreen TEXT console (the getty).
+     *   3. From the console, `startwm` (or `wm`) restarts the session;
+     *      `reboot` resets the machine.
+     * This is how a Linux distro restarts/ switches its WM: the login
+     * manager / init just re-spawns the session binary.
      * ================================================================= */
-    wm_run();
+    for (;;) {
+        long wpid = fork();
+        if (wpid == 0) {
+            /* child: become the compositor */
+            char *argv[] = {"/bin/wm", 0};
+            char *envp[] = {"HOME=/home/yart", "TERM=nyra", 0};
+            long r = exec("/bin/wm", argv, envp);
+            if (r != 0) {
+                klog("init: exec /bin/wm failed\n");
+                exit(1);
+            }
+        } else if (wpid < 0) {
+            klog("init: fork for wm failed\n");
+            break;
+        }
 
-    klog("wm: compositor exited (shouldn't happen)\n");
-    exit(0);
+        /* wait for the session to end */
+        int st = 0;
+        waitpid(wpid, &st);
+        klog("init: graphical session ended (status ");
+        { char b[16]; my_itoa(st, b); klog(b); }
+        klog(")\n");
+
+        /* Run the text console as a SEPARATE child (the "getty").  The getty
+         * claims the framebuffer; when it exits (startwm) its death releases
+         * the claim so the next wm can take over - exactly how Linux init
+         * spawns getty, which hands off to the login -> wm.  reboot() inside
+         * the console never returns, so we only get here on `startwm`. */
+        long gpid = fork();
+        if (gpid == 0) {
+            text_console();
+            exit(0);                    /* startwm: release the fb on exit */
+        }
+        waitpid(gpid, &st);
+        /* loop back and start a fresh graphical session */
+    }
+
+    klog("init: supervisor loop ended\n");
     return 0;
 }
+

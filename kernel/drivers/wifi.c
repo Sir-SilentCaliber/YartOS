@@ -141,7 +141,7 @@ void wifi_pci_notify(u16 vendor, u16 device, u8 bus, u8 dev, u8 fn, u8 class_, u
 }
 
 int wifi_scan(void){
-    if (pit_ticks() - g_last_scan < 50 && g_ap_n>0) return g_ap_n; /* debounce 0.5s */
+    if (pit_ticks() - g_last_scan < MS_TO_TICKS(500) && g_ap_n>0) return g_ap_n; /* debounce 0.5s */
     g_last_scan=pit_ticks();
     g_state=WIFI_SCANNING;
     g_last_state_change=pit_ticks();

@@ -7,10 +7,30 @@ int   G_focus_win = -1;
 
 win_t *win_find(u32 id){ for(int i=0;i<MAX_WIN;i++) if(G_win[i].active&&G_win[i].id==id)return &G_win[i]; return 0; }
 
+/* Client-area rectangle (no titlebar) of a window on screen.  A maximized
+ * window fills the work area below the panel (its surface is upscaled to
+ * fit); otherwise the rect is the window's own surface geometry.  This is
+ * the single source of truth so hit-testing, drawing and damage all agree. */
+void win_client_rect(win_t *w, int *x, int *y, int *cw, int *ch){
+    if(w->maximized){
+        *x = 0; *y = PANEL_H + TB_H;
+        *cw = G_fb.w; *ch = G_fb.h - PANEL_H - TB_H;
+    } else {
+        *x = w->x; *y = w->y;
+        *cw = w->w; *ch = w->h;
+    }
+}
+/* Frame rectangle (client + titlebar) — used for hit testing. */
+void win_frame_rect(win_t *w, int *x, int *y, int *fw, int *fh){
+    int cx, cy, cw, ch; win_client_rect(w, &cx, &cy, &cw, &ch);
+    int ty = cy - TB_H; if(ty < PANEL_H) ty = PANEL_H;
+    *x = cx; *y = ty; *fw = cw; *fh = ch + TB_H;
+}
+
 win_t *win_at(int x,int y){
     for(int z=G_z_top;z>=0;z--) for(int i=0;i<MAX_WIN;i++) if(G_win[i].active&&!G_win[i].hidden&&!G_win[i].minimized&&(G_win[i].workspace==G_workspace||G_win[i].workspace<0)&&G_win[i].z==z){
-        int ty=G_win[i].y-TB_H; if(ty<PANEL_H)ty=PANEL_H;
-        if(ptin(x,y,G_win[i].x,ty,G_win[i].x+G_win[i].w,ty+TB_H+G_win[i].h)) return &G_win[i];
+        int fx, fy, fw, fh; win_frame_rect(&G_win[i], &fx, &fy, &fw, &fh);
+        if(ptin(x,y,fx,fy,fx+fw,fy+fh)) return &G_win[i];
     }
     return 0;
 }
@@ -35,8 +55,13 @@ void close_win(win_t*w){
 }
 
 void toggle_max(win_t*w){
-    if(w->maximized){ wm_move(w->id,w->saved_x,w->saved_y); w->w=w->saved_w; w->h=w->saved_h; w->maximized=false; w->snap=0; }
-    else { w->saved_x=w->x; w->saved_y=w->y; w->saved_w=w->w; w->saved_h=w->h; wm_move(w->id,40,PANEL_H+10); w->w=G_fb.w-80; w->h=G_fb.h-PANEL_H-90; w->maximized=true; }
+    /* Maximize is a display-state toggle: the surface keeps its geometry, the
+     * compositor just draws it filling the work area (upscaled).  The old
+     * code wrote w->w/h = screen size locally AND only wm_move'd, so
+     * scan_windows() clobbered the size every other frame and the window
+     * never grew (and would have over-read the surface buffer). */
+    w->maximized = !w->maximized;
+    w->snap = 0;
     w->dirty=true; g_backdrop_dirty=true; damage_whole();
 }
 
@@ -137,10 +162,11 @@ void win_update(win_t*w, long now){
 
 void win_draw_rect(win_t*w, GfxRect *out){
     int tb = TB_H;
-    int tx = w->x + w->draw_dx, ty = w->y + w->draw_dy - tb; if(ty < PANEL_H){ ty = PANEL_H; }
-    int total = w->h + tb;
-    int cx = tx + w->w/2, cy = ty + total/2;
-    int aw = (int)(w->w * w->scale), ah = (int)(total * w->scale);
+    int cx0, cy0, cw0, ch0; win_client_rect(w, &cx0, &cy0, &cw0, &ch0);
+    int tx = cx0 + w->draw_dx, ty = cy0 + w->draw_dy - tb; if(ty < PANEL_H){ ty = PANEL_H; }
+    int total = ch0 + tb;
+    int cx = tx + cw0/2, cy = ty + total/2;
+    int aw = (int)(cw0 * w->scale), ah = (int)(total * w->scale);
     tx = cx - aw/2; ty = cy - ah/2;
     *out = (GfxRect){ tx-14, ty-4, aw+28, ah+22 };
 }
@@ -179,10 +205,11 @@ static void draw_restore_glyph(int cx,int cy,u32 c){
 void draw_window(win_t*w){
     if(w->minimized || !w->active) return;
     int tb = TB_H;
-    int tx = w->x + w->draw_dx, ty = w->y + w->draw_dy - tb; if(ty < PANEL_H){ ty = PANEL_H; }
-    int total = w->h + tb;
-    int cx = tx + w->w/2, cy = ty + total/2;
-    int aw = (int)(w->w * w->scale), ah = (int)(total * w->scale);
+    int cx0, cy0, cw0, ch0; win_client_rect(w, &cx0, &cy0, &cw0, &ch0);
+    int tx = cx0 + w->draw_dx, ty = cy0 + w->draw_dy - tb; if(ty < PANEL_H){ ty = PANEL_H; }
+    int total = ch0 + tb;
+    int cx = tx + cw0/2, cy = ty + total/2;
+    int aw = (int)(cw0 * w->scale), ah = (int)(total * w->scale);
     tx = cx - aw/2; ty = cy - ah/2;
     u8 alpha = w->alpha;
     if(alpha > 24) win_shadow(tx,ty,aw,ah);
@@ -194,13 +221,24 @@ void draw_window(win_t*w){
     else { sf_round_rect_blend(&G_fb,tx,ty,aw,ah,8,((u32)alpha<<24)|(bg&0xFFFFFF)); }
     /* app surface (fills everything below the titlebar).  w->va is 0 for a
      * window whose surface is gone (see scan_windows) — skip rather than
-     * dereference a stale/unmapped WM-side VA. */
+     * dereference a stale/unmapped WM-side VA.  A maximized window upscales
+     * its (<=640x480) surface to fill the client area - the same
+     * "legacy app on HiDPI" model the 2x UI scale already uses. */
     surface_t src; src.px=(u32*)(unsigned long)w->va; src.w=w->w; src.h=w->h; src.pitch=w->w;
-    if(src.px && w->va && alpha>40){ int cw=aw, ch=ah-tb; if(cw>w->w)cw=w->w; if(ch>w->h)ch=w->h;
-        if(G_scale == 2 && cw*2 <= G_fb.w && ch*2 <= G_fb.h)
-            sf_blit_scaled(&G_fb, tx, ty+tb, cw*2, ch*2, &src, 0, 0, cw, ch);  /* HiDPI 2x upscale of 1x app surface */
-        else
+    if(src.px && w->va && alpha>40){
+        int cw=aw, ch=ah-tb;
+        if(w->maximized){
+            sf_blit_scaled(&G_fb, tx, ty+tb, cw, ch, &src, 0, 0, w->w, w->h);
+        } else if(G_scale == 2 && cw*2 <= G_fb.w && ch*2 <= G_fb.h){
+            /* HiDPI 2x upscale of the 1x app surface */
+            if(cw>w->w)cw=w->w;
+            if(ch>w->h)ch=w->h;
+            sf_blit_scaled(&G_fb, tx, ty+tb, cw*2, ch*2, &src, 0, 0, cw, ch);
+        } else {
+            if(cw>w->w)cw=w->w;
+            if(ch>w->h)ch=w->h;
             sf_blit(&G_fb,tx,ty+tb,&src,0,0,cw,ch);
+        }
     }
     /* titlebar: app icon + title left; minimize / maximize / close buttons
      * right — subtle Skift buttons (transparent, GRAY300 glyph, GRAY700

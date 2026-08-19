@@ -73,7 +73,7 @@ typedef struct {
     u8 alpha;
 } win_t;
 
-typedef struct { char name[40]; char path[72]; int icon; bool removable; } app_t;
+typedef struct { char name[40]; char path[72]; int icon; bool removable; bool dynamic; } app_t;
 typedef struct { char name[40]; char path[72]; int icon; bool core; } dock_t;
 typedef struct { char name[40]; char path[72]; int icon; int kind; int gx, gy; } desk_t;
 typedef struct { const char *label; int action; int arg; int icon; } menuitem_t;
@@ -218,6 +218,8 @@ void damage_overlay_small(void);
 GfxRect osd_rect(void);
 
 /* ---- windows (wm_windows.c) ---- */
+void win_client_rect(win_t *w, int *x, int *y, int *cw, int *ch);
+void win_frame_rect(win_t *w, int *x, int *y, int *fw, int *fh);
 void win_draw_rect(win_t *w, GfxRect *out);
 void win_shadow(int tx,int ty,int aw,int ah);
 void draw_close_glyph(int cx,int cy,u32 c);
@@ -289,8 +291,10 @@ void draw_lock(surface_t *s, long now);
 /* ---- orchestrator (wm.c) ---- */
 void osd(const char *m);
 int icon_for_path(const char *p);
+int icon_for_name(const char *n);
 void add_app(const char *name,const char *path,int icon);
 int app_index(const char *path);
+void scan_desktop_apps(void);
 void load_all(void);
 void save_config(void);
 void save_dock_only(void);

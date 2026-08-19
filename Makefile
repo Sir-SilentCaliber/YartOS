@@ -16,6 +16,7 @@ AS       := nasm
 
 KERNEL   := build/yart.elf
 USER_ELF := build/init.elf
+WM_ELF   := build/wm.elf
 ISO      := yart.iso
 ISO_ROOT := iso_root
 LIMINE   := limine
@@ -96,7 +97,7 @@ ifneq ($(PIL_OK),OK)
 endif
 
 .PHONY: all iso run clean distclean limine assets portable-check
-all: $(KERNEL) $(USER_ELF) build/nyra.elf build/files.elf build/settings.elf build/editor.elf build/browser.elf
+all: $(KERNEL) $(USER_ELF) $(WM_ELF) build/nyra.elf build/files.elf build/settings.elf build/editor.elf build/browser.elf build/media.elf build/camera.elf build/viewer.elf build/calc.elf build/sysinfo.elf build/apk.elf initrd_root/repo/calc.ypkg initrd_root/repo/sysinfo.ypkg
 
 assets: $(KORA_BIN) $(KORA_H) $(WP_BIN) $(CUR_BIN) $(CUR_H)
 
@@ -142,12 +143,15 @@ $(KERNEL): $(OBJS) kernel/linker.ld
 build/start.o: userland/start.c userland/sys.h
 	@mkdir -p build
 	$(CC) $(UCFLAGS) -c userland/start.c -o build/start.o
-build/init.o: userland/init.c userland/sys.h userland/wm.c userland/gfx.h $(KORA_H)
+build/init.o: userland/init.c userland/sys.h userland/gfx.h
 	@mkdir -p build
 	$(CC) $(UCFLAGS) -c userland/init.c -o build/init.o
+build/wm_main.o: userland/wm_main.c userland/sys.h
+	@mkdir -p build
+	$(CC) $(UCFLAGS) -c userland/wm_main.c -o build/wm_main.o
 build/theme.o: userland/theme/theme.c userland/theme/theme.h userland/sys.h
 	$(CC) $(UCFLAGS) -Iuserland/theme -c userland/theme/theme.c -o build/theme.o
-build/wm.o: userland/wm.c userland/wm.h userland/sys.h userland/gfx.h userland/cursors.h userland/theme/theme.h $(KORA_H) $(CUR_H) assets
+build/wm.o: userland/wm.c userland/wm.h userland/sys.h userland/gfx.h userland/cursors.h userland/theme/theme.h userland/jpeg_enc.h $(KORA_H) $(CUR_H) assets
 	@mkdir -p build
 	$(CC) $(UCFLAGS) -c userland/wm.c -o build/wm.o
 build/wm_damage.o: userland/wm_damage.c userland/wm.h
@@ -165,6 +169,9 @@ build/wm_overlays.o: userland/wm_overlays.c userland/wm.h
 build/gfx.o: userland/gfx.c userland/gfx.h userland/sys.h $(KORA_H) assets
 	@mkdir -p build
 	$(CC) $(UCFLAGS) -c userland/gfx.c -o build/gfx.o
+build/wallpaper_code.o: userland/wallpaper.c userland/gfx.h userland/sys.h assets
+	@mkdir -p build
+	$(CC) $(UCFLAGS) -c userland/wallpaper.c -o build/wallpaper_code.o
 build/assets.o: $(KORA_BIN)
 	@mkdir -p build
 	cd build && $(LD) -r -b binary -o assets.o kora.bin
@@ -175,8 +182,15 @@ build/cursors.o: $(CUR_BIN)
 	@mkdir -p build
 	cd build && $(LD) -r -b binary -o cursors.o cursors.bin
 
-$(USER_ELF): build/start.o build/init.o build/wm.o build/wm_damage.o build/wm_windows.o build/wm_dock.o build/wm_panel.o build/wm_launcher.o build/wm_overlays.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o userland/init.ld
-	$(LD) $(ULDFLAGS) build/start.o build/init.o build/wm.o build/wm_damage.o build/wm_windows.o build/wm_dock.o build/wm_panel.o build/wm_launcher.o build/wm_overlays.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o -o $@
+# init = the SUPERVISOR + text console.  Small: no wm, no wallpaper, no
+# cursors - just the text renderer (gfx) + icon atlas (assets, which gfx pulls
+# in for icon_get).  The compositor is a separate /bin/wm binary.
+$(USER_ELF): build/start.o build/init.o build/gfx.o build/assets.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/init.o build/gfx.o build/assets.o -o $@
+
+# /bin/wm = the ring-3 compositor (the session init fork/execs).
+$(WM_ELF): build/start.o build/wm_main.o build/wm.o build/wm_damage.o build/wm_windows.o build/wm_dock.o build/wm_panel.o build/wm_launcher.o build/wm_overlays.o build/cursors_lib.o build/gfx.o build/wallpaper_code.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o build/jpeg_enc.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/wm_main.o build/wm.o build/wm_damage.o build/wm_windows.o build/wm_dock.o build/wm_panel.o build/wm_launcher.o build/wm_overlays.o build/cursors_lib.o build/gfx.o build/wallpaper_code.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o build/jpeg_enc.o -o $@
 
 # /bin/hello
 build/hello.o: userland/hello.c userland/sys.h
@@ -205,14 +219,14 @@ build/gui_browser.o: userland/gui_apps.c userland/sys.h userland/gfx.h userland/
 	@mkdir -p build
 	$(CC) $(UCFLAGS) -DAPP_BROWSER -DAPP_NAME=\"About\" -c $< -o $@
 
-build/files.elf: build/start.o build/gui_files.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o userland/init.ld
-	$(LD) $(ULDFLAGS) build/start.o build/gui_files.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o -o $@
-build/settings.elf: build/start.o build/gui_settings.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o userland/init.ld
-	$(LD) $(ULDFLAGS) build/start.o build/gui_settings.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o -o $@
-build/editor.elf: build/start.o build/gui_editor.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o userland/init.ld
-	$(LD) $(ULDFLAGS) build/start.o build/gui_editor.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o -o $@
-build/browser.elf: build/start.o build/gui_browser.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o userland/init.ld
-	$(LD) $(ULDFLAGS) build/start.o build/gui_browser.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o -o $@
+build/files.elf: build/start.o build/gui_files.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/cursors.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/gui_files.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/cursors.o -o $@
+build/settings.elf: build/start.o build/gui_settings.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/cursors.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/gui_settings.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/cursors.o -o $@
+build/editor.elf: build/start.o build/gui_editor.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/cursors.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/gui_editor.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/cursors.o -o $@
+build/browser.elf: build/start.o build/gui_browser.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/cursors.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/gui_browser.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/cursors.o -o $@
 
 initrd_root/bin/files: build/files.elf
 	@mkdir -p initrd_root/bin
@@ -225,19 +239,99 @@ initrd_root/bin/browser: build/browser.elf
 	cp build/browser.elf initrd_root/bin/browser; chmod 755 initrd_root/bin/browser
 
 # /bin/nyra - Nyra Terminal (unique shell replacing settings)
-build/nyra.o: userland/nyra.c userland/sys.h userland/gfx.h $(CUR_H)
+build/nyra.o: userland/nyra.c userland/sys.h userland/gfx.h userland/apk.h userland/fsutil.h $(CUR_H)
 	@mkdir -p build
 	$(CC) $(UCFLAGS) -c userland/nyra.c -o build/nyra.o
 build/cursors_lib.o: userland/cursors.c userland/cursors.h $(CUR_H)
 	@mkdir -p build
 	$(CC) $(UCFLAGS) -c userland/cursors.c -o build/cursors_lib.o
-build/nyra.elf: build/start.o build/nyra.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o userland/init.ld
-	$(LD) $(ULDFLAGS) build/start.o build/nyra.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/wallpaper.o build/cursors.o -o $@
+build/nyra.elf: build/start.o build/nyra.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/cursors.o build/apk_core.o build/fsutil.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/nyra.o build/cursors_lib.o build/gfx.o build/theme.o build/assets.o build/cursors.o build/apk_core.o build/fsutil.o -o $@
+
+# /bin/media - Motion-JPEG video player
+build/media.o: userland/media.c userland/sys.h userland/gfx.h userland/jpeg.h
+	@mkdir -p build
+	$(CC) $(UCFLAGS) -c userland/media.c -o build/media.o
+build/jpeg.o: userland/jpeg.c userland/jpeg.h
+	@mkdir -p build
+	$(CC) $(UCFLAGS) -c userland/jpeg.c -o build/jpeg.o
+build/jpeg_enc.o: userland/jpeg_enc.c userland/jpeg_enc.h
+	@mkdir -p build
+	$(CC) $(UCFLAGS) -c userland/jpeg_enc.c -o build/jpeg_enc.o
+build/clip.o: userland/clip.mjpeg
+	@mkdir -p build
+	cp userland/clip.mjpeg build/clip.mjpeg
+	cd build && $(LD) -r -b binary -o clip.o clip.mjpeg
+build/media.elf: build/start.o build/media.o build/jpeg.o build/clip.o build/gfx.o build/assets.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/media.o build/jpeg.o build/clip.o build/gfx.o build/assets.o -o $@
+
+# ---- roadmap #5: camera + viewer ----
+build/fsutil.o: userland/fsutil.c userland/fsutil.h userland/sys.h
+	@mkdir -p build
+	$(CC) $(UCFLAGS) -c userland/fsutil.c -o build/fsutil.o
+
+build/camera.o: userland/camera.c userland/sys.h userland/gfx.h userland/jpeg_enc.h userland/fsutil.h
+	@mkdir -p build
+	$(CC) $(UCFLAGS) -c userland/camera.c -o build/camera.o
+build/camera.elf: build/start.o build/camera.o build/fsutil.o build/jpeg_enc.o build/gfx.o build/assets.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/camera.o build/fsutil.o build/jpeg_enc.o build/gfx.o build/assets.o -o $@
+
+build/viewer.o: userland/viewer.c userland/sys.h userland/gfx.h userland/jpeg.h userland/fsutil.h
+	@mkdir -p build
+	$(CC) $(UCFLAGS) -c userland/viewer.c -o build/viewer.o
+build/viewer.elf: build/start.o build/viewer.o build/fsutil.o build/jpeg.o build/gfx.o build/assets.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/viewer.o build/fsutil.o build/jpeg.o build/gfx.o build/assets.o -o $@
+
+# ---- roadmap #7: package manager + Calculator (installable) package ----
+build/apk_core.o: userland/apk_core.c userland/apk.h userland/fsutil.h userland/sys.h
+	@mkdir -p build
+	$(CC) $(UCFLAGS) -c userland/apk_core.c -o build/apk_core.o
+build/apk.o: userland/apk.c userland/apk.h userland/fsutil.h userland/sys.h
+	@mkdir -p build
+	$(CC) $(UCFLAGS) -c userland/apk.c -o build/apk.o
+build/apk.elf: build/start.o build/apk.o build/apk_core.o build/fsutil.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/apk.o build/apk_core.o build/fsutil.o -o $@
+
+build/calc.o: userland/calc.c userland/sys.h userland/gfx.h userland/fsutil.h
+	@mkdir -p build
+	$(CC) $(UCFLAGS) -c userland/calc.c -o build/calc.o
+build/calc.elf: build/start.o build/calc.o build/fsutil.o build/gfx.o build/assets.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/calc.o build/fsutil.o build/gfx.o build/assets.o -o $@
+
+build/sysinfo.o: userland/sysinfo.c userland/sys.h
+	@mkdir -p build
+	$(CC) $(UCFLAGS) -c userland/sysinfo.c -o build/sysinfo.o
+build/sysinfo.elf: build/start.o build/sysinfo.o userland/init.ld
+	$(LD) $(ULDFLAGS) build/start.o build/sysinfo.o -o $@
+
+# the Calculator ships ONLY as an installable package (demonstrates apk)
+initrd_root/repo/calc.ypkg: build/calc.elf scripts/mkpkg.py
+	@mkdir -p initrd_root/repo
+	python3 scripts/mkpkg.py initrd_root/repo/calc.ypkg --name calc --version 1.0.0 \
+	    --desc "A simple calculator" --icon calculator --desktop \
+	    --file build/calc.elf:/bin/calc:exec
+
+# a second package: a CLI system-info tool (proves the repo holds N packages)
+initrd_root/repo/sysinfo.ypkg: build/sysinfo.elf scripts/mkpkg.py
+	@mkdir -p initrd_root/repo
+	python3 scripts/mkpkg.py initrd_root/repo/sysinfo.ypkg --name sysinfo --version 1.0.0 \
+	    --desc "CLI system info" --icon terminal \
+	    --file build/sysinfo.elf:/bin/sysinfo:exec
+
+# seed the desktop-entry dir (apk + the compositor scan need it)
+initrd_root/usr/share/applications/.keep:
+	@mkdir -p initrd_root/usr/share/applications
+	@touch $@
 
 initrd_root/bin/init: $(USER_ELF)
 	@mkdir -p initrd_root/bin
 	cp $(USER_ELF) initrd_root/bin/init
 	@chmod 755 initrd_root/bin/init
+
+initrd_root/bin/wm: $(WM_ELF)
+	@mkdir -p initrd_root/bin
+	cp $(WM_ELF) initrd_root/bin/wm
+	@chmod 755 initrd_root/bin/wm
 
 initrd_root/bin/hello: build/hello.elf
 	@mkdir -p initrd_root/bin
@@ -248,6 +342,119 @@ initrd_root/bin/nyra: build/nyra.elf
 	@mkdir -p initrd_root/bin
 	cp build/nyra.elf initrd_root/bin/nyra
 	@chmod 755 initrd_root/bin/nyra
+
+initrd_root/bin/media: build/media.elf
+	@mkdir -p initrd_root/bin
+	cp build/media.elf initrd_root/bin/media
+	@chmod 755 initrd_root/bin/media
+
+initrd_root/bin/camera: build/camera.elf
+	@mkdir -p initrd_root/bin
+	cp build/camera.elf initrd_root/bin/camera
+	@chmod 755 initrd_root/bin/camera
+
+initrd_root/bin/viewer: build/viewer.elf
+	@mkdir -p initrd_root/bin
+	cp build/viewer.elf initrd_root/bin/viewer
+	@chmod 755 initrd_root/bin/viewer
+
+initrd_root/bin/apk: build/apk.elf
+	@mkdir -p initrd_root/bin
+	cp build/apk.elf initrd_root/bin/apk
+	@chmod 755 initrd_root/bin/apk
+
+# The Linux-ABI test binaries + dynamic-linking demo are GENUINE Linux ELF
+# objects, so they are built with the HOST toolchain — which must emit ELF
+# (i.e. a Linux host; macOS clang emits Mach-O).  On non-ELF hosts they are
+# skipped (the core YartOS build is unaffected).  See LINUX_DEMO_DEPS below.
+HOST_IS_LINUX := $(shell uname -s | grep -qi linux && echo 1 || echo 0)
+
+# A genuine Linux static binary (ET_EXEC, Linux syscall ABI) embedded for
+# verifying the Linux-ABI layer.
+initrd_root/bin/test_linux: tests/test_linux.S
+	@mkdir -p initrd_root/bin
+	gcc -nostdlib -static -no-pie -o $@ tests/test_linux.S
+	@chmod 755 $@
+
+# threads (clone+futex) + sockets + execve test, and its execve target
+initrd_root/bin/test_linux2: tests/test_linux2.S
+	@mkdir -p initrd_root/bin
+	gcc -nostdlib -static -no-pie -o $@ tests/test_linux2.S
+	@chmod 755 $@
+
+initrd_root/bin/test_echo: tests/test_echo.S
+	@mkdir -p initrd_root/bin
+	gcc -nostdlib -static -no-pie -o $@ tests/test_echo.S
+	@chmod 755 $@
+
+initrd_root/bin/test_tls: tests/test_tls.S
+	@mkdir -p initrd_root/bin
+	gcc -nostdlib -static -no-pie -o $@ tests/test_tls.S
+	@chmod 755 $@
+
+# DYNAMIC LINKING demo: a real dynamic linker (interpreter) + shared lib +
+# a dynamically-linked program.  All are genuine Linux ELF objects.
+initrd_root/lib/ld-yart.so: tests/ld-yart.c
+	@mkdir -p initrd_root/lib
+	gcc -shared -fPIC -nostdlib -Wl,-e,_start -o $@ tests/ld-yart.c
+
+initrd_root/lib/libgreet.so: tests/libgreet.c
+	@mkdir -p initrd_root/lib
+	gcc -shared -fPIC -nostdlib -o $@ tests/libgreet.c
+
+initrd_root/bin/dynhello: tests/dynhello.c initrd_root/lib/ld-yart.so initrd_root/lib/libgreet.so
+	@mkdir -p initrd_root/bin
+	gcc -nostdlib -pie -fPIC -Wl,--dynamic-linker=/lib/ld-yart.so \
+	    -o $@ tests/dynhello.c -L initrd_root/lib -lgreet
+	@chmod 755 $@
+
+# TLS demo: a dynamically-linked program + a .so, both using __thread
+# variables (exercises __tls_get_addr + DTPMOD64/DTPOFF64 + static TLS).
+initrd_root/lib/libtls.so: tests/libtls.c
+	@mkdir -p initrd_root/lib
+	gcc -shared -fPIC -nostdlib -o $@ tests/libtls.c
+
+initrd_root/bin/tlsdemo: tests/tlsdemo.c initrd_root/lib/ld-yart.so initrd_root/lib/libtls.so
+	@mkdir -p initrd_root/bin
+	gcc -nostdlib -pie -fPIC -Wl,--dynamic-linker=/lib/ld-yart.so \
+	    -o $@ tests/tlsdemo.c -L initrd_root/lib -ltls
+	@chmod 755 $@
+
+# IFUNC demo: a .so exporting an STT_GNU_IFUNC symbol (the resolver path).
+initrd_root/lib/libifunc.so: tests/libifunc.c
+	@mkdir -p initrd_root/lib
+	gcc -shared -fPIC -nostdlib -o $@ tests/libifunc.c
+
+initrd_root/bin/ifuncdemo: tests/ifuncdemo.c initrd_root/lib/ld-yart.so initrd_root/lib/libifunc.so
+	@mkdir -p initrd_root/bin
+	gcc -nostdlib -pie -fPIC -Wl,--dynamic-linker=/lib/ld-yart.so \
+	    -o $@ tests/ifuncdemo.c -L initrd_root/lib -lifunc
+	@chmod 755 $@
+
+# COPY-relocation demo (a .so referencing a global defined in the program).
+initrd_root/lib/libcopy.so: tests/libcopy.c
+	@mkdir -p initrd_root/lib
+	gcc -shared -fPIC -nostdlib -o $@ tests/libcopy.c
+
+initrd_root/bin/copydemo: tests/copydemo.c initrd_root/lib/ld-yart.so initrd_root/lib/libcopy.so
+	@mkdir -p initrd_root/bin
+	gcc -nostdlib -pie -fPIC -Wl,--dynamic-linker=/lib/ld-yart.so \
+	    -o $@ tests/copydemo.c -L initrd_root/lib -lcopy
+	@chmod 755 $@
+
+# Only build/embed the Linux demos on an ELF-capable (Linux) host.
+ifeq ($(HOST_IS_LINUX),1)
+LINUX_DEMO_DEPS := initrd_root/bin/test_linux initrd_root/bin/test_linux2 \
+                   initrd_root/bin/test_echo initrd_root/bin/test_tls \
+                   initrd_root/bin/dynhello initrd_root/bin/tlsdemo \
+                   initrd_root/bin/ifuncdemo initrd_root/bin/copydemo \
+                   initrd_root/lib/ld-yart.so initrd_root/lib/libgreet.so \
+                   initrd_root/lib/libtls.so initrd_root/lib/libifunc.so \
+                   initrd_root/lib/libcopy.so
+else
+LINUX_DEMO_DEPS :=
+$(info NOTE: non-ELF host ($(shell uname -s)) — skipping Linux-ABI demo binaries.)
+endif
 
 initrd_root/etc/motd:
 	@mkdir -p initrd_root/etc
@@ -265,7 +472,7 @@ $(LIMINE):
 	@chmod +x scripts/get-limine.sh 2>/dev/null || true
 	bash ./scripts/get-limine.sh
 
-build/initrd.tar: initrd_root/etc/motd initrd_root/etc/yart.conf initrd_root/home/yart/cursor.conf $(BMP_WALL) initrd_root/bin/init initrd_root/bin/hello initrd_root/bin/nyra initrd_root/bin/files initrd_root/bin/settings initrd_root/bin/editor initrd_root/bin/browser
+build/initrd.tar: initrd_root/etc/motd initrd_root/etc/yart.conf initrd_root/home/yart/cursor.conf $(BMP_WALL) initrd_root/bin/init initrd_root/bin/wm initrd_root/bin/hello initrd_root/bin/nyra initrd_root/bin/files initrd_root/bin/settings initrd_root/bin/editor initrd_root/bin/browser initrd_root/bin/media initrd_root/bin/camera initrd_root/bin/viewer $(LINUX_DEMO_DEPS) initrd_root/bin/apk initrd_root/repo/calc.ypkg initrd_root/repo/sysinfo.ypkg initrd_root/usr/share/applications/.keep
 	@mkdir -p build
 	cd initrd_root && tar --format=ustar -cf ../build/initrd.tar .
 
@@ -301,13 +508,14 @@ run-bios: $(ISO)
 
 clean:
 	rm -rf build $(ISO_ROOT) $(ISO) \
-	           initrd_root/bin/init initrd_root/bin/hello initrd_root/bin/nyra \
-	           initrd_root/bin/files initrd_root/bin/settings \
-	           initrd_root/bin/editor initrd_root/bin/browser \
+	           initrd_root/bin initrd_root/repo initrd_root/usr \
+	           initrd_root/lib/ld-yart.so initrd_root/lib/libgreet.so \
 	           $(BMP_WALL) initrd_root/etc/motd initrd_root/etc/yart.conf \
 	           initrd_root/home/yart/cursor.conf initrd_root/YartOS \
-	           yart-disk.img runlogs *.ppm *.png audio-out.wav
-	rmdir initrd_root/bin 2>/dev/null || true
+	           yart-disk.img runlogs audio-out.wav
+	@for f in *.ppm *.png; do \
+	  if [ -e "$$f" ] && ! git ls-files --error-unmatch "$$f" >/dev/null 2>&1; then rm -f "$$f"; fi; \
+	done
 distclean: clean
 	rm -rf $(LIMINE)
 
@@ -318,6 +526,13 @@ portable-check:
 	  if [ -e "$$f" ]; then echo "NOT PORTABLE: $$f present (run 'make clean')"; ok=0; fi; \
 	done; \
 	for f in *.ppm *.png; do \
+	  if [ -e "$$f" ] && ! git ls-files --error-unmatch "$$f" >/dev/null 2>&1; then \
+	    echo "NOT PORTABLE: untracked $$f present (run 'make clean')"; ok=0; fi; \
+	done; \
+	for d in initrd_root/bin initrd_root/repo initrd_root/usr; do \
+	  if [ -e "$$d" ]; then echo "NOT PORTABLE: $$d present (run 'make clean')"; ok=0; fi; \
+	done; \
+	for f in initrd_root/lib/ld-yart.so initrd_root/lib/libgreet.so; do \
 	  if [ -e "$$f" ]; then echo "NOT PORTABLE: $$f present (run 'make clean')"; ok=0; fi; \
 	done; \
 	if [ -n "$$(ls runlogs/ 2>/dev/null)" ]; then echo "NOT PORTABLE: runlogs/ not empty"; ok=0; fi; \

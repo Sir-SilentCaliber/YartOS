@@ -57,7 +57,7 @@
 #define IRQ_VEC_BASE     32
 #define IRQ_TIMER_VEC    32    /* PIT slot while it is the time source */
 
-#define PIT_HZ 100
+/* (system tick rate lives in <yart/hal.h> as TICK_HZ) */
 
 /* PIT channel 0 ports (for IRQ-free counter polling during calibration) */
 #define PIT_CH0 0x40
@@ -273,6 +273,12 @@ static bool ioapic_init(u32 phys_addr, u32 gsi_base) {
 
 /* ---- APIC timer ---- */
 
+/* Number of PIT channel-0 counter reloads to time the APIC timer over.
+ * One reload = one full PIT period = 1000/TICK_HZ ms, so TICK_HZ/50 reloads
+ * is ~20 ms at any tick rate (2 reloads @100 Hz, 20 @1 kHz).  Keeps the
+ * calibration window constant regardless of TICK_HZ. */
+#define CAL_RELOADS (TICK_HZ / 50)
+
 /* Latch and read the PIT channel-0 counter without interrupts.  We can't
  * rely on the PIT IRQ during calibration: the PIC is already masked (and
  * QEMU/TCG must not deliver legacy IRQs while the LAPIC is live). */
@@ -288,10 +294,10 @@ static bool lapic_timer_calibrate(void) {
     lapic_write(LAPIC_TIMER_ICR, 0);
     lapic_write(LAPIC_LVT_TIMER, LVT_MASK | APIC_TIMER_VECTOR);  /* one-shot */
     lapic_write(LAPIC_TIMER_ICR, 0xFFFFFFFFu);
-    /* wait for ~2 PIT counter reloads (PIT @100Hz -> ~20 ms), IRQ-free */
+    /* wait for CAL_RELOADS PIT counter reloads (~20 ms), IRQ-free */
     u16 last = pit_counter_read();
     int wraps = 0;
-    while (wraps < 2) {
+    while (wraps < CAL_RELOADS) {
         u16 now = pit_counter_read();
         if (now > last) wraps++;    /* counter wrapped back up = one tick */
         last = now;
@@ -302,10 +308,11 @@ static bool lapic_timer_calibrate(void) {
         kprintf("apic: timer did not run (delta=%u)\n", delta);
         return false;
     }
-    /* counter ran at bus/16 for 20 ms -> bus = delta * 16 * 50 */
-    lapic_bus_hz = (u64)delta * 16ULL * 50ULL;
-    kprintf("apic: timer calibration delta=%u/20ms -> bus ~%llu Hz\n",
-            delta, (unsigned long long)lapic_bus_hz);
+    /* counter ran at bus/16 for CAL_RELOADS/TICK_HZ seconds ->
+     * bus = delta * 16 * TICK_HZ / CAL_RELOADS */
+    lapic_bus_hz = (u64)delta * 16ULL * TICK_HZ / CAL_RELOADS;
+    kprintf("apic: timer calibration delta=%u/%d reloads -> bus ~%llu Hz\n",
+            delta, CAL_RELOADS, (unsigned long long)lapic_bus_hz);
     return true;
 }
 
@@ -326,7 +333,7 @@ static void lapic_timer_start_periodic(u32 hz) {
  * BSP-derived bus frequency. */
 void apic_timer_start_this_cpu(void) {
     if (!lapic_mmio) return;
-    u64 count = (lapic_bus_hz / 16ULL) / PIT_HZ;
+    u64 count = (lapic_bus_hz / 16ULL) / TICK_HZ;
     if (count == 0) count = 1;
     if (count > 0xFFFFFFFFULL) count = 0xFFFFFFFFULL;
     lapic_write(LAPIC_TIMER_DIV, DIV_BY_16);
@@ -386,6 +393,6 @@ void apic_init(void) {
     /* commit: switch interrupt delivery to LAPIC/IOAPIC + APIC timer */
     g_apic_active = true;
     irq_register(APIC_TIMER_VECTOR, yart_timer_irq);
-    lapic_timer_start_periodic(PIT_HZ);
+    lapic_timer_start_periodic(TICK_HZ);
     kprintf("apic: interrupt delivery switched to LAPIC/IOAPIC + APIC timer\n");
 }

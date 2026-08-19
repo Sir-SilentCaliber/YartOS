@@ -28,13 +28,20 @@ runlogs/
 
 # ---- generated at build time (tracked in the original repo, removed for
 #      portability - `make iso` regenerates all of these) ----
-initrd_root/bin/init
-initrd_root/bin/hello
-initrd_root/bin/nyra
-initrd_root/bin/files
-initrd_root/bin/settings
-initrd_root/bin/editor
-initrd_root/bin/browser
+
+# every /bin binary (init, wm, nyra, files, media, camera, viewer, apk,
+# test_*, dynhello, tlsdemo, ifuncdemo, copydemo, ...)
+initrd_root/bin/
+
+# all built shared objects (ld-yart.so, libgreet/libifunc/libcopy/libtls.so)
+initrd_root/lib/*.so
+
+# *.ypkg package archives
+initrd_root/repo/
+
+# desktop-entry dir seed (.keep)
+initrd_root/usr/
+
 initrd_root/etc/motd
 initrd_root/etc/yart.conf
 initrd_root/etc/wallpaper.bmp

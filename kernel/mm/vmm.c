@@ -203,7 +203,7 @@ int vmm_reserve_in(u64 *pml4, user_region_t *rs, int *count,
     u64 start = PAGE_ALIGN_DOWN(va);
     u64 end   = start + npages * PAGE_SIZE;
     if (end < start) return -1;
-    if (start < USER_VBASE || end > USER_STACK_TOP) return -1;
+    if (start < USER_VFLOOR || end > USER_STACK_TOP) return -1;
     for (int i = 0; i < *count; i++) {
         u64 r_end = rs[i].start + rs[i].npages * PAGE_SIZE;
         if (start < r_end && end > rs[i].start) return -1;   /* overlap */
@@ -222,6 +222,32 @@ int vmm_reserve_in(u64 *pml4, user_region_t *rs, int *count,
     return 0;
 }
 
+/* Quietly find the first free VA >= `start` (page-aligned) that fits `npages`
+ * pages without overlapping any existing region, and return it, or 0 if none
+ * before `limit`.  NO logging: used by mmap()'s probe loop, which otherwise
+ * spams one "reserve FAIL" line per page as it walked past the ~17 MB
+ * compositor image (init.elf carries the 16 MB wallpaper blob) that can
+ * overlap the mmap arena depending on the ASLR bias.  O(regions), not
+ * O(pages). */
+u64 vmm_user_find_free(u64 start, u64 npages, u64 limit) {
+    u64 need = npages * PAGE_SIZE;
+    u64 cand = PAGE_ALIGN_UP(start);
+    int n; user_region_t *rs = active_regions(&n);
+    while (cand + need <= limit) {
+        bool free = true;
+        for (int i = 0; i < n; i++) {
+            u64 r_end = rs[i].start + rs[i].npages * PAGE_SIZE;
+            if (cand < r_end && cand + need > rs[i].start) {
+                cand = r_end;          /* skip past this region's end */
+                free = false;
+                break;
+            }
+        }
+        if (free) return cand;
+    }
+    return 0;
+}
+
 int vmm_user_reserve(u64 va, u64 npages, u64 flags, u32 opts) {
     if (npages == 0) return -1;
     /* CHARGE-AFTER-CHECKS FIX: validate everything first, charge only on
@@ -233,7 +259,7 @@ int vmm_user_reserve(u64 va, u64 npages, u64 flags, u32 opts) {
     u64 start = PAGE_ALIGN_DOWN(va);
     u64 end   = start + npages * PAGE_SIZE;
     if (end < start) return -1;
-    if (start < USER_VBASE || end > USER_STACK_TOP) {
+    if (start < USER_VFLOOR || end > USER_STACK_TOP) {
         if (sched_current() && sched_current()->pid == 4)
             kprintf("vmm: reserve FAIL va=0x%lx npages=%lu: out of user range\n",
                     (unsigned long)va, (unsigned long)npages);
@@ -750,7 +776,7 @@ static bool page_readable_for_kernel(u64 a) {
 bool vmm_user_range_ok(u64 va, u64 len) {
     if (len == 0) return true;
     if (va + len < va) return false;
-    if (va < USER_VBASE || va + len > USER_STACK_TOP) return false;
+    if (va < USER_VFLOOR || va + len > USER_STACK_TOP) return false;
     u64 first = PAGE_ALIGN_DOWN(va);
     u64 last  = PAGE_ALIGN_UP(va + len);
     for (u64 a = first; a < last; a += PAGE_SIZE)
@@ -770,7 +796,7 @@ bool vmm_user_str_ok(u64 s, u64 max) {
         u64 pg = PAGE_ALIGN_DOWN(a);
         if (pg != cur_page) {
             cur_page = pg;
-            if (a < USER_VBASE || a >= USER_STACK_TOP) return false;
+            if (a < USER_VFLOOR || a >= USER_STACK_TOP) return false;
             if (!page_readable_for_kernel(a)) return false;
         }
         char c;

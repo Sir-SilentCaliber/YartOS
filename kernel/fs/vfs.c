@@ -145,6 +145,14 @@ static vnode_t *find_child(vnode_t *p, const char *name) {
     return NULL;
 }
 
+vnode_t *vfs_find_child(vnode_t *parent, const char *name) {
+    if (!parent || !name) return NULL;
+    vfs_lock();
+    vnode_t *c = find_child(parent, name);
+    vfs_unlock();
+    return c;
+}
+
 static vnode_t *find_or_make_dir(vnode_t *p, const char *name) {
     vnode_t *e = find_child(p, name);
     if (e && e->type == VN_DIR) return e;
@@ -162,6 +170,7 @@ vnode_t *vfs_create(vnode_t *parent, const char *name, vnode_type_t t) {
     n->dirty_b0 = 0;
     n->dirty_b1 = 0xFFFFFFFFu;             /* new file: every block dirty  */
     attach(parent, n);
+    parent->dirty = true;                  /* dir entries changed on disk  */
     vfs_unlock(); return n;
 }
 
@@ -245,6 +254,20 @@ void vfs_init(void *initrd, size_t total) {
 
 vnode_t *vfs_root(void) { return root_node; }
 
+/* Follow a symlink chain (up to 8 deep) to its target.  The target string is
+ * stored in the symlink vnode's data; relative targets resolve against the
+ * link's parent dir, absolute against root.  Must be called with vfs_lock. */
+static vnode_t *resolve_link(vnode_t *v) {
+    int depth = 0;
+    while (v && v->type == VN_SYMLINK && depth++ < 8) {
+        const char *tgt = (const char *)v->data;
+        if (!tgt || !tgt[0]) return NULL;
+        vnode_t *base = (tgt[0] == '/') ? root_node : v->parent;
+        v = vfs_lookup_at(base, tgt);
+    }
+    return v;
+}
+
 vnode_t *vfs_lookup_at(vnode_t *cwd, const char *path) {
     vfs_lock();
     vnode_t *cur = (path && path[0] == '/') ? root_node : (cwd ? cwd : root_node);
@@ -265,12 +288,68 @@ vnode_t *vfs_lookup_at(vnode_t *cwd, const char *path) {
         }
         vnode_t *next = find_child(cur, part);
         if (!next) { vfs_unlock(); return NULL; }
+        /* a symlink in a path component resolves before continuing (the
+         * final component is also resolved, so open()/read() follow links) */
+        next = resolve_link(next);
+        if (!next) { vfs_unlock(); return NULL; }
         cur = next;
     }
     vfs_unlock(); return cur;
 }
 
 vnode_t *vfs_lookup(const char *path) { return vfs_lookup_at(NULL, path); }
+
+/* No-follow lookup: identical walk but the FINAL component is returned as-is
+ * (a symlink node), so unlink/rename/stat act on the link itself.  Symlinks
+ * in INTERMEDIATE components still resolve (you can't have a link as a dir
+ * and not follow it mid-path). */
+vnode_t *vfs_lookup_at_nofollow(vnode_t *cwd, const char *path) {
+    vfs_lock();
+    vnode_t *cur = (path && path[0] == '/') ? root_node : (cwd ? cwd : root_node);
+    if (!path || !*path || (path[0] == '/' && path[1] == 0)) { vfs_unlock(); return cur; }
+    char part[VFS_MAX_NAME];
+    const char *s = path;
+    if (*s == '/') s++;
+    bool last = false;
+    while (*s && !last) {
+        size_t i = 0;
+        while (*s && *s != '/' && i < VFS_MAX_NAME - 1) part[i++] = *s++;
+        part[i] = 0;
+        while (*s == '/') s++;
+        last = (*s == 0);
+        if (i == 0) continue;
+        if (strcmp(part, ".") == 0) continue;
+        if (strcmp(part, "..") == 0) {
+            if (cur->parent) cur = cur->parent;
+            continue;
+        }
+        vnode_t *next = find_child(cur, part);
+        if (!next) { vfs_unlock(); return NULL; }
+        if (!last) next = resolve_link(next);   /* follow mid-path only */
+        if (!next) { vfs_unlock(); return NULL; }
+        cur = next;
+    }
+    vfs_unlock(); return cur;
+}
+
+vnode_t *vfs_lookup_nofollow(const char *path) { return vfs_lookup_at_nofollow(NULL, path); }
+
+vnode_t *vfs_symlink(vnode_t *parent, const char *name, const char *target) {
+    vfs_lock();
+    if (!parent || parent->type != VN_DIR || !name || !target) { vfs_unlock(); return NULL; }
+    if (find_child(parent, name)) { vfs_unlock(); return NULL; }
+    vnode_t *n = mknode(name, VN_SYMLINK);
+    size_t tl = strlen(target);
+    n->data = kmalloc(tl + 1);
+    memcpy(n->data, target, tl + 1);
+    n->size = tl;
+    n->mode = 0777u;                 /* symlinks are always lrwxrwxrwx */
+    n->dirty = true;
+    n->dirty_b0 = 0; n->dirty_b1 = 0xFFFFFFFFu;
+    attach(parent, n);
+    parent->dirty = true;
+    vfs_unlock(); return n;
+}
 
 int vfs_read(vnode_t *v, void *buf, size_t off, size_t n) {
     vfs_lock();
@@ -335,11 +414,8 @@ int vfs_unlink(vnode_t *v) {
     if (!v || !v->parent) { vfs_unlock(); return -1; }
     /* don't allow non-empty dir delete */
     if (v->type == VN_DIR && v->child) { vfs_unlock(); return -1; }
-    {
-        char pth[VFS_MAX_PATH];
-        if (vfs_path_of(v, pth, sizeof pth) > 0)
-            blkfs_note_delete(pth);        /* remove from disk on next sync */
-    }
+    if (v->ino)
+        blkfs_note_delete(v->ino);         /* remove from disk on next sync */
     vnode_t *p = v->parent;
     if (p->child == v) p->child = v->sibling;
     else {
@@ -348,6 +424,7 @@ int vfs_unlink(vnode_t *v) {
     }
     v->sibling = NULL;
     v->parent  = NULL;          /* detached: no longer reachable by lookup */
+    p->dirty = true;            /* parent's on-disk dir entries changed    */
     vnode_unref(v);             /* drop the tree's reference; freed only
                                    when the last open fd closes it too */
     vfs_unlock(); return 0;

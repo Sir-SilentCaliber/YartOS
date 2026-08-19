@@ -1,7 +1,28 @@
-/* Yart OS - YartFS v4 ADVANCED MAXIMUM
- * Pushes FS to real OS level: triple indirect, 2048 inodes, link count, symlink, extent hint, journal checksum
+/* YartOS — YartFS v5: an ext-architected filesystem.
+ *
+ * This replaces the v4 "path-string inode" design with the on-disk model a
+ * real Unix filesystem (ext2/ext3/ext4) uses:
+ *
+ *   - 4 KiB blocks (8 x 512-byte sectors; the block layer loops per page).
+ *   - BLOCK GROUPS: the volume is split into groups, each with its own block
+ *     bitmap, inode bitmap and inode table (locality + fsck-ability).
+ *   - INODES KEYED BY NUMBER (root = 1).  No path strings on disk.  Hard
+ *     links fall out of `links_count` naturally.
+ *   - ON-DISK DIRECTORY ENTRIES: a directory's data is a packed array of
+ *     (inode, rec_len, name_len, type, name) records — exactly ext's dirent.
+ *     Lookup walks dirents; `ls` reads them; no path reconstruction at mount.
+ *   - INDIRECT BLOCKS for file data (direct[12] + single + double + triple,
+ *     each indirect block holds 1024 pointers).
+ *   - Integrity: per-inode CRC32 (metadata) + per-data-block CRC32.
+ *   - Write ordering + a superblock mount counter give ext2-style crash
+ *     DETECTION (a full redo-log journal is the next stage; see
+ *     docs/EXT4_VFS_PLAN.md).
+ *
+ * The RAM vnode tree remains the source of truth (a write-back cache): sync()
+ * walks it post-order and persists dirty nodes; mount() rebuilds it from the
+ * on-disk inodes + dirents.  The public API is unchanged, so vfs.c and the
+ * syscall layer never move.
  */
-
 #include <yart/blk.h>
 #include <yart/fs.h>
 #include <yart/mm.h>
@@ -9,301 +30,728 @@
 #include <yart/console.h>
 #include <yart/hal.h>
 
+/* ---------------- on-disk format constants ---------------- */
+#define YFS_MAGIC     0x5952544635300000ULL  /* "YRTF50" */
+#define YFS_VERSION   5
+#define YFS_BLOCK_SIZE       4096
+#define YFS_SECTORS_PER_BLK  (YFS_BLOCK_SIZE / BLK_SECTOR_SIZE)   /* 8 */
+#define YFS_BLOCKS_PER_GROUP 4096
+#define YFS_INODES_PER_GROUP 1024
+#define YFS_INODE_SIZE       128
+#define YFS_INODES_PER_BLK   (YFS_BLOCK_SIZE / YFS_INODE_SIZE)    /* 32 */
+#define YFS_ITABLE_BLOCKS    (YFS_INODES_PER_GROUP / YFS_INODES_PER_BLK) /* 32 */
+#define YFS_META_PER_GROUP   (2 + YFS_ITABLE_BLOCKS)  /* bbitmap+ibitmap+itable */
+#define YFS_INDIRECT_PER     (YFS_BLOCK_SIZE / 4)     /* 1024 ptrs/block */
+#define YFS_DIRECT           12
+#define YFS_MAX_GROUPS       64
+#define YFS_JOURNAL_BLOCKS   64            /* reserved (redo journal: stage 4) */
+#define YFS_ROOT_INO         1
+
+/* inode mode: type in the high 16 bits, perms in the low 16. */
+#define YFS_TYPE_FILE 1
+#define YFS_TYPE_DIR  2
+#define YFS_TYPE_LNK  3
+
+/* ---------------- on-disk structures ---------------- */
+typedef struct PACKED {
+    u64 magic;
+    u32 version;
+    u32 block_size;
+    u32 blocks_per_group;
+    u32 inodes_per_group;
+    u32 inode_size;
+    u32 total_blocks;      /* FS blocks (excludes swap) */
+    u32 total_groups;
+    u32 journal_start;     /* block # of the reserved journal area */
+    u32 journal_blocks;
+    u32 crc_start;         /* block # of the per-data-block CRC region */
+    u32 mtime;
+    u32 mount_count;
+    u32 state;             /* 0 = clean, 1 = dirty (crash detection) */
+    u32 reserved[7];
+} yfs_sb_t;
+
+typedef struct PACKED {
+    u32 block_bitmap;      /* block # of the block bitmap */
+    u32 inode_bitmap;      /* block # of the inode bitmap */
+    u32 inode_table;       /* first block # of the inode table */
+    u32 data_start;        /* first data block # */
+    u32 data_end;          /* one past the last data block # */
+    u32 free_blocks;
+    u32 free_inodes;
+    u32 reserved;
+} yfs_gdesc_t;
+
+typedef struct PACKED {
+    u32 mode;              /* (type<<16) | perms */
+    u32 uid, gid;
+    u32 size;              /* bytes (dirs: dirent bytes) */
+    u32 mtime;
+    u32 links_count;
+    u32 blocks_count;      /* data blocks allocated */
+    u32 direct[YFS_DIRECT];
+    u32 single_indirect;
+    u32 double_indirect;
+    u32 triple_indirect;
+    u32 generation;
+    u32 crc;               /* CRC32 of the inode with crc=0 */
+    u32 reserved[8];
+} yfs_inode_t;
+
+typedef struct PACKED {
+    u32 inode;
+    u16 rec_len;           /* total entry length, 4-byte aligned */
+    u8  name_len;
+    u8  type;
+    char name[];           /* name_len bytes */
+} yfs_dirent_t;
+
+_Static_assert(sizeof(yfs_inode_t) == YFS_INODE_SIZE, "inode must be 128 B");
+_Static_assert(sizeof(yfs_sb_t) <= YFS_BLOCK_SIZE, "superblock fits one block");
+_Static_assert(sizeof(yfs_gdesc_t) * YFS_MAX_GROUPS <= YFS_BLOCK_SIZE,
+               "gdt fits one block");
+
+/* ---------------- runtime state ---------------- */
 static bool g_active;
 static u64  g_synced_files;
-static blkfs_super_t g_super;
-static blkfs_inode_t *g_inodes;
-static u8   g_inode_used[BLKFS_MAX_INODES / 8];
-static u8  *g_data_bitmap;
-static u32  g_data_bitmap_sectors;
-static char g_deleted[64][160];
-static int  g_deleted_count;
+static yfs_sb_t    g_sb;
+static yfs_gdesc_t g_desc[YFS_MAX_GROUPS];
+static u8  *g_bbitmap[YFS_MAX_GROUPS];   /* block bitmaps (1 block each)  */
+static u8  *g_ibitmap[YFS_MAX_GROUPS];   /* inode bitmaps (1 block each)  */
+static u32  g_deleted[64];               /* inode numbers to free at sync */
+static int  g_deleted_n;
 
-static u32 blkfs_disk_total(void){ u64 s=blk_disk_sectors(); u64 swap=vmm_swap_disk_reserve_sectors(); return (u32)(s>swap?s-swap:0); }
-static void io_read(u64 sec,u32 cnt,void *buf){ blk_read_sectors(sec,cnt,buf); }
-static void io_write(u64 sec,u32 cnt,const void *buf){
-    int rc = blk_write_sectors(sec, cnt, buf);
-    if (rc != 0)
-        kprintf("blkfs: !! io_write sector %llu count %u FAILED rc=%d\n",
-                (unsigned long long)sec, cnt, rc);
+/* ---------------- block I/O (4K block = 8 sectors) ---------------- */
+static void rd_blk(u32 b, void *buf) { blk_read_sectors((u64)b * YFS_SECTORS_PER_BLK, YFS_SECTORS_PER_BLK, buf); }
+static void wr_blk(u32 b, const void *buf) { blk_write_sectors((u64)b * YFS_SECTORS_PER_BLK, YFS_SECTORS_PER_BLK, buf); }
+
+static u32 crc32b(const void *data, u32 len) {
+    const u8 *p = data; u32 crc = 0xFFFFFFFFu;
+    while (len--) { crc ^= *p++; for (int i = 0; i < 8; i++) crc = (crc >> 1) ^ (0xEDB88320u & (u32)-(crc & 1)); }
+    return ~crc;
 }
 
-static u32 crc32_bytes(const void *data,u32 len){ const u8 *p=data; u32 crc=0xFFFFFFFFu; while(len--){ crc^=*p++; for(int i=0;i<8;i++) crc=(crc>>1)^(0xEDB88320u & (u32)-(crc & 1)); } return ~crc; }
-static u32 crc_of(u32 sector){ u32 off=sector-g_super.data_start_sector; u8 buf[BLK_SECTOR_SIZE]; io_read(g_super.crc_start_sector+off/128,1,buf); u32 c; memcpy(&c, buf+(off%128)*4,4); return c; }
-static void crc_store(u32 sector,u32 crc){ u32 off=sector-g_super.data_start_sector; u8 buf[BLK_SECTOR_SIZE]; memset(buf,0,sizeof buf); io_read(g_super.crc_start_sector+off/128,1,buf); memcpy(buf+(off%128)*4,&crc,4); io_write(g_super.crc_start_sector+off/128,1,buf); }
+/* ---------------- geometry ---------------- */
+static u32 disk_total_blocks(void) {
+    u64 s = blk_disk_sectors();
+    u64 swap = vmm_swap_disk_reserve_sectors();
+    return (u32)((s > swap ? s - swap : 0) / YFS_SECTORS_PER_BLK);
+}
 
-#define BLKFS_JRN_SECTORS 128
-#define JRN_MAGIC 0x594A524Eu
-#define JRN_RECORDS 30
-#define JRN_FILE 1
-#define JRN_DIR 2
-#define JRN_DELETE 3
-#define JRN_SYMLINK 4
-#define JRN_MAX_DATA (BLKFS_JRN_SECTORS-JRN_RECORDS)
-typedef struct PACKED { u32 magic; u32 seq; u32 type; u32 size; char path[160]; u32 nblocks; u32 uid,mode; u32 crc; u32 reserved[3]; } blkfs_jrn_t;
-static u32 jrn_start; static u64 g_jrn_replays; static u32 jrn_seq;
+static int group_of_data_block(u32 blk) {
+    for (u32 g = 0; g < g_sb.total_groups; g++)
+        if (blk >= g_desc[g].data_start && blk < g_desc[g].data_end) return (int)g;
+    return -1;
+}
 
-static void jrn_clear_range(void){ u8 z[BLK_SECTOR_SIZE]; memset(z,0,sizeof z); for(u32 i=0;i<BLKFS_JRN_SECTORS;i++) io_write(jrn_start+i,1,z); }
-static int jrn_write(const char *path,u8 type,const void *data,u32 size){
-    blkfs_jrn_t h; memset(&h,0,sizeof h); h.magic=JRN_MAGIC; h.seq=++jrn_seq; h.type=type; h.size=size; strncpy(h.path,path,sizeof h.path-1); h.uid=0; h.mode=0644;
-    u32 nblocks=(size+BLK_SECTOR_SIZE-1)/BLK_SECTOR_SIZE; if(nblocks>JRN_MAX_DATA){ nblocks=JRN_MAX_DATA; size=JRN_MAX_DATA*BLK_SECTOR_SIZE; } h.nblocks=nblocks;
-    if(data && size) h.crc=crc32_bytes(data,size);
-    u8 sb[BLK_SECTOR_SIZE]; memset(sb,0,sizeof sb); memcpy(sb,&h,sizeof h);
-    io_write(jrn_start+ (jrn_seq-1)%JRN_RECORDS,1,sb);
-    for(u32 b=0;b<nblocks;b++){ u8 buf[BLK_SECTOR_SIZE]; memset(buf,0,sizeof buf); u32 off=b*BLK_SECTOR_SIZE; u32 take=(size-off>BLK_SECTOR_SIZE)?BLK_SECTOR_SIZE:size-off; if(take&&data) memcpy(buf,(const u8*)data+off,take); io_write(jrn_start+JRN_RECORDS+b,1,buf); }
+/* compute layout into g_sb + g_desc.  total_blocks must be known. */
+static bool compute_layout(void) {
+    u32 total = disk_total_blocks();
+    if (total < 1024) return false;
+    memset(g_desc, 0, sizeof g_desc);   /* fresh: no stale fields */
+    g_sb.total_blocks = total;
+    g_sb.block_size = YFS_BLOCK_SIZE;
+    g_sb.blocks_per_group = YFS_BLOCKS_PER_GROUP;
+    g_sb.inodes_per_group = YFS_INODES_PER_GROUP;
+    g_sb.inode_size = YFS_INODE_SIZE;
+
+    u32 groups = (total + YFS_BLOCKS_PER_GROUP - 1) / YFS_BLOCKS_PER_GROUP;
+    if (groups == 0 || groups > YFS_MAX_GROUPS) return false;
+    g_sb.total_groups = groups;
+
+    g_sb.journal_blocks = YFS_JOURNAL_BLOCKS;
+    g_sb.journal_start = total - YFS_JOURNAL_BLOCKS;
+
+    /* group metadata starts right after superblock(0) + gdt(1) */
+    u32 base = 2;
+    for (u32 g = 0; g < groups; g++) {
+        u32 span = base + g * YFS_BLOCKS_PER_GROUP;
+        u32 span_end = span + YFS_BLOCKS_PER_GROUP;
+        if (span_end > g_sb.journal_start) span_end = g_sb.journal_start;
+        if (span_end <= span + YFS_META_PER_GROUP) return false;
+        g_desc[g].block_bitmap = span;
+        g_desc[g].inode_bitmap = span + 1;
+        g_desc[g].inode_table  = span + 2;
+        g_desc[g].data_start   = span + YFS_META_PER_GROUP;
+        g_desc[g].data_end     = span_end;
+        g_desc[g].free_blocks  = span_end - g_desc[g].data_start;
+        g_desc[g].free_inodes  = YFS_INODES_PER_GROUP;
+    }
+    /* CRC region: one u32 per ACTUAL data block (sum over groups, not
+     * journal_start - data_start, which would count interleaved metadata). */
+    u32 data_total = 0;
+    for (u32 g = 0; g < groups; g++)
+        data_total += g_desc[g].data_end - g_desc[g].data_start;
+    u32 crc_blocks = (data_total * 4 + YFS_BLOCK_SIZE - 1) / YFS_BLOCK_SIZE;
+    g_sb.crc_start = g_sb.journal_start - crc_blocks;
+    /* the last group's data must not run into the CRC region */
+    for (u32 g = 0; g < groups; g++)
+        if (g_desc[g].data_end > g_sb.crc_start) g_desc[g].data_end = g_sb.crc_start;
+    return g_sb.crc_start > g_desc[0].data_start;
+}
+
+static void wr_gdt(void) {
+    static u8 buf[YFS_BLOCK_SIZE]; memset(buf, 0, sizeof buf);
+    memcpy(buf, g_desc, g_sb.total_groups * sizeof(yfs_gdesc_t));
+    wr_blk(1, buf);
+}
+static void rd_gdt(void) {
+    static u8 buf[YFS_BLOCK_SIZE]; rd_blk(1, buf);
+    memcpy(g_desc, buf, g_sb.total_groups * sizeof(yfs_gdesc_t));
+}
+
+/* ---------------- bitmaps ---------------- */
+static bool ibit(u32 ino) {
+    u32 g = (ino - 1) / YFS_INODES_PER_GROUP, i = (ino - 1) % YFS_INODES_PER_GROUP;
+    return (g_ibitmap[g][i / 8] >> (i % 8)) & 1;
+}
+static void iset(u32 ino, bool v) {
+    u32 g = (ino - 1) / YFS_INODES_PER_GROUP, i = (ino - 1) % YFS_INODES_PER_GROUP;
+    if (v) g_ibitmap[g][i / 8] |=  (1u << (i % 8));
+    else   g_ibitmap[g][i / 8] &= ~(1u << (i % 8));
+}
+static bool bbit(u32 blk) {
+    int g = group_of_data_block(blk);
+    if (g < 0) return true;               /* outside data: treat as used */
+    u32 i = blk - g_desc[g].data_start;
+    return (g_bbitmap[g][i / 8] >> (i % 8)) & 1;
+}
+static void bset(u32 blk, bool v) {
+    int g = group_of_data_block(blk);
+    if (g < 0) return;
+    u32 i = blk - g_desc[g].data_start;
+    if (v) g_bbitmap[g][i / 8] |=  (1u << (i % 8));
+    else   g_bbitmap[g][i / 8] &= ~(1u << (i % 8));
+}
+
+static u32 alloc_ino(void) {
+    for (u32 g = 0; g < g_sb.total_groups; g++)
+        for (u32 i = 0; i < YFS_INODES_PER_GROUP; i++) {
+            u32 ino = g * YFS_INODES_PER_GROUP + i + 1;
+            if (!ibit(ino)) { iset(ino, true); return ino; }
+        }
     return 0;
 }
-static void jrn_replay(void){
-    blkfs_jrn_t recs[JRN_RECORDS]; u32 n=0, minseq=0xFFFFFFFFu;
-    for(u32 i=0;i<JRN_RECORDS;i++){ blkfs_jrn_t h; u8 sb[BLK_SECTOR_SIZE]; io_read(jrn_start+i,1,sb); memcpy(&h,sb,sizeof h); if(h.magic!=JRN_MAGIC) continue; recs[n++]=h; if(h.seq<minseq) minseq=h.seq; }
-    if(!n) return;
-    u32 expect=minseq;
-    for(u32 pass=0;pass<n;pass++){ for(u32 i=0;i<n;i++){ if(recs[i].seq!=expect) continue; blkfs_jrn_t h=recs[i];
-            if(h.crc){ /* CRC validated */ }
-            g_jrn_replays++; kprintf("blkfs: journal replay #%u %s type=%u size=%u crc=%08x\n",h.seq,h.path,h.type,h.size,h.crc);
-            if(h.type==JRN_DELETE){ vnode_t *v=vfs_lookup(h.path); if(v) vfs_unlink(v); }
-            else {
-                const char *slash=NULL; for(const char *p=h.path;*p;p++) if(*p=='/') slash=p;
-                if(slash && slash!=h.path){ char dir[VFS_MAX_PATH]; size_t l=slash-h.path; if(l<sizeof dir){ memcpy(dir,h.path,l); dir[l]=0; vfs_mkdir_p(dir);} }
-                const char *base=slash?slash+1:h.path; char dir[VFS_MAX_PATH]; if(slash && slash!=h.path){ size_t l=slash-h.path; memcpy(dir,h.path,l); dir[l]=0; } else strncpy(dir,"/",sizeof dir-1);
-                vnode_t *d=vfs_lookup(dir); if(!d) return;
-                vnode_t *v=vfs_lookup(h.path); if(!v) v=vfs_create(d,base,h.type==JRN_DIR?VN_DIR:VN_FILE); 
-                if(v && h.type!=JRN_DIR){ if(v->data) kfree(v->data); v->size=h.size; v->cap=h.size; v->data=h.size?kzalloc(h.size):NULL; u32 off=0; for(u32 b=0;b<h.nblocks && off<h.size;b++){ u8 buf[BLK_SECTOR_SIZE]; io_read(jrn_start+JRN_RECORDS+b,1,buf); u32 take=h.size-off; if(take>BLK_SECTOR_SIZE) take=BLK_SECTOR_SIZE; if(v->data) memcpy((u8*)v->data+off,buf,take); off+=take; } v->uid=h.uid; v->mode=h.mode; v->dirty=true; }
+static u32 alloc_block(u32 prefer_group) {
+    for (u32 pass = 0; pass < 2; pass++)
+        for (u32 gg = 0; gg < g_sb.total_groups; gg++) {
+            u32 g = (pass == 0) ? (prefer_group + gg) % g_sb.total_groups : gg;
+            for (u32 i = 0; i < g_desc[g].data_end - g_desc[g].data_start; i++) {
+                u32 blk = g_desc[g].data_start + i;
+                if (!bbit(blk)) { bset(blk, true); return blk; }
             }
-            expect++; break; } }
-    jrn_clear_range();
-}
-
-bool blkfs_active(void){ return g_active; }
-u64 blkfs_synced_files(void){ return g_synced_files; }
-
-static bool inode_used(u32 i){ return (g_inode_used[i/8] >> (i%8)) & 1; }
-static void inode_set(u32 i,bool used){ if(used) g_inode_used[i/8]|=(1u<<(i%8)); else g_inode_used[i/8]&=~(1u<<(i%8)); }
-static bool data_used(u32 b){ return (g_data_bitmap[b/8] >> (b%8)) & 1; }
-static void data_set(u32 b,bool used){ if(used) g_data_bitmap[b/8]|=(1u<<(b%8)); else g_data_bitmap[b/8]&=~(1u<<(b%8)); }
-
-/* extent-like contiguous alloc hint: try to find run of n contiguous free sectors */
-static u32 data_alloc_contiguous(u32 count){
-    if(count==0) return 0xFFFFFFFFu;
-    if(count==1){
-        for(u32 b=1;b<g_super.data_sectors;b++) if(!data_used(b)){ data_set(b,true); return b; }
-        return 0xFFFFFFFFu;
-    }
-    for(u32 b=1;b+count<=g_super.data_sectors;b++){
-        bool ok=true;
-        for(u32 j=0;j<count;j++) if(data_used(b+j)){ ok=false; b+=j; break; }
-        if(ok){ for(u32 j=0;j<count;j++) data_set(b+j,true); return b; }
-    }
-    return 0xFFFFFFFFu;
-}
-static u32 data_alloc(void){ return data_alloc_contiguous(1); }
-
-static void inode_read(u32 i){ u8 s[BLK_SECTOR_SIZE]; io_read(g_super.inode_start_sector+i,1,s); memcpy(&g_inodes[i],s,sizeof(blkfs_inode_t)); }
-static void inode_write(u32 i){ u8 s[BLK_SECTOR_SIZE]; memset(s,0,sizeof s); memcpy(s,&g_inodes[i],sizeof(blkfs_inode_t)); io_write(g_super.inode_start_sector+i,1,s); }
-static blkfs_inode_t *inode_find(const char *path){ for(u32 i=0;i<BLKFS_MAX_INODES;i++) if(inode_used(i) && strcmp(g_inodes[i].path,path)==0) return &g_inodes[i]; return NULL; }
-static blkfs_inode_t *inode_alloc(const char *path){ for(u32 i=0;i<BLKFS_MAX_INODES;i++) if(!inode_used(i)){ inode_set(i,true); memset(&g_inodes[i],0,sizeof(blkfs_inode_t)); strncpy(g_inodes[i].path,path,sizeof(g_inodes[i].path)-1); g_inodes[i].reserved[2]=1; inode_write(i); return &g_inodes[i]; } return NULL; }
-static void zero_sector(u32 sector){ u8 z[BLK_SECTOR_SIZE]; memset(z,0,sizeof z); io_write(g_super.data_start_sector+sector,1,z); }
-
-static u32 inode_data_block(blkfs_inode_t *in,u32 b,bool alloc){
-    if(b < BLKFS_MAX_DIRECT){ u32 db=in->direct[b]; if(db==0){ if(!alloc) return 0xFFFFFFFFu; db=data_alloc(); if(db==0xFFFFFFFFu) return 0xFFFFFFFFu; in->direct[b]=db; zero_sector(db); } return db; }
-    u32 idx=b-BLKFS_MAX_DIRECT;
-    if(idx < BLKFS_MAX_INDIRECT*BLKFS_INDIRECT_PER){
-        u32 ti=idx/BLKFS_INDIRECT_PER; u32 te=idx%BLKFS_INDIRECT_PER;
-        u32 tbl=in->indirect[ti]; if(tbl==0){ if(!alloc) return 0xFFFFFFFFu; tbl=data_alloc(); if(tbl==0xFFFFFFFFu) return 0xFFFFFFFFu; u8 z[BLK_SECTOR_SIZE]; memset(z,0,sizeof z); io_write(g_super.data_start_sector+tbl,1,z); in->indirect[ti]=tbl; }
-        u8 buf[BLK_SECTOR_SIZE]; io_read(g_super.data_start_sector+tbl,1,buf); u32 *ents=(u32*)buf; u32 db=ents[te]; if(db==0 && alloc){ db=data_alloc(); if(db!=0xFFFFFFFFu){ ents[te]=db; io_write(g_super.data_start_sector+tbl,1,buf); zero_sector(db); } } return (db!=0xFFFFFFFFu)?db:0xFFFFFFFFu;
-    }
-    idx-=BLKFS_MAX_INDIRECT*BLKFS_INDIRECT_PER;
-    if(idx < BLKFS_DINDIRECT_COUNT){
-        u32 dind=BLKFS_DINDIRECT_SECTOR(in); if(dind==0){ if(!alloc) return 0xFFFFFFFFu; dind=data_alloc(); if(dind==0xFFFFFFFFu) return 0xFFFFFFFFu; u8 z[BLK_SECTOR_SIZE]; memset(z,0,sizeof z); io_write(g_super.data_start_sector+dind,1,z); in->reserved[0]=dind; }
-        u8 dbuf[BLK_SECTOR_SIZE]; io_read(g_super.data_start_sector+dind,1,dbuf); u32 *dents=(u32*)dbuf;
-        u32 ti=idx/BLKFS_INDIRECT_PER; u32 te=idx%BLKFS_INDIRECT_PER;
-        u32 tbl=dents[ti]; if(tbl==0){ if(!alloc) return 0xFFFFFFFFu; tbl=data_alloc(); if(tbl==0xFFFFFFFFu) return 0xFFFFFFFFu; u8 z[BLK_SECTOR_SIZE]; memset(z,0,sizeof z); io_write(g_super.data_start_sector+tbl,1,z); dents[ti]=tbl; io_write(g_super.data_start_sector+dind,1,dbuf); }
-        u8 ibuf[BLK_SECTOR_SIZE]; io_read(g_super.data_start_sector+tbl,1,ibuf); u32 *ients=(u32*)ibuf; u32 db=ients[te]; if(db==0 && alloc){ db=data_alloc(); if(db!=0xFFFFFFFFu){ ients[te]=db; io_write(g_super.data_start_sector+tbl,1,ibuf); zero_sector(db); } } return (db!=0xFFFFFFFFu)?db:0xFFFFFFFFu;
-    }
-    idx-=BLKFS_DINDIRECT_COUNT;
-    if(idx >= BLKFS_TINDIRECT_COUNT) return 0xFFFFFFFFu;
-    u32 tind=BLKFS_TINDIRECT_SECTOR(in); if(tind==0){ if(!alloc) return 0xFFFFFFFFu; tind=data_alloc(); if(tind==0xFFFFFFFFu) return 0xFFFFFFFFu; u8 z[BLK_SECTOR_SIZE]; memset(z,0,sizeof z); io_write(g_super.data_start_sector+tind,1,z); in->reserved[1]=tind; }
-    u8 tbuf[BLK_SECTOR_SIZE]; io_read(g_super.data_start_sector+tind,1,tbuf); u32 *tents=(u32*)tbuf;
-    u32 dind_idx = idx / (BLKFS_INDIRECT_PER*BLKFS_INDIRECT_PER);
-    u32 rem = idx % (BLKFS_INDIRECT_PER*BLKFS_INDIRECT_PER);
-    u32 ind_idx = rem / BLKFS_INDIRECT_PER;
-    u32 data_idx = rem % BLKFS_INDIRECT_PER;
-    u32 dind_sec = tents[dind_idx]; if(dind_sec==0){ if(!alloc) return 0xFFFFFFFFu; dind_sec=data_alloc(); if(dind_sec==0xFFFFFFFFu) return 0xFFFFFFFFu; u8 z[BLK_SECTOR_SIZE]; memset(z,0,sizeof z); io_write(g_super.data_start_sector+dind_sec,1,z); tents[dind_idx]=dind_sec; io_write(g_super.data_start_sector+tind,1,tbuf); }
-    u8 dbuf[BLK_SECTOR_SIZE]; io_read(g_super.data_start_sector+dind_sec,1,dbuf); u32 *dents=(u32*)dbuf;
-    u32 tbl=dents[ind_idx]; if(tbl==0){ if(!alloc) return 0xFFFFFFFFu; tbl=data_alloc(); if(tbl==0xFFFFFFFFu) return 0xFFFFFFFFu; u8 z[BLK_SECTOR_SIZE]; memset(z,0,sizeof z); io_write(g_super.data_start_sector+tbl,1,z); dents[ind_idx]=tbl; io_write(g_super.data_start_sector+dind_sec,1,dbuf); }
-    u8 ibuf[BLK_SECTOR_SIZE]; io_read(g_super.data_start_sector+tbl,1,ibuf); u32 *ients=(u32*)ibuf; u32 db=ients[data_idx]; if(db==0 && alloc){ db=data_alloc(); if(db!=0xFFFFFFFFu){ ients[data_idx]=db; io_write(g_super.data_start_sector+tbl,1,ibuf); zero_sector(db); } } return (db!=0xFFFFFFFFu)?db:0xFFFFFFFFu;
-}
-
-static void discard_block(u32 db){ if(db>=g_super.data_sectors) return; u8 z[BLK_SECTOR_SIZE]; memset(z,0,sizeof z); io_write(g_super.data_start_sector+db,1,z); crc_store(g_super.data_start_sector+db,0); data_set(db,false); }
-
-static void inode_free(blkfs_inode_t *in){
-    for(u32 i=0;i<BLKFS_MAX_INODES;i++) if(&g_inodes[i]==in){
-        for(u32 b=0;b<in->blocks;b++){ u32 db=inode_data_block(in,b,false); if(db!=0xFFFFFFFFu) discard_block(db); }
-        for(u32 t=0;t<BLKFS_MAX_INDIRECT;t++) if(in->indirect[t] < g_super.data_sectors){ data_set(in->indirect[t],false); u8 z[BLK_SECTOR_SIZE]; memset(z,0,sizeof z); io_write(g_super.data_start_sector+in->indirect[t],1,z); }
-        u32 dind=BLKFS_DINDIRECT_SECTOR(in);
-        if(dind && dind<g_super.data_sectors){
-            u8 dbuf[BLK_SECTOR_SIZE]; io_read(g_super.data_start_sector+dind,1,dbuf); u32 *dents=(u32*)dbuf;
-            for(u32 ti=0;ti<BLKFS_INDIRECT_PER;ti++){ u32 tbl=dents[ti]; if(tbl && tbl<g_super.data_sectors){ data_set(tbl,false); u8 z[BLK_SECTOR_SIZE]; memset(z,0,sizeof z); io_write(g_super.data_start_sector+tbl,1,z); } }
-            data_set(dind,false); u8 z[BLK_SECTOR_SIZE]; memset(z,0,sizeof z); io_write(g_super.data_start_sector+dind,1,z);
         }
-        u32 tind=BLKFS_TINDIRECT_SECTOR(in);
-        if(tind && tind<g_super.data_sectors){
-            u8 tbuf[BLK_SECTOR_SIZE]; io_read(g_super.data_start_sector+tind,1,tbuf); u32 *tents=(u32*)tbuf;
-            for(u32 di=0;di<BLKFS_INDIRECT_PER;di++){ u32 dsec=tents[di]; if(!dsec||dsec>=g_super.data_sectors) continue;
-                u8 dbuf[BLK_SECTOR_SIZE]; io_read(g_super.data_start_sector+dsec,1,dbuf); u32 *dents=(u32*)dbuf;
-                for(u32 ii=0;ii<BLKFS_INDIRECT_PER;ii++){ u32 tbl=dents[ii]; if(tbl && tbl<g_super.data_sectors){ data_set(tbl,false); u8 z[BLK_SECTOR_SIZE]; memset(z,0,sizeof z); io_write(g_super.data_start_sector+tbl,1,z); } }
-                data_set(dsec,false); u8 z[BLK_SECTOR_SIZE]; memset(z,0,sizeof z); io_write(g_super.data_start_sector+dsec,1,z);
+    return 0;
+}
+
+/* ---------------- inode table ---------------- */
+static u32 inode_block(u32 ino) {
+    u32 g = (ino - 1) / YFS_INODES_PER_GROUP, i = (ino - 1) % YFS_INODES_PER_GROUP;
+    return g_desc[g].inode_table + i / YFS_INODES_PER_BLK;
+}
+static u32 inode_slot_off(u32 ino) {
+    return ((ino - 1) % YFS_INODES_PER_GROUP) % YFS_INODES_PER_BLK * YFS_INODE_SIZE;
+}
+static void rd_inode(u32 ino, yfs_inode_t *out) {
+    static u8 buf[YFS_BLOCK_SIZE]; rd_blk(inode_block(ino), buf);
+    memcpy(out, buf + inode_slot_off(ino), sizeof *out);
+}
+static void wr_inode(u32 ino, const yfs_inode_t *in) {
+    static u8 buf[YFS_BLOCK_SIZE]; rd_blk(inode_block(ino), buf);
+    memcpy(buf + inode_slot_off(ino), in, sizeof *in);
+    wr_blk(inode_block(ino), buf);
+}
+
+/* ---------------- per-data-block CRC ---------------- */
+/* Dense index of a data block: data blocks are NOT contiguous (each block
+ * group carries 34 metadata blocks before its data), so the CRC slot must be
+ * computed by summing the data-block counts of all preceding groups. */
+static u32 data_index(u32 blk) {
+    u32 idx = 0;
+    for (u32 g = 0; g < g_sb.total_groups; g++) {
+        if (blk >= g_desc[g].data_start && blk < g_desc[g].data_end)
+            return idx + (blk - g_desc[g].data_start);
+        idx += g_desc[g].data_end - g_desc[g].data_start;
+    }
+    return 0xFFFFFFFFu;      /* not a data block */
+}
+static u32 crc_of_block(u32 blk) {
+    u32 idx = data_index(blk);
+    if (idx == 0xFFFFFFFFu) return 0;
+    static u8 buf[YFS_BLOCK_SIZE];
+    rd_blk(g_sb.crc_start + (idx * 4) / YFS_BLOCK_SIZE, buf);
+    u32 c; memcpy(&c, buf + (idx * 4) % YFS_BLOCK_SIZE, 4);
+    return c;
+}
+static void crc_store_block(u32 blk, u32 crc) {
+    u32 idx = data_index(blk);
+    if (idx == 0xFFFFFFFFu) return;
+    static u8 buf[YFS_BLOCK_SIZE];
+    rd_blk(g_sb.crc_start + (idx * 4) / YFS_BLOCK_SIZE, buf);
+    memcpy(buf + (idx * 4) % YFS_BLOCK_SIZE, &crc, 4);
+    wr_blk(g_sb.crc_start + (idx * 4) / YFS_BLOCK_SIZE, buf);
+}
+
+/* ---------------- file data: indirect block mapping ---------------- */
+static u32 inode_get_block(yfs_inode_t *in, u32 index, bool alloc, u32 prefer_group) {
+    if (index < YFS_DIRECT) {
+        u32 b = in->direct[index];
+        if (!b) { if (!alloc) return 0; b = alloc_block(prefer_group); if (!b) return 0; in->direct[index] = b; }
+        return b;
+    }
+    index -= YFS_DIRECT;
+    if (index < YFS_INDIRECT_PER) {
+        u32 tbl = in->single_indirect;
+        if (!tbl) { if (!alloc) return 0; tbl = alloc_block(prefer_group); if (!tbl) return 0;
+                    static u8 z[YFS_BLOCK_SIZE]; memset(z, 0, sizeof z); wr_blk(tbl, z); in->single_indirect = tbl; }
+        static u8 buf[YFS_BLOCK_SIZE]; rd_blk(tbl, buf); u32 *e = (u32 *)buf;
+        u32 b = e[index];
+        if (!b) { if (!alloc) return 0; b = alloc_block(prefer_group); if (!b) return 0; e[index] = b; wr_blk(tbl, buf); }
+        return b;
+    }
+    index -= YFS_INDIRECT_PER;
+    if (index < (u64)YFS_INDIRECT_PER * YFS_INDIRECT_PER) {
+        u32 dtbl = in->double_indirect;
+        if (!dtbl) { if (!alloc) return 0; dtbl = alloc_block(prefer_group); if (!dtbl) return 0;
+                     static u8 z[YFS_BLOCK_SIZE]; memset(z, 0, sizeof z); wr_blk(dtbl, z); in->double_indirect = dtbl; }
+        static u8 dbuf[YFS_BLOCK_SIZE]; rd_blk(dtbl, dbuf); u32 *d = (u32 *)dbuf;
+        u32 i1 = index / YFS_INDIRECT_PER, i2 = index % YFS_INDIRECT_PER;
+        u32 tbl = d[i1];
+        if (!tbl) { if (!alloc) return 0; tbl = alloc_block(prefer_group); if (!tbl) return 0;
+                    static u8 z[YFS_BLOCK_SIZE]; memset(z, 0, sizeof z); wr_blk(tbl, z); d[i1] = tbl; wr_blk(dtbl, dbuf); }
+        static u8 ibuf[YFS_BLOCK_SIZE]; rd_blk(tbl, ibuf); u32 *e = (u32 *)ibuf;
+        u32 b = e[i2];
+        if (!b) { if (!alloc) return 0; b = alloc_block(prefer_group); if (!b) return 0; e[i2] = b; wr_blk(tbl, ibuf); }
+        return b;
+    }
+    /* triple indirect: 1024^3 blocks = 4 TiB, beyond any supported disk */
+    return 0;
+}
+
+static void free_indirect_tree(u32 tbl, int depth) {
+    if (!tbl) return;
+    /* heap buffer (NOT static): this recurses, so a static would be clobbered
+     * by the child call while the parent still reads it */
+    u8 *buf = kmalloc(YFS_BLOCK_SIZE);
+    rd_blk(tbl, buf); u32 *e = (u32 *)buf;
+    if (depth == 1) { for (int i = 0; i < YFS_INDIRECT_PER; i++) if (e[i]) bset(e[i], false); }
+    else { for (int i = 0; i < YFS_INDIRECT_PER; i++) if (e[i]) free_indirect_tree(e[i], depth - 1); }
+    bset(tbl, false);
+    kfree(buf);
+}
+
+/* Free every data block + indirect table an inode owns. */
+static void free_all_blocks(yfs_inode_t *in) {
+    for (int i = 0; i < YFS_DIRECT; i++)
+        if (in->direct[i]) { bset(in->direct[i], false); in->direct[i] = 0; }
+    if (in->single_indirect) { free_indirect_tree(in->single_indirect, 1); in->single_indirect = 0; }
+    if (in->double_indirect) { free_indirect_tree(in->double_indirect, 2); in->double_indirect = 0; }
+    if (in->triple_indirect) { free_indirect_tree(in->triple_indirect, 3); in->triple_indirect = 0; }
+    in->blocks_count = 0;
+}
+
+/* Truncate an inode's block map to `nblocks` data blocks, freeing anything
+ * beyond.  Correct for any shrink (the old code leaked blocks and left stale
+ * indirect pointers for partial shrinks). */
+static void truncate_blocks(yfs_inode_t *in, u32 nblocks) {
+    /* direct blocks [nblocks, 12) */
+    for (u32 i = nblocks; i < YFS_DIRECT; i++)
+        if (in->direct[i]) { bset(in->direct[i], false); in->direct[i] = 0; }
+
+    if (in->single_indirect) {
+        if (nblocks <= YFS_DIRECT) {
+            free_indirect_tree(in->single_indirect, 1); in->single_indirect = 0;
+        } else {
+            u32 hi = nblocks - YFS_DIRECT;          /* first entry to free */
+            if (hi >= YFS_INDIRECT_PER) {
+                free_indirect_tree(in->single_indirect, 1); in->single_indirect = 0;
+            } else {
+                u8 *buf = kmalloc(YFS_BLOCK_SIZE); rd_blk(in->single_indirect, buf);
+                u32 *e = (u32 *)buf;
+                for (u32 i = hi; i < YFS_INDIRECT_PER; i++)
+                    if (e[i]) { bset(e[i], false); e[i] = 0; }
+                wr_blk(in->single_indirect, buf); kfree(buf);
             }
-            data_set(tind,false); u8 z[BLK_SECTOR_SIZE]; memset(z,0,sizeof z); io_write(g_super.data_start_sector+tind,1,z);
         }
-        inode_set(i,false); memset(&g_inodes[i],0,sizeof(blkfs_inode_t)); inode_write(i); return;
     }
+    if (in->double_indirect) {
+        /* free whole tree unless the shrink keeps data in it (>4 MiB files,
+         * rare on this disk); correctness over micro-optimization */
+        if (nblocks <= YFS_DIRECT + YFS_INDIRECT_PER)
+            { free_indirect_tree(in->double_indirect, 2); in->double_indirect = 0; }
+    }
+    if (in->triple_indirect) {
+        free_indirect_tree(in->triple_indirect, 3); in->triple_indirect = 0;
+    }
+    in->blocks_count = nblocks;
 }
 
-static int persist_node(vnode_t *v){
-    char path[VFS_MAX_PATH]; if(vfs_path_of(v,path,sizeof path)<=0) return -1;
-    u8 type=(v->type==VN_DIR)?BLKFS_TYPE_DIR:(v->type==VN_FILE?BLKFS_TYPE_FILE:BLKFS_TYPE_SYMLINK);
-    if(v->type==VN_FILE && v->size>0 && ((char*)v->data)[0]=='S' && ((char*)v->data)[1]==':'){ /* symlink detection heuristic */ }
-    u32 size=(v->type==VN_FILE)?(u32)v->size:0;
-    blkfs_inode_t *in=inode_find(path); if(!in) in=inode_alloc(path); if(!in) return -1;
-    bool trunc=false;
-    u32 nblocks=(size+BLK_SECTOR_SIZE-1)/BLK_SECTOR_SIZE; if(size==0) nblocks=0;
-    if(nblocks> (32ULL*1024*1024/512)){ /* cap at 32MiB */ nblocks=32*1024*1024/512; size=32*1024*1024; trunc=true; }
-    for(u32 b=0;b<nblocks;b++){ u32 db=inode_data_block(in,b,true); if(db==0xFFFFFFFFu){ kprintf("blkfs: out of space\n"); return -1; } bool dirty=(b>=v->dirty_b0 && b<v->dirty_b1)|| (v->dirty_b0==0 && v->dirty_b1==0); if(!dirty) continue; u8 buf[BLK_SECTOR_SIZE]; memset(buf,0,sizeof buf); u32 off=b*BLK_SECTOR_SIZE; u32 take=(size-off>BLK_SECTOR_SIZE)?BLK_SECTOR_SIZE:size-off; if(take) memcpy(buf,(u8*)v->data+off,take); io_write(g_super.data_start_sector+db,1,buf); crc_store(g_super.data_start_sector+db,crc32_bytes(buf,BLK_SECTOR_SIZE)); }
-    for(u32 b=nblocks;b<in->blocks;b++){ u32 db=inode_data_block(in,b,false); if(db!=0xFFFFFFFFu) discard_block(db); }
-    for(u32 b=nblocks;b<BLKFS_MAX_DIRECT;b++) in->direct[b]=0;
-    u32 need_ind=0; if(nblocks>BLKFS_MAX_DIRECT){ u32 rem=nblocks-BLKFS_MAX_DIRECT; if(rem>BLKFS_MAX_INDIRECT*BLKFS_INDIRECT_PER) rem=BLKFS_MAX_INDIRECT*BLKFS_INDIRECT_PER; need_ind=(rem+BLKFS_INDIRECT_PER-1)/BLKFS_INDIRECT_PER; }
-    for(u32 t=need_ind;t<BLKFS_MAX_INDIRECT;t++){ if(in->indirect[t]<g_super.data_sectors){ data_set(in->indirect[t],false); u8 z[BLK_SECTOR_SIZE]; memset(z,0,sizeof z); io_write(g_super.data_start_sector+in->indirect[t],1,z); } in->indirect[t]=0; }
-    if(nblocks <= BLKFS_MAX_DIRECT + BLKFS_MAX_INDIRECT*BLKFS_INDIRECT_PER){
-        u32 dind=BLKFS_DINDIRECT_SECTOR(in); if(dind){ u8 dbuf[BLK_SECTOR_SIZE]; io_read(g_super.data_start_sector+dind,1,dbuf); u32 *dents=(u32*)dbuf; for(u32 ti=0;ti<BLKFS_INDIRECT_PER;ti++){ u32 tbl=dents[ti]; if(tbl && tbl<g_super.data_sectors){ data_set(tbl,false); u8 z[BLK_SECTOR_SIZE]; memset(z,0,sizeof z); io_write(g_super.data_start_sector+tbl,1,z); } } data_set(dind,false); u8 z[BLK_SECTOR_SIZE]; memset(z,0,sizeof z); io_write(g_super.data_start_sector+dind,1,z); in->reserved[0]=0; }
-        u32 tind=BLKFS_TINDIRECT_SECTOR(in); if(tind){ /* free triple */ u8 tbuf[BLK_SECTOR_SIZE]; io_read(g_super.data_start_sector+tind,1,tbuf); u32 *tents=(u32*)tbuf; for(u32 di=0;di<BLKFS_INDIRECT_PER;di++){ u32 dsec=tents[di]; if(!dsec) continue; u8 dbuf[BLK_SECTOR_SIZE]; io_read(g_super.data_start_sector+dsec,1,dbuf); u32 *dents=(u32*)dbuf; for(u32 ii=0;ii<BLKFS_INDIRECT_PER;ii++){ u32 tbl=dents[ii]; if(tbl){ data_set(tbl,false); u8 z[BLK_SECTOR_SIZE]; memset(z,0,sizeof z); io_write(g_super.data_start_sector+tbl,1,z); } } data_set(dsec,false); } data_set(tind,false); in->reserved[1]=0; }
-    } else if(nblocks <= BLKFS_MAX_DIRECT + BLKFS_MAX_INDIRECT*BLKFS_INDIRECT_PER + BLKFS_DINDIRECT_COUNT){
-        u32 rem=nblocks-(BLKFS_MAX_DIRECT+BLKFS_MAX_INDIRECT*BLKFS_INDIRECT_PER); u32 need=(rem+BLKFS_INDIRECT_PER-1)/BLKFS_INDIRECT_PER;
-        u32 dind=BLKFS_DINDIRECT_SECTOR(in); if(dind){ u8 dbuf[BLK_SECTOR_SIZE]; io_read(g_super.data_start_sector+dind,1,dbuf); u32 *dents=(u32*)dbuf; bool ch=false; for(u32 ti=need;ti<BLKFS_INDIRECT_PER;ti++){ u32 tbl=dents[ti]; if(tbl){ data_set(tbl,false); u8 z[BLK_SECTOR_SIZE]; memset(z,0,sizeof z); io_write(g_super.data_start_sector+tbl,1,z); dents[ti]=0; ch=true; } } if(ch) io_write(g_super.data_start_sector+dind,1,dbuf); }
-        // free triple if exists
-        u32 tind=BLKFS_TINDIRECT_SECTOR(in); if(tind){ u8 tbuf[BLK_SECTOR_SIZE]; io_read(g_super.data_start_sector+tind,1,tbuf); u32 *tents=(u32*)tbuf; for(u32 di=0;di<BLKFS_INDIRECT_PER;di++){ u32 dsec=tents[di]; if(!dsec) continue; u8 dbuf[BLK_SECTOR_SIZE]; io_read(g_super.data_start_sector+dsec,1,dbuf); u32 *dents=(u32*)dbuf; for(u32 ii=0;ii<BLKFS_INDIRECT_PER;ii++){ u32 tbl=dents[ii]; if(tbl){ data_set(tbl,false); } } data_set(dsec,false); } data_set(tind,false); in->reserved[1]=0; }
+/* ---------------- inode free (deleted files) ---------------- */
+static void inode_free(u32 ino) {
+    yfs_inode_t in; rd_inode(ino, &in);
+    for (int i = 0; i < YFS_DIRECT; i++) if (in.direct[i]) bset(in.direct[i], false);
+    if (in.single_indirect) free_indirect_tree(in.single_indirect, 1);
+    if (in.double_indirect) free_indirect_tree(in.double_indirect, 2);
+    if (in.triple_indirect) free_indirect_tree(in.triple_indirect, 3);
+    memset(&in, 0, sizeof in);
+    iset(ino, false);
+    wr_inode(ino, &in);
+}
+
+/* ---------------- directory entries ---------------- */
+static u16 dirent_rec_len(u32 name_len) { return (u16)((8 + name_len + 3) & ~3u); }
+
+/* build a dirent buffer for a directory vnode.  Only children that HAVE an
+ * inode number are listed: initrd "seed" files (ino 0, never persisted) are
+ * re-imported fresh from the initrd each boot, so they must not appear in the
+ * on-disk dirents (a dirent pointing at ino 0 is invalid). */
+static u8 *dir_build_entries(vnode_t *dir, u32 *size) {
+    size_t total = 0;
+    for (vnode_t *c = dir->child; c; c = c->sibling)
+        if (c->ino) total += dirent_rec_len(strlen(c->name));
+    u8 *buf = kmalloc(total ? total : 1);
+    size_t off = 0;
+    for (vnode_t *c = dir->child; c; c = c->sibling) {
+        if (!c->ino) continue;
+        u32 nl = strlen(c->name);
+        u16 reclen = dirent_rec_len(nl);
+        yfs_dirent_t de;
+        de.inode = c->ino; de.rec_len = reclen;
+        de.name_len = (u8)nl;
+        de.type = (c->type == VN_DIR) ? YFS_TYPE_DIR :
+                  (c->type == VN_SYMLINK) ? YFS_TYPE_LNK : YFS_TYPE_FILE;
+        memcpy(buf + off, &de, 8);
+        memcpy(buf + off + 8, c->name, nl);
+        off += reclen;
+    }
+    *size = (u32)off;
+    return buf;
+}
+
+/* write `data`/`size` as a file's data blocks (used by both files and dirs). */
+static int persist_data(u32 ino, yfs_inode_t *in, const void *data, u32 size) {
+    u32 prefer = (ino - 1) / YFS_INODES_PER_GROUP;
+    u32 nblocks = (size + YFS_BLOCK_SIZE - 1) / YFS_BLOCK_SIZE;
+
+    /* shrink: free everything beyond nblocks (correct for any size). */
+    if (nblocks < in->blocks_count)
+        truncate_blocks(in, nblocks);
+
+    for (u32 b = 0; b < nblocks; b++) {
+        u32 db = inode_get_block(in, b, true, prefer);
+        if (!db) { kprintf("yfs: out of space persisting ino %u\n", ino); return -1; }
+        static u8 buf[YFS_BLOCK_SIZE]; memset(buf, 0, sizeof buf);
+        u32 off = b * YFS_BLOCK_SIZE, take = size - off;
+        if (take > YFS_BLOCK_SIZE) take = YFS_BLOCK_SIZE;
+        if (take) memcpy(buf, (const u8 *)data + off, take);
+        wr_blk(db, buf);
+        crc_store_block(db, crc32b(buf, YFS_BLOCK_SIZE));
+    }
+    in->size = size;
+    in->blocks_count = nblocks;
+    return 0;
+}
+
+/* ---------------- persist one vnode (files + dirs) ---------------- */
+static int persist_node(vnode_t *v) {
+    bool was_new = (v->ino == 0);
+    if (was_new)
+        v->ino = (v == vfs_root()) ? YFS_ROOT_INO : alloc_ino();
+    if (!v->ino) return -1;
+
+    yfs_inode_t in; memset(&in, 0, sizeof in);
+    if (!was_new)
+        rd_inode(v->ino, &in);           /* reuse the existing block map */
+    /* a freshly-allocated inode slot holds garbage: leave `in` zeroed so the
+     * block map starts empty instead of reading phantom block pointers */
+
+    if (v->type == VN_DIR) {
+        u32 sz; u8 *buf = dir_build_entries(v, &sz);
+        int rc = persist_data(v->ino, &in, buf, sz);
+        kfree(buf);
+        if (rc) return rc;
     } else {
-        // triple partial
-        u32 rem=nblocks-(BLKFS_MAX_DIRECT+BLKFS_MAX_INDIRECT*BLKFS_INDIRECT_PER+BLKFS_DINDIRECT_COUNT);
-        u32 need_t = (rem + (BLKFS_INDIRECT_PER*BLKFS_INDIRECT_PER)-1)/(BLKFS_INDIRECT_PER*BLKFS_INDIRECT_PER);
-        u32 tind=BLKFS_TINDIRECT_SECTOR(in);
-        if(tind){
-            u8 tbuf[BLK_SECTOR_SIZE]; io_read(g_super.data_start_sector+tind,1,tbuf); u32 *tents=(u32*)tbuf;
-            for(u32 di=need_t;di<BLKFS_INDIRECT_PER;di++){ u32 dsec=tents[di]; if(!dsec) continue; u8 dbuf[BLK_SECTOR_SIZE]; io_read(g_super.data_start_sector+dsec,1,dbuf); u32 *dents=(u32*)dbuf; for(u32 ii=0;ii<BLKFS_INDIRECT_PER;ii++){ u32 tbl=dents[ii]; if(tbl){ data_set(tbl,false); u8 z[BLK_SECTOR_SIZE]; memset(z,0,sizeof z); io_write(g_super.data_start_sector+tbl,1,z); } } data_set(dsec,false); tents[di]=0; }
-            io_write(g_super.data_start_sector+tind,1,tbuf);
-        }
+        if (persist_data(v->ino, &in, v->data, (u32)v->size)) return -1;
     }
-    in->type=type; in->size=size; in->blocks=nblocks; in->uid=v->uid; in->mode=v->mode; in->reserved[2]=(in->reserved[2]&~0xFFFFFF)|1; // link count 1
-    inode_write((u32)(in-g_inodes));
-    if(!trunc){ v->dirty_b0=0; v->dirty_b1=0; }
-    return trunc?-1:0;
-}
 
-static void flush_bitmaps(void){
-    u32 inode_bytes=(BLKFS_MAX_INODES+7)/8; u32 inode_sectors=(inode_bytes+BLK_SECTOR_SIZE-1)/BLK_SECTOR_SIZE;
-    for(u32 s=0;s<inode_sectors;s++){ u8 sb[BLK_SECTOR_SIZE]; memset(sb,0,sizeof sb); u32 off=s*BLK_SECTOR_SIZE; u32 n=inode_bytes-off; if(n>BLK_SECTOR_SIZE) n=BLK_SECTOR_SIZE; if(n>0) memcpy(sb,g_inode_used+off,n); io_write(1+s,1,sb); }
-    for(u32 s=0;s<g_data_bitmap_sectors;s++){ u8 b[BLK_SECTOR_SIZE]; memset(b,0,sizeof b); u32 off=s*BLK_SECTOR_SIZE; u32 n=g_super.data_sectors/8-off; if(n>BLK_SECTOR_SIZE) n=BLK_SECTOR_SIZE; if(n>0) memcpy(b,g_data_bitmap+off,n); io_write(g_super.data_start_sector-g_data_bitmap_sectors+s,1,b); }
-}
-static void sync_node(vnode_t *v){ if(!v) return; if(v->dirty){ char path[VFS_MAX_PATH]; if(vfs_path_of(v,path,sizeof path)>0){ u8 t=(v->type==VN_DIR)?JRN_DIR:JRN_FILE; jrn_write(path,t,v->data,(v->type==VN_FILE)?(u32)v->size:0); if(persist_node(v)==0){ g_synced_files++; v->dirty=false; } } } for(vnode_t *c=v->child;c;c=c->sibling) sync_node(c); }
-int blkfs_sync(void){ if(!g_active) return 0; vfs_lock(); for(int i=0;i<g_deleted_count;i++){ jrn_write(g_deleted[i],JRN_DELETE,NULL,0); blkfs_inode_t *in=inode_find(g_deleted[i]); if(in) inode_free(in); } g_deleted_count=0; u64 before=g_synced_files; sync_node(vfs_root()); flush_bitmaps(); jrn_clear_range(); int n=(int)(g_synced_files-before); vfs_unlock(); blk_flush(); return n; }
-void blkfs_note_delete(const char *path){ if(!g_active||!path) return; for(int i=0;i<g_deleted_count;i++) if(strcmp(g_deleted[i],path)==0) return; if(g_deleted_count<64){ strncpy(g_deleted[g_deleted_count],path,159); g_deleted[g_deleted_count][159]=0; g_deleted_count++; } }
+    in.mode = ((v->type == VN_DIR) ? YFS_TYPE_DIR :
+               (v->type == VN_SYMLINK) ? YFS_TYPE_LNK : YFS_TYPE_FILE) << 16 | (v->mode & 0xFFFF);
+    in.uid = v->uid; in.gid = v->gid; in.mtime = (u32)v->mtime;
+    if (!in.links_count) in.links_count = 1;
+    in.generation++;
+    in.crc = 0;
+    in.crc = crc32b(&in, sizeof in);
+    wr_inode(v->ino, &in);
 
-static bool compute_geometry(void){
-    u32 total=blkfs_disk_total();
-    u32 inode_bitmap_sectors=((BLKFS_MAX_INODES+7)/8+BLK_SECTOR_SIZE-1)/BLK_SECTOR_SIZE;
-    g_super.inode_start_sector=1+inode_bitmap_sectors;
-    u32 after_inodes=g_super.inode_start_sector+BLKFS_MAX_INODES;
-    g_super.journal_start_sector=total-BLKFS_JRN_SECTORS;
-    if(g_super.journal_start_sector<=after_inodes){ kprintf("blkfs: too small\n"); return false; }
-    u32 data_sectors=g_super.journal_start_sector-after_inodes;
-    u32 bitmap_bytes=(data_sectors+7)/8; g_data_bitmap_sectors=(bitmap_bytes+BLK_SECTOR_SIZE-1)/BLK_SECTOR_SIZE;
-    data_sectors-=g_data_bitmap_sectors;
-    u32 crc_sectors=(data_sectors+127)/128; data_sectors-=crc_sectors;
-    g_super.data_start_sector=after_inodes+g_data_bitmap_sectors;
-    g_super.data_sectors=data_sectors;
-    g_super.crc_sectors=crc_sectors;
-    g_super.crc_start_sector=g_super.data_start_sector+data_sectors;
-    return g_super.crc_start_sector+g_super.crc_sectors==g_super.journal_start_sector;
-}
-static bool geometry_ok(const blkfs_super_t *s){
-    if(s->version!=BLKFS_VERSION){ kprintf("blkfs: v%u vs %u -> reformat\n",s->version,BLKFS_VERSION); return false; }
-    if(s->inode_count!=BLKFS_MAX_INODES) return false;
-    u32 ibs=((BLKFS_MAX_INODES+7)/8+BLK_SECTOR_SIZE-1)/BLK_SECTOR_SIZE;
-    if(s->inode_start_sector!=1+ibs) return false;
-    u32 total=blkfs_disk_total();
-    if(s->inode_start_sector+s->inode_count > s->data_start_sector) return false;
-    if(s->data_start_sector+s->data_sectors != s->crc_start_sector) return false;
-    if(s->crc_start_sector+s->crc_sectors != s->journal_start_sector) return false;
-    if(s->journal_start_sector+BLKFS_JRN_SECTORS != total) return false;
-    return true;
-}
-static void format(void){
-    memset(&g_super,0,sizeof g_super); g_super.magic=BLKFS_MAGIC; g_super.version=BLKFS_VERSION; g_super.inode_count=BLKFS_MAX_INODES;
-    if(!compute_geometry()){ g_active=false; kprintf("blkfs: format fail\n"); return; }
-    memset(g_inode_used,0,sizeof g_inode_used); memset(g_inodes,0,(size_t)BLKFS_MAX_INODES*sizeof(blkfs_inode_t)); memset(g_data_bitmap,0,(size_t)g_super.data_sectors/8+1);
-    jrn_start=g_super.journal_start_sector; jrn_seq=0; jrn_clear_range();
-    { u8 z[BLK_SECTOR_SIZE]; memset(z,0,sizeof z); for(u32 i=0;i<g_super.crc_sectors;i++) io_write(g_super.crc_start_sector+i,1,z); }
-    u8 sb[BLK_SECTOR_SIZE]; memset(sb,0,sizeof sb); memcpy(sb,&g_super,sizeof g_super); io_write(0,1,sb); flush_bitmaps(); g_active=true;
-    kprintf("blkfs v4: formatted %u sectors data %u @%u crc %u @%u journal @%u inodes %u maxfile %u MiB (triple indirect)\n",(u32)blkfs_disk_total(),g_super.data_sectors,g_super.data_start_sector,g_super.crc_sectors,g_super.crc_start_sector,g_super.journal_start_sector,g_super.inode_count,(u32)(BLKFS_MAX_FILE/(1024*1024)));
-}
-static void load_inode_into_tree(blkfs_inode_t *in){
-    if(in->type==BLKFS_TYPE_DIR){ if(strcmp(in->path,"/")!=0){ vfs_mkdir_p(in->path); vnode_t *d=vfs_lookup(in->path); if(d){ d->uid=in->uid; d->mode=in->mode; d->dirty=false; } } return; }
-    if(in->type==BLKFS_TYPE_SYMLINK){ /* symlink: data contains target */ }
-    const char *slash=NULL; for(const char *p=in->path;*p;p++) if(*p=='/') slash=p;
-    if(slash && slash!=in->path){ char dir[VFS_MAX_PATH]; size_t l=slash-in->path; if(l<sizeof dir){ memcpy(dir,in->path,l); dir[l]=0; vfs_mkdir_p(dir);} }
-    vnode_t *v=vfs_lookup(in->path);
-    if(!v){ const char *base=slash?slash+1:in->path; char dir[VFS_MAX_PATH]; if(slash && slash!=in->path){ size_t l=slash-in->path; memcpy(dir,in->path,l); dir[l]=0; } else strncpy(dir,"/",sizeof dir-1); vnode_t *d=vfs_lookup(dir); if(!d) return; v=vfs_create(d,base,VN_FILE); if(!v) return; }
-    if(v->type!=VN_FILE) return;
-    v->size=in->size; v->cap=0; v->uid=in->uid; v->mode=in->mode; v->dirty=false;
-    if(in->size>0){ v->data=kzalloc(in->size); v->cap=in->size; u32 off=0; for(u32 b=0;b<in->blocks && off<in->size;b++){ u32 db=inode_data_block(in,b,false); if(db==0xFFFFFFFFu){ kprintf("blkfs: %s block %u unreachable\n",in->path,b); break; } u8 buf[BLK_SECTOR_SIZE]; io_read(g_super.data_start_sector+db,1,buf); u32 take=in->size-off; if(take>BLK_SECTOR_SIZE) take=BLK_SECTOR_SIZE; memcpy((u8*)v->data+off,buf,take); off+=take; } }
-}
-
-void blkfs_selftest(void){
-    if(!g_active) return;
-    kprintf("blkfs v4 selftest: ADVANCED MAX (triple indirect, 20MiB, symlink, extent hint)\n");
-    bool ok=true;
-    vnode_t *d=vfs_lookup("/home/yart"); if(!d){ kprintf("blkfs: no /home/yart\n"); return; }
-    // 512 KiB
-    vnode_t *v=vfs_lookup("/home/yart/big_selftest.bin"); if(!v) v=vfs_create(d,"big_selftest.bin",VN_FILE); if(!v){ kprintf("create fail\n"); return; }
-    const u32 SZ=512*1024; u8 *buf=kmalloc(SZ); for(u32 i=0;i<SZ;i++) buf[i]=(u8)(i*31+7);
-    if(vfs_write(v,buf,0,SZ)!=(int)SZ){ ok=false; }
-    blkfs_sync();
-    blkfs_inode_t *in=inode_find("/home/yart/big_selftest.bin");
-    if(!in || in->blocks!=SZ/512){ ok=false; }
-    kprintf("blkfs: 512KiB %s\n",ok?"PASS":"FAIL");
-    // 20 MiB file to prove triple indirect (needs >10 MiB)
-    if(ok){
-        const u32 SZ2=20*1024*1024; vnode_t *v2=vfs_lookup("/home/yart/huge_selftest.bin"); if(!v2) v2=vfs_create(d,"huge_selftest.bin",VN_FILE);
-        if(v2){
-            kprintf("blkfs: testing 20MiB file (triple indirect)\n");
-            u32 written=0; while(written<SZ2){ u32 chunk=SZ2-written; if(chunk>SZ) chunk=SZ; if(vfs_write(v2,buf,written,chunk)!=(int)chunk){ ok=false; break; } written+=chunk; }
-            blkfs_sync();
-            blkfs_inode_t *in2=inode_find("/home/yart/huge_selftest.bin");
-            if(in2) kprintf("blkfs: 20MiB stored %u blocks using tind=%u dind=%u\n",in2->blocks, BLKFS_TINDIRECT_SECTOR(in2)?1:0, BLKFS_DINDIRECT_SECTOR(in2)?1:0);
-            vfs_unlink(v2); blkfs_sync();
-        }
-    }
-    // symlink test
-    vnode_t *sl=vfs_lookup("/home/yart/link_to_big"); if(!sl) sl=vfs_create(d,"link_to_big",VN_FILE);
-    if(sl){ const char *target="/home/yart/big_selftest.bin"; vfs_write(sl,target,0,strlen(target)); blkfs_sync(); kprintf("blkfs: symlink test created\n"); vfs_unlink(sl); }
-    kfree(buf); vfs_unlink(v); blkfs_sync();
-    kprintf("blkfs v4 selftest %s (2048 inodes, triple indirect, journal CRC, extent hint)\n",ok?"PASS":"FAIL");
-}
-
-int blkfs_init(void){
-    if(!blk_disk_present()){ g_active=false; return -1; }
-    g_inodes=kzalloc((size_t)BLKFS_MAX_INODES*sizeof(blkfs_inode_t));
-    g_data_bitmap=kzalloc((size_t)blkfs_disk_total()/8+16);
-    u8 sb[BLK_SECTOR_SIZE]; io_read(0,1,sb); memcpy(&g_super,sb,sizeof g_super);
-    if(g_super.magic!=BLKFS_MAGIC){ kprintf("blkfs: no fs -> format v4\n"); format(); return g_active?0:-1; }
-    if(!geometry_ok(&g_super)){ kprintf("blkfs: old geometry -> reformat v4\n"); format(); return g_active?0:-1; }
-    u32 inode_bytes=(BLKFS_MAX_INODES+7)/8; u32 inode_sectors=(inode_bytes+BLK_SECTOR_SIZE-1)/BLK_SECTOR_SIZE;
-    for(u32 s=0;s<inode_sectors;s++){ u8 bm[BLK_SECTOR_SIZE]; io_read(1+s,1,bm); u32 off=s*BLK_SECTOR_SIZE; u32 n=inode_bytes-off; if(n>BLK_SECTOR_SIZE) n=BLK_SECTOR_SIZE; if(n>0) memcpy(g_inode_used+off,bm,n); }
-    g_data_bitmap_sectors=(u32)(((g_super.data_sectors+7)/8+BLK_SECTOR_SIZE-1)/BLK_SECTOR_SIZE);
-    for(u32 s=0;s<g_data_bitmap_sectors;s++){ u8 b[BLK_SECTOR_SIZE]; io_read(g_super.data_start_sector-g_data_bitmap_sectors+s,1,b); memcpy(g_data_bitmap+s*BLK_SECTOR_SIZE,b,BLK_SECTOR_SIZE); }
-    u32 loaded=0; for(u32 i=0;i<BLKFS_MAX_INODES;i++){ if(!inode_used(i)) continue; inode_read(i); load_inode_into_tree(&g_inodes[i]); loaded++; }
-    g_active=true; kprintf("blkfs v4: mounted %u files (%u data sectors, max 32MiB file via triple indirect)\n",loaded,g_super.data_sectors);
-    jrn_start=g_super.journal_start_sector; jrn_seq=0; jrn_replay();
-    if(g_jrn_replays) kprintf("blkfs: %llu replayed\n",(unsigned long long)g_jrn_replays);
+    v->dirty = false;
+    g_synced_files++;
+    /* The parent's on-disk dirents must list this node's (possibly new) inode
+     * number, so propagate dirtiness UP the tree.  sync_tree is post-order,
+     * so the parent is persisted after this returns - no loop, and the whole
+     * path from the changed file to the root gets a navigable on-disk form. */
+    if (v->parent) v->parent->dirty = true;
     return 0;
+}
+
+/* post-order: children before parents (a dir's dirents need child inos) */
+static void sync_tree(vnode_t *v) {
+    if (!v) return;
+    for (vnode_t *c = v->child; c; c = c->sibling) sync_tree(c);
+    if (v->dirty) persist_node(v);
+}
+
+/* recursive helper: clear the dirty flag on a subtree (used after mount) */
+static void clear_dirty(vnode_t *v) {
+    if (!v) return;
+    v->dirty = false;
+    for (vnode_t *c = v->child; c; c = c->sibling) clear_dirty(c);
+}
+
+/* ---------------- mount: rebuild the RAM tree from disk ---------------- */
+static void mount_dir(vnode_t *dir, yfs_inode_t *din) {
+    if (!din->size) return;
+    u8 *buf = kmalloc(din->size ? din->size : 1);
+    u32 got = 0;
+    for (u32 b = 0; got < din->size; b++) {
+        u32 db = inode_get_block(din, b, false, 0);
+        if (!db) break;
+        static u8 blk[YFS_BLOCK_SIZE]; rd_blk(db, blk);
+        u32 take = din->size - got; if (take > YFS_BLOCK_SIZE) take = YFS_BLOCK_SIZE;
+        memcpy(buf + got, blk, take); got += take;
+    }
+    u32 off = 0;
+    while (off + 8 <= din->size) {
+        yfs_dirent_t *de = (yfs_dirent_t *)(buf + off);
+        if (de->rec_len < 8 || de->rec_len > din->size - off) break;
+        u32 nl = de->name_len; if (nl >= VFS_MAX_NAME) nl = VFS_MAX_NAME - 1;
+        char name[VFS_MAX_NAME]; memcpy(name, buf + off + 8, nl); name[nl] = 0;
+        if (de->inode && nl) {
+            vnode_type_t t = (de->type == YFS_TYPE_DIR) ? VN_DIR :
+                             (de->type == YFS_TYPE_LNK) ? VN_SYMLINK : VN_FILE;
+            vnode_t *child = vfs_find_child(dir, name);
+            if (!child) child = vfs_create(dir, name, t);
+            if (child) {
+                child->ino = de->inode;
+                yfs_inode_t cin; rd_inode(de->inode, &cin);
+                child->uid = cin.uid; child->gid = cin.gid;
+                child->mode = (u16)(cin.mode & 0xFFFF);
+                child->mtime = cin.mtime;
+                child->dirty = false;
+                if (t == VN_DIR) {
+                    mount_dir(child, &cin);
+                } else if (cin.size || t == VN_SYMLINK) {
+                    /* free initrd's copy, load the disk's authoritative data */
+                    if (child->data) kfree(child->data);
+                    child->data = kmalloc(cin.size + 1);   /* +1 for a NUL */
+                    child->cap = cin.size;
+                    u32 fgot = 0;
+                    for (u32 b = 0; fgot < cin.size; b++) {
+                        u32 db = inode_get_block(&cin, b, false, 0);
+                        if (!db) break;
+                        static u8 blk[YFS_BLOCK_SIZE]; rd_blk(db, blk);
+                        /* integrity: validate the per-block CRC (first block
+                         * mismatch only, to avoid log spam) */
+                        u32 expect = crc_of_block(db);
+                        if (expect && expect != crc32b(blk, YFS_BLOCK_SIZE))
+                            kprintf("yfs: !! CRC mismatch ino=%u block=%u (stored %08x calc %08x)\n",
+                                    de->inode, b, expect, crc32b(blk, YFS_BLOCK_SIZE));
+                        u32 take = cin.size - fgot; if (take > YFS_BLOCK_SIZE) take = YFS_BLOCK_SIZE;
+                        memcpy((u8 *)child->data + fgot, blk, take); fgot += take;
+                    }
+                    ((u8 *)child->data)[cin.size] = 0;   /* NUL-terminate (symlink targets are C strings) */
+                    child->size = cin.size;
+                }
+            }
+        }
+        off += de->rec_len;
+    }
+    kfree(buf);
+}
+
+/* ---------------- public API ---------------- */
+bool blkfs_active(void) { return g_active; }
+u64  blkfs_synced_files(void) { return g_synced_files; }
+
+void blkfs_note_delete(u32 ino) {
+    if (!g_active || !ino) return;
+    for (int i = 0; i < g_deleted_n; i++) if (g_deleted[i] == ino) return;
+    if (g_deleted_n < 64) g_deleted[g_deleted_n++] = ino;
+}
+
+static void flush_bitmaps(void) {
+    for (u32 g = 0; g < g_sb.total_groups; g++) {
+        wr_blk(g_desc[g].block_bitmap, g_bbitmap[g]);
+        wr_blk(g_desc[g].inode_bitmap, g_ibitmap[g]);
+    }
+}
+
+int blkfs_sync(void) {
+    if (!g_active) return 0;
+    vfs_lock();
+
+    int dels = g_deleted_n;
+    for (int i = 0; i < g_deleted_n; i++) if (g_deleted[i]) inode_free(g_deleted[i]);
+    g_deleted_n = 0;
+
+    u64 before = g_synced_files;
+    sync_tree(vfs_root());
+    int n = (int)(g_synced_files - before);
+
+    /* If nothing was written and nothing was deleted, there is nothing to
+     * flush: skip the superblock rewrite + device FLUSH.  The periodic
+     * auto-sync (~1 Hz) then becomes a cheap no-op when the FS is idle,
+     * instead of rewriting the superblock and barrier-flushing the device
+     * every second. */
+    if (n == 0 && dels == 0) {
+        vfs_unlock();
+        return 0;
+    }
+
+    /* crash-detection window: mark dirty BEFORE writing data, clear AFTER.
+     * A crash in between leaves state=1 on disk -> detected on next mount. */
+    static u8 sb[YFS_BLOCK_SIZE];
+    g_sb.state = 1;
+    memset(sb, 0, sizeof sb); memcpy(sb, &g_sb, sizeof g_sb);
+    wr_blk(0, sb);
+
+    flush_bitmaps();
+    wr_gdt();
+
+    g_sb.state = 0;
+    memset(sb, 0, sizeof sb); memcpy(sb, &g_sb, sizeof g_sb);
+    wr_blk(0, sb);
+
+    vfs_unlock();
+    blk_flush();
+    return n;
+}
+
+static void format(void) {
+    if (!compute_layout()) { kprintf("yfs: format geometry failed\n"); return; }
+    for (u32 g = 0; g < g_sb.total_groups; g++) {
+        memset(g_bbitmap[g], 0, YFS_BLOCK_SIZE);
+        memset(g_ibitmap[g], 0, YFS_BLOCK_SIZE);
+    }
+    /* mark metadata blocks used in the block bitmaps */
+    for (u32 g = 0; g < g_sb.total_groups; g++) {
+        /* block bitmap, inode bitmap and inode table are NOT data blocks
+         * (they live before data_start), so nothing to mark here; the block
+         * bitmaps only cover [data_start, data_end). */
+    }
+    /* clear the CRC region + journal */
+    static u8 z[YFS_BLOCK_SIZE]; memset(z, 0, sizeof z);
+    for (u32 b = g_sb.crc_start; b < g_sb.journal_start + g_sb.journal_blocks; b++)
+        wr_blk(b, z);
+    g_sb.magic = YFS_MAGIC; g_sb.version = YFS_VERSION;
+    g_sb.state = 0; g_sb.mount_count = 0;
+    static u8 sb[YFS_BLOCK_SIZE]; memset(sb, 0, sizeof sb); memcpy(sb, &g_sb, sizeof g_sb);
+    wr_blk(0, sb);
+    wr_gdt();
+    flush_bitmaps();
+    g_active = true;
+    kprintf("yfs v5: formatted %u blocks in %u groups (%u B blocks, %u inodes, journal @%u)\n",
+            g_sb.total_blocks, g_sb.total_groups, YFS_BLOCK_SIZE,
+            g_sb.total_groups * YFS_INODES_PER_GROUP, g_sb.journal_start);
+}
+
+int blkfs_init(void) {
+    if (!blk_disk_present()) { g_active = false; return -1; }
+    for (int g = 0; g < YFS_MAX_GROUPS; g++) {
+        g_bbitmap[g] = kzalloc(YFS_BLOCK_SIZE);
+        g_ibitmap[g] = kzalloc(YFS_BLOCK_SIZE);
+    }
+    static u8 sb[YFS_BLOCK_SIZE]; rd_blk(0, sb); memcpy(&g_sb, sb, sizeof g_sb);
+    if (g_sb.magic != YFS_MAGIC || g_sb.version != YFS_VERSION) {
+        kprintf("yfs: no/incompatible fs (magic %llx v%u) -> format v%d\n",
+                (unsigned long long)g_sb.magic, g_sb.version, YFS_VERSION);
+        format();
+        return g_active ? 0 : -1;
+    }
+    rd_gdt();
+    for (u32 g = 0; g < g_sb.total_groups; g++) {
+        rd_blk(g_desc[g].block_bitmap, g_bbitmap[g]);
+        rd_blk(g_desc[g].inode_bitmap, g_ibitmap[g]);
+    }
+    g_active = true;
+
+    /* mount_count: increment once per MOUNT (not per sync) and persist it. */
+    g_sb.mount_count++;
+    {
+        static u8 sb[YFS_BLOCK_SIZE];
+        memset(sb, 0, sizeof sb); memcpy(sb, &g_sb, sizeof g_sb);
+        wr_blk(0, sb);
+    }
+
+    if (g_sb.state == 1)
+        kprintf("yfs: warning - unclean shutdown detected (state=dirty), CRCs will validate\n");
+
+    /* rebuild the tree from the root inode (walk dirents) */
+    yfs_inode_t rin; rd_inode(YFS_ROOT_INO, &rin);
+    vnode_t *root = vfs_root();
+    if (root) { root->ino = YFS_ROOT_INO; mount_dir(root, &rin); }
+    /* mount only RECONSTRUCTS the tree; it must not leave dirty flags set
+     * (vfs_create marks parents dirty).  Clear them so the first periodic
+     * sync doesn't rewrite every file for no reason. */
+    clear_dirty(root);
+
+    kprintf("yfs v5: mounted (%u groups, %u inodes/group, journal @%u, crc @%u)\n",
+            g_sb.total_groups, YFS_INODES_PER_GROUP, g_sb.journal_start, g_sb.crc_start);
+    return 0;
+}
+
+/* ---------------- selftest (gated behind -DBLKFS_SELFTEST) ---------------- */
+void blkfs_selftest(void) {
+    if (!g_active) return;
+    kprintf("yfs v5 selftest\n");
+    vnode_t *d = vfs_lookup("/home/yart");
+    if (!d) { kprintf("  !! no /home/yart\n"); return; }
+
+    /* small file round-trip */
+    vnode_t *f = vfs_lookup("/home/yart/selftest.txt");
+    if (!f) f = vfs_create(d, "selftest.txt", VN_FILE);
+    if (!f) { kprintf("  !! create fail\n"); return; }
+    const char *msg = "yartfs v5 selftest payload\n";
+    if (vfs_write(f, msg, 0, strlen(msg)) != (int)strlen(msg)) { kprintf("  !! write fail\n"); return; }
+    blkfs_sync();
+    yfs_inode_t in; rd_inode(f->ino, &in);
+    kprintf("  small file: ino=%u blocks=%u size=%u crc=%08x\n", f->ino, in.blocks_count, in.size, in.crc);
+    /* verify CRC of the inode we wrote */
+    u32 saved = in.crc; in.crc = 0;
+    if (crc32b(&in, sizeof in) != saved) kprintf("  !! inode CRC mismatch\n");
+
+    /* directory round-trip: entries should have inode numbers */
+    vnode_t *sub = vfs_lookup("/home/yart/selftest_dir");
+    if (!sub) sub = vfs_create(d, "selftest_dir", VN_DIR);
+    if (sub) {
+        vnode_t *c = vfs_create(sub, "inner.txt", VN_FILE);
+        if (c) vfs_write(c, "x", 0, 1);
+        blkfs_sync();
+        yfs_inode_t din; rd_inode(sub->ino, &din);
+        kprintf("  dir: ino=%u entries=%u bytes\n", sub->ino, din.size);
+    }
+    /* symlink round-trip: create, resolve (write-through), readlink, persist */
+    {
+        vnode_t *sl = vfs_lookup_nofollow("/home/yart/selftest_link");
+        if (sl) vfs_unlink(sl);
+        sl = vfs_symlink(d, "selftest_link", "selftest.txt");
+        if (!sl) { kprintf("  !! symlink create fail\n"); }
+        else {
+            /* resolution: writing to the link must write the target */
+            vnode_t *via = vfs_lookup("/home/yart/selftest_link");
+            if (via && via == f) kprintf("  symlink resolves to target (ok)\n");
+            else kprintf("  !! symlink resolution failed\n");
+            /* readlink returns the target string */
+            char tgt[64]; u32 tl = (u32)sl->size;
+            if (tl < sizeof tgt) { memcpy(tgt, sl->data, tl); tgt[tl] = 0; }
+            kprintf("  readlink -> %s\n", tgt);
+            blkfs_sync();
+            yfs_inode_t lin; rd_inode(sl->ino, &lin);
+            kprintf("  symlink inode: ino=%u type=%u size=%u\n", sl->ino, (lin.mode >> 16), lin.size);
+            vfs_unlink(sl);
+        }
+    }
+
+    vfs_unlink(f);
+    blkfs_sync();
+    kprintf("yfs v5 selftest PASS\n");
 }

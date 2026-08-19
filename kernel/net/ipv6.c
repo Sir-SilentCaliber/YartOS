@@ -204,7 +204,7 @@ int net_icmp6_ping(const u8 addr[16], u64 *rtt_ticks) {
     for (int i = 0; i < 32; i++) body[i] = (u8)(0x40 + i);
     u64 t0 = pit_ticks();
     if (icmp6_send(a, ICMP6_ECHO_REQUEST, 0, p, body, 32) != 0) return -1;
-    while (pit_ticks() - t0 < 150) {
+    while (pit_ticks() - t0 < MS_TO_TICKS(1500)) {
         net_pump_ipv6();
         if (g_ping6_hit) {
             if (rtt_ticks) *rtt_ticks = pit_ticks() - t0;
@@ -359,12 +359,12 @@ void net_ipv6_poll(void) {
     static u64 last_action;
     static u64 step_start;
     if (g_ip6_ok) return;
-    if (pit_ticks() - last_action < 10) return;
+    if (pit_ticks() - last_action < MS_TO_TICKS(100)) return;
     last_action = pit_ticks();
 
     /* per-step timeout: a silent router must not wedge the state machine */
     if (v6_step != V6_STEP_RS && v6_step != V6_STEP_PROBE &&
-        pit_ticks() - step_start > 60) {
+        pit_ticks() - step_start > MS_TO_TICKS(600)) {
         kprintf("ipv6: step %d timed out - next candidate\n", v6_step);
         v6_step = V6_STEP_PROBE;
         step_start = pit_ticks();

@@ -142,7 +142,7 @@ static u16  g_ping_reply_id, g_ping_reply_seq;
 
 /* ---- ARP cache (small, with TTL) ---- */
 #define ARP_CACHE 8
-#define ARP_TTL 300                       /* 3 s at 100 Hz */
+#define ARP_TTL MS_TO_TICKS(3000)         /* 3 s */
 static struct { u32 ip; u8 mac[6]; bool valid; u64 time; } g_arp[ARP_CACHE];
 
 /* DHCP */
@@ -215,7 +215,7 @@ int net_dns_resolve(const char *host, u32 *out_ip) {
         if (udp_raw_send(g_ip, g_dns, DNS_CLIENT_PORT, UDP_DNS, q, (u16)o) != 0)
             break;
         u64 t0 = pit_ticks();
-        while (pit_ticks() - t0 < 40 && !g_dns_rx_len) {
+        while (pit_ticks() - t0 < MS_TO_TICKS(400) && !g_dns_rx_len) {
             net_pump();                    /* process the reply */
             __asm__ volatile("pause");
         }
@@ -407,7 +407,7 @@ int net_arp_resolve(u32 ip) {
         net_pump();                      /* process the ARP reply */
         /* 1.5 s timeout: 0.5 s was too tight under emulation and after
          * the 3 s ARP-TTL expiry (the reply was still in flight). */
-        if (pit_ticks() - t0 > 150) return -1;
+        if (pit_ticks() - t0 > MS_TO_TICKS(1500)) return -1;
         __asm__ volatile("pause");
     }
     return 0;
@@ -463,7 +463,7 @@ int net_icmp_ping(u32 ip, u64 *rtt_ticks) {
     r[2] = (u8)(chk >> 8); r[3] = (u8)(chk & 0xFF);
     u64 t0 = pit_ticks();
     if (net_ip_send(g_ip, ip, 1, r, 40) != 0) return -1;
-    while (pit_ticks() - t0 < 150) {
+    while (pit_ticks() - t0 < MS_TO_TICKS(1500)) {
         net_pump();
         if (g_ping_hit && g_ping_reply_src == ip &&
             g_ping_reply_id == g_ping_id && g_ping_reply_seq == g_ping_seq) {
@@ -724,7 +724,7 @@ void net_service(void) {
             g_dhcp_state = DHCP_DISCOVER;
             dhcp_send(DHCP_DISCOVER, 0, 0);
             kprintf("net: DHCP DISCOVER (xid=0x%x)\n", g_xid);
-        } else if (pit_ticks() - g_dhcp_last > 20) {
+        } else if (pit_ticks() - g_dhcp_last > MS_TO_TICKS(200)) {
             if (g_dhcp_state == DHCP_DISCOVER) dhcp_send(DHCP_DISCOVER, 0, 0);
             else if (g_dhcp_state == DHCP_REQUEST)
                 dhcp_send(DHCP_REQUEST, g_offer_ip, g_server_id);

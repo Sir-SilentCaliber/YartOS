@@ -394,6 +394,7 @@ add("dock_browser",      "web-browser",                    "apps",   SZ_DOCK)
 add("dock_editor",       "accessories-text-editor",        "apps",   SZ_DOCK)
 add("dock_settings",     "preferences-system",             "categories", SZ_DOCK)
 add("dock_launcher",    "applications-all",               "apps",   SZ_DOCK)
+add("dock_calc",        "accessories-calculator",         "apps",   SZ_DOCK)
 add("dock_apps_grid",   "view-grid",                  "actions",SZ_DOCK)
 add("dock_trash",       "user-trash",                     "places", SZ_DOCK)
 

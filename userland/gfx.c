@@ -367,42 +367,17 @@ void itoa0(int v, char *b, int w) {
     while (pad-- > 0) { b[k++] = '0'; } while (i) { b[k++] = tmp[--i]; } b[k] = 0;
 }
 
-/* ----- assets ----- */
+/* ----- assets (Kora icon atlas; linked into every binary) -----
+ * The wallpaper pack is the OTHER large asset but is compositor-only, so it
+ * lives in userland/wallpaper.c and is linked into /bin/init alone. */
 extern const char _binary_kora_bin_start[];
 extern const char _binary_kora_bin_end[];
-extern const char _binary_wallpaper_bin_start[];
-extern const char _binary_wallpaper_bin_end[];
 typedef struct { u32 name_off; u16 name_len; u32 px_off; u16 w, h, pitch; } __attribute__((packed)) ic_ent_t;
 static struct { int count; const ic_ent_t *ent; const u8 *blob; } G_icons;
-static const u8  *G_wp_base; static const u32 *G_wp_pixels; static int G_wp_w, G_wp_h, G_wp_count, G_wp_index;
-static const u8 *wallpaper_entry(int idx, int *w_out, int *h_out) {
-    const u8 *b = G_wp_base; if (!b) return 0; if (b[0]!='Y'||b[1]!='W'||b[2]!='A'||b[3]!='L'||b[4]!='L') return 0;
-    int version = b[5]; if (version == 1) { if (idx != 0) return 0; int w = b[6] | (b[7]<<8); int h = b[8] | (b[9]<<8); *w_out = w; *h_out = h; return b + 16; }
-    if (version == 2) { int count = b[6] | (b[7]<<8); if (idx < 0 || idx >= count) return 0; const u32 *offs = (const u32*)(b + 16); const u8 *e = b + offs[idx]; int w = e[0] | (e[1]<<8); int h = e[2] | (e[3]<<8); *w_out = w; *h_out = h; return e + 8; } return 0;
-}
 void assets_init(void) {
     const u8 *b = (const u8*)_binary_kora_bin_start; if (b[0]!='Y'||b[1]!='I'||b[2]!='C'||b[3]!='O'||b[4]!='N') return;
     u16 count = *(const u16*)(b+6); G_icons.count = count; asm volatile("" ::: "memory"); G_icons.ent = (const ic_ent_t*)(b+16); asm volatile("" ::: "memory"); G_icons.blob = b; asm volatile("" ::: "memory"); font_build();
 }
-int wallpaper_count(void) {
-    if (!G_wp_base) {
-        G_wp_base = (const u8*)_binary_wallpaper_bin_start; const u8 *b = G_wp_base;
-        if (b[0]!='Y'||b[1]!='W'||b[2]!='A'||b[3]!='L'||b[4]!='L') return 0;
-        int ver = b[5]; if (ver == 1) G_wp_count = 1; else if (ver == 2) G_wp_count = b[6] | (b[7]<<8); else G_wp_count = 0;
-    } return G_wp_count;
-}
-int wallpaper_load_index(int idx) {
-    (void)wallpaper_count(); int w,h; const u8 *px = wallpaper_entry(idx, &w, &h); if (!px) return -1;
-    G_wp_index = idx; G_wp_w = w; G_wp_h = h; G_wp_pixels = (const u32*)px; return 0;
-}
-int wallpaper_load(surface_t *out) {
-    if (wallpaper_load_index(0) < 0) { return -1; } if (out) { out->px=(u32*)G_wp_pixels; out->w=G_wp_w; out->h=G_wp_h; out->pitch=G_wp_w; } return 0;
-}
-void wallpaper_bind(surface_t *s) { if (s) { s->px=(u32*)G_wp_pixels; s->w=G_wp_w; s->h=G_wp_h; s->pitch=G_wp_w; } }
-int wallpaper_current_index(void) { return G_wp_index; }
-int wallpaper_width(void) { return G_wp_w; } int wallpaper_height(void) { return G_wp_h; }
-const u32 *wallpaper_pixels(void) { return G_wp_pixels; }
-u32 wallpaper_px(int x, int y) { if ((u32)x>=(u32)G_wp_w || (u32)y>=(u32)G_wp_h) return 0xFF000000; const u8 *p = (const u8*)G_wp_pixels + ((long)y*G_wp_w + x)*4; return ARGB(p[3], p[0], p[1], p[2]); }
 icon_t icon_get(int id) { icon_t z = {0}; if (id < 0 || id >= G_icons.count) return z; const ic_ent_t *e = &G_icons.ent[id]; z.px = (const u32*)(G_icons.blob + e->px_off); z.w = e->w; z.h = e->h; z.pitch = e->pitch / 4; return z; }
 void sf_icon_tl(surface_t *s, int x, int y, icon_t ico, u32 tint) {
     if (!ico.px || !ico.w || !ico.h) { return; } u32 tR = R(tint), tG = G(tint), tB = B(tint); int has_tint = (tint != 0);

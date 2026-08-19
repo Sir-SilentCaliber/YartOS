@@ -24,9 +24,23 @@ rm -f /tmp/qemu-qmp.sock
 ACCEL=(-cpu max)
 if [ -w /dev/kvm ]; then
     ACCEL=(-enable-kvm -cpu host)
-    echo "run: KVM acceleration enabled"
+    echo "run: KVM acceleration enabled (smooth)"
 else
-    echo "run: no /dev/kvm - falling back to TCG emulation (slower)"
+    cat >&2 <<'EOF'
+
+=========================================================================
+ WARNING: no /dev/kvm - running under TCG (pure software emulation).
+ TCG is 10-50x SLOWER than KVM. The desktop and cursor WILL feel laggy
+ no matter how optimized the code is. This is NOT a YartOS bug.
+
+ To get it smooth, pick one:
+   1. Enable KVM:  sudo modprobe kvm-intel   (or kvm-amd)
+                   sudo usermod -aG kvm $USER   (then log out and back in)
+      Confirm with:  ls -l /dev/kvm
+   2. Or boot the ISO on real hardware:  scripts/usb-deploy.sh
+=========================================================================
+
+EOF
 fi
 
 exec qemu-system-x86_64 \

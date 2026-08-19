@@ -202,7 +202,7 @@ void kmain(void) {
         if (n > 0) { buf[n] = 0; serial_puts(buf); }
     }
 
-    pit_init(100);
+    pit_init(TICK_HZ);
     apic_init();
     smp_start_aps();
     /* APs are up: Limine's SMP trampoline is no longer needed, so the
@@ -267,6 +267,9 @@ void kmain(void) {
 
     kprintf("yart: kernel up.  compositor owns the screen.\n");
     sti();
+    /* The system tick is now live (interrupts on): calibrate the TSC against
+     * it for the sub-ms monotonic clock (time_ms) the compositor paces with. */
+    tsc_calibrate();
     smp_ap_kwork_demo();
 
     u64 last_sync = 0;
@@ -277,7 +280,7 @@ void kmain(void) {
         audio_poll();
         usb_hid_poll();
         sched_reap_orphans();
-        if (blkfs_active() && pit_ticks() - last_sync >= 100) {
+        if (blkfs_active() && pit_ticks() - last_sync >= MS_TO_TICKS(1000)) {
             int n = blkfs_sync();
             last_sync = pit_ticks();
             if (n > 0)

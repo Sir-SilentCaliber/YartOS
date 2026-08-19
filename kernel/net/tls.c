@@ -367,7 +367,7 @@ int tls_connect(u32 ip, u16 port) {
     if (!net_own_ip()) return -1;
     int conn = net_tcp_connect(ip, port);
     if (conn < 0) return -1;
-    u64 deadline = pit_ticks() + 2000;
+    u64 deadline = pit_ticks() + MS_TO_TICKS(20000);
     tls_conn_t *t = &g_tls[conn];
     memset(t, 0, sizeof *t);
     t->active = true;
@@ -629,7 +629,7 @@ int tls_recv(int h, u8 *buf, int cap) {
         t->rx_len -= (u16)n;
         return n;
     }
-    u64 deadline = pit_ticks() + 100;
+    u64 deadline = pit_ticks() + MS_TO_TICKS(1000);
     while (pit_ticks() < deadline && t->rx_len == 0 && !t->peer_closed) {
         tls_read_appdata(t, deadline);
         __asm__ volatile("pause");
@@ -677,7 +677,7 @@ extern int bn_rsa_private_crt(const u8 *in, int nlen,
                               const u8 *n, u8 *out);
 
 static int tls_server_handshake(int conn) {
-    u64 deadline = pit_ticks() + 2000;
+    u64 deadline = pit_ticks() + MS_TO_TICKS(20000);
     tls_conn_t *t = &g_tls[conn];
     memset(t, 0, sizeof *t);
     t->active = true;
@@ -849,7 +849,7 @@ static int tls_server_handshake(int conn) {
     u32 cfmlen = 0;
     bool have_cfin = false;
     if (tls_read_handshake(t, TLS_HS_FINISHED, cfin, &cfmlen,
-                           pit_ticks() + 30, true) == 0) {
+                           pit_ticks() + MS_TO_TICKS(300), true) == 0) {
         have_cfin = true;                    /* client Finished hashed */
     }
     u8 ccs = 1;

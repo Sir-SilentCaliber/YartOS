@@ -59,10 +59,24 @@ u32  lapic_read_id_reg(void);
 void apic_timer_start_this_cpu(void);   /* per-CPU APIC timer */
 void lapic_spurious_irq(cpu_regs_t *r); /* spurious vector handler    */
 
+/* ---- system tick rate (single source of truth) ----
+ * The PIT (vector 32) and, after apic_init(), the LAPIC timer (vector 48)
+ * both bump the same tick counter at this rate.  Skift runs its scheduler
+ * tick at 1 kHz ("switchTask(1_ms, frame)"), which gives 1 ms granularity
+ * for sleeps and the monotonic clock - the resolution a 60 Hz compositor
+ * needs to pace frames evenly.  All tick-derived durations in the kernel
+ * MUST go through MS_TO_TICKS() / TICKS_TO_MS() below, never a raw number,
+ * so changing TICK_HZ stays safe. */
+#define TICK_HZ         250
+#define MS_TO_TICKS(ms) ((ms) * TICK_HZ / 1000)
+#define TICKS_TO_MS(t)  ((t)  * 1000 / TICK_HZ)
+
 /* PIT / time */
 void pit_init(u32 hz);
-u64  pit_ticks(void);
-void sleep_ms(u32 ms);
+u64  pit_ticks(void);            /* coarse tick counter (TICK_HZ rate)  */
+void sleep_ms(u32 ms);           /* coarse kernel busy-sleep (ms)       */
+void tsc_calibrate(void);        /* measure TSC rate against the tick   */
+u64  time_ms(void);              /* sub-ms monotonic clock (TSC-backed) */
 
 /* RTC */
 typedef struct {

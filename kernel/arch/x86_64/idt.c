@@ -158,8 +158,21 @@ static u64 page_fault(cpu_regs_t *r) {
      * jumped into user code.  Recover by dropping the corrupt context and
      * switching to the idle task instead of panicking the whole OS. */
     if ((err & 0x10) && va < 0xffff800000000000ULL) {
-        kprintf("cpu: SMEP fault at va=%p - dropping corrupt context\\n",
-                (void *)va);
+        /* First fault only: dump the full frame + context so we can tell
+         * WHICH frame is corrupt (this is the deterministic repro of the
+         * pre-existing SMEP-on-exec race).  Later faults just count. */
+        static u64 g_smep_count;
+        if (g_smep_count == 0) {
+            cpu_local_t *c = get_cpu_local();
+            task_t *cur = sched_current();
+            dump_exception(r);
+            kprintf("smep-dbg: cpu=%d cur_task=%d '%s' is_user=%d\n",
+                    c ? (int)c->cpu_id : -1,
+                    cur ? (int)cur->pid : -1,
+                    cur ? cur->name : "?",
+                    cur ? (int)cur->is_user : -1);
+        }
+        g_smep_count++;
         return sched_fault_recover((u64)r);
     }
 

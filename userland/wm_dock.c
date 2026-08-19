@@ -181,7 +181,12 @@ void draw_label_clipped(surface_t*s,int cx,int y,const char*t,u32 col){
 
 int desk_hit(int x,int y){ for(int i=0;i<G_desk_n;i++){int x0,y0,x1,y1;desk_rect(i,&x0,&y0,&x1,&y1); if(ptin(x,y,x0,y0,x1,y1))return i;} return -1; }
 
-bool desk_selected(int i){ return G_sel_desk==i || G_multi_sel; }
+/* Single-click selection ONLY.  The old code returned `G_multi_sel` here, so
+ * once a marquee drag set G_multi_sel every icon on the desktop was
+ * highlighted ("drag selects ALL apps").  Marquee (rubber-band) selection is
+ * computed separately in draw_desktop_live() against the actual rectangle
+ * intersection, and it now resets on release. */
+bool desk_selected(int i){ return G_sel_desk==i; }
 
 void draw_desktop_icons(surface_t*s){
     for(int i=0;i<G_desk_n;i++){

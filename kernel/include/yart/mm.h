@@ -90,6 +90,7 @@ typedef struct {
 } user_region_t;
 
 int  vmm_user_reserve(u64 va, u64 npages, u64 flags, u32 opts);
+u64  vmm_user_find_free(u64 start, u64 npages, u64 limit);  /* quiet, no log */
 /* Generalised reserve: track + map inside an explicit pml4 (exec path). */
 int  vmm_reserve_in(u64 *pml4, user_region_t *rs, int *count,
                     u64 va, u64 npages, u64 flags, u32 opts);

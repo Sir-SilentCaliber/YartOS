@@ -15,10 +15,11 @@
 
 #include "sys.h"
 #include "gfx.h"
+#include "apk.h"
 
 #define WIN_W 640
 #define WIN_H 400
-#define PROMPT "$ "
+#define PROMPT " $ "
 
 #define MAX_COLS 128
 #define MAX_ROWS 40
@@ -393,6 +394,11 @@ static void line_render(void){
     int sc0=G_scrolled;
     G_cur_r=start; G_cur_c=0;
     G_fg=2; G_bold=false;
+    /* prompt = current directory + " $ " (like a real shell), so `cd` is
+     * visibly reflected in the prompt. */
+    char cwd[128]; long cr=_sc(SYS_GETCWD, (long)cwd, 128, 0);
+    const char *ps = (cr>0 && cwd[0]) ? cwd : "/";
+    for(const char *p=ps; *p; p++) term_put(*p);
     for(const char *p=PROMPT; *p; p++) term_put(*p);
     G_fg=7;
     for(int i=0;i<G_cmd_len;i++) term_put(G_cmd[i]);
@@ -443,7 +449,7 @@ static void screen_clear_and_prompt(void){
 
 /* ---------------- FS / shell commands ---------------- */
 static void cmd_ls(const char *path){
-    if(!path || !path[0]) path="/";
+    /* empty path = current directory (the kernel resolves "" to the cwd). */
     int fd=open(path, 0);
     if(fd<0){ add_line("ls: cannot open"); return; }
     while(1){
@@ -658,6 +664,8 @@ static void run_one(const char *cmd){
         add_line("  cat <file>     - show file");
         add_line("  echo <msg>     - echo");
         add_line("  mkdir <dir>    - make dir");
+        add_line("  ln -s <t> <l>  - create symlink");
+        add_line("  readlink <l>   - show symlink target");
         add_line("  rm <file>      - remove");
         add_line("  touch <file>   - create empty");
         add_line("  ps             - list PIDs");
@@ -672,6 +680,15 @@ static void run_one(const char *cmd){
         add_line("  fsync          - flush FS to disk");
         add_line("  dmesg          - kernel log");
         add_line("  notify <msg>   - raise a desktop notification");
+        add_line("  apk add <pkg>  - install a package (appears in the launcher)");
+        add_line("  apk del <pkg>  - remove it   apk list / search / info");
+        add_line("  linuxtest      - run a Linux binary through the Linux ABI");
+        add_line("  linuxtest2     - Linux threads (clone+futex) + sockets + execve");
+        add_line("  dynhello       - run a DYNAMICALLY-LINKED Linux program (.so)");
+        add_line("  tlsdemo        - __thread vars through the dynamic linker + TLS");
+        add_line("  ifuncdemo      - IFUNC (indirect function) resolution");
+        add_line("  copydemo       - copy relocation (.so referencing a program global)");
+        add_line("  tlstest        - verify TLS (arch_prctl ARCH_SET_FS -> %fs)");
         add_line("  reboot         - restart the machine");
         add_line("  exit           - close terminal (Ctrl+D)");
         add_line("  /bin/prog [&]  - run a program as a job");
@@ -707,7 +724,11 @@ static void run_one(const char *cmd){
         const char *h=env_get("HOME");
         if(_sc(SYS_CHDIR, (long)h,0,0)==0){ G_status=0; } else { add_line("cd: no HOME"); G_status=1; }
     } else if(strncmp(cmd,"ls",2)==0){
-        const char *arg = cmd[2]==' ' ? cmd+3 : "/";
+        /* `ls` with no argument lists the CURRENT directory ("" resolves to
+         * the cwd in the kernel), not "/".  The old code defaulted to "/",
+         * so after `cd /home/yart` the prompt still showed root - making `cd`
+         * look broken. */
+        const char *arg = cmd[2]==' ' ? cmd+3 : "";
         cmd_ls(arg);
     } else if(strncmp(cmd,"cd ",3)==0){
         if(_sc(SYS_CHDIR, (long)(cmd+3),0,0)==0){
@@ -726,6 +747,17 @@ static void run_one(const char *cmd){
         if(_sc(SYS_MKDIR, (long)(cmd+6),0,0)==0) add_line("mkdir ok"); else add_line("mkdir failed");
     } else if(strncmp(cmd,"rm ",3)==0){
         if(unlink(cmd+3)==0) add_line("removed"); else add_line("rm failed");
+    } else if(strncmp(cmd,"ln -s ",6)==0){
+        /* ln -s <target> <link> */
+        const char *a=cmd+6; while(*a==' ')a++;
+        const char *tgt=a; while(*tgt&&*tgt!=' ')tgt++;
+        if(!*tgt){ add_line("usage: ln -s <target> <link>"); }
+        else { char *s=(char*)tgt; *s=0; tgt=s+1; while(*tgt==' ')tgt++;
+               if(symlink(a, tgt)==0) add_line("link created"); else add_line("ln -s failed"); }
+    } else if(strncmp(cmd,"readlink ",9)==0){
+        char buf[256];
+        long n=readlink(cmd+9, buf, sizeof buf);
+        if(n>0) add_line(buf); else add_line("readlink: not a symlink");
     } else if(strncmp(cmd,"touch ",6)==0){
         int fd=open(cmd+6, 0x40); if(fd>=0){ close(fd); add_line("touched"); } else add_line("touch failed");
     } else if(strcmp(cmd,"ps")==0){
@@ -769,6 +801,85 @@ static void run_one(const char *cmd){
         if(notify(cmd+7)==0) add_line("notification sent"); else add_line("notify failed");
     } else if(strcmp(cmd,"dmesg")==0){
         char buf[20*257]; long n=dmesg(buf, 0, 20); if(n>0){ for(int i=0;i<n;i++){ char *ln=&buf[i*257]; add_line(ln); } } else add_line("dmesg empty");
+    } else if(strncmp(cmd,"apk",3)==0 || strncmp(cmd,"pkg",3)==0){
+        const char *args = cmd[3]==' ' ? cmd+4 : "";
+        char tmp[LINE_LEN]; strncpy(tmp, args, LINE_LEN-1); tmp[LINE_LEN-1]=0;
+        char *argv[16]; int argc=1;
+        argv[0]="apk";
+        char *p=tmp;
+        while(*p && argc<15){ while(*p==' ')p++; if(!*p)break; argv[argc++]=p; while(*p&&*p!=' ')p++; if(*p){*p=0;p++;} }
+        argv[argc]=0;
+        apk_main(argc, argv, add_line);
+    } else if(strcmp(cmd,"linuxtest")==0){
+        /* exec a genuine Linux static binary through the Linux-ABI layer */
+        long pid=fork();
+        if(pid==0){
+            char *argv[]={"/bin/test_linux",0};
+            char *envp[]={"HOME=/home/yart","TERM=nyra",0};
+            exec("/bin/test_linux",argv,envp);
+            klog("nyra: linux exec failed\n"); exit(1);
+        } else if(pid>0){ int st=0; waitpid(pid,&st); add_line("linuxtest done (see serial / kernel log for its output)"); }
+        else add_line("fork failed");
+    } else if(strcmp(cmd,"linuxtest2")==0){
+        /* clone+futex (threads) + UDP loopback + execve, through the Linux ABI */
+        long pid=fork();
+        if(pid==0){
+            char *argv[]={"/bin/test_linux2",0};
+            char *envp[]={"HOME=/home/yart","TERM=nyra",0};
+            exec("/bin/test_linux2",argv,envp);
+            klog("nyra: linux exec failed\n"); exit(1);
+        } else if(pid>0){ int st=0; waitpid(pid,&st); add_line("linuxtest2 done (threads/sockets/execve)"); }
+        else add_line("fork failed");
+    } else if(strcmp(cmd,"dynhello")==0){
+        /* run a dynamically-linked Linux program (the full PT_INTERP chain) */
+        long pid=fork();
+        if(pid==0){
+            char *argv[]={"/bin/dynhello",0};
+            char *envp[]={"HOME=/home/yart","TERM=nyra",0};
+            exec("/bin/dynhello",argv,envp);
+            klog("nyra: dynhello exec failed\n"); exit(1);
+        } else if(pid>0){ int st=0; waitpid(pid,&st); add_line("dynhello done (see serial / kernel log)"); }
+        else add_line("fork failed");
+    } else if(strcmp(cmd,"tlsdemo")==0){
+        /* TLS through the dynamic linker: __thread in program + a .so */
+        long pid=fork();
+        if(pid==0){
+            char *argv[]={"/bin/tlsdemo",0};
+            char *envp[]={"HOME=/home/yart","TERM=nyra",0};
+            exec("/bin/tlsdemo",argv,envp);
+            klog("nyra: tlsdemo exec failed\n"); exit(1);
+        } else if(pid>0){ int st=0; waitpid(pid,&st); add_line("tlsdemo done (see serial / kernel log)"); }
+        else add_line("fork failed");
+    } else if(strcmp(cmd,"ifuncdemo")==0){
+        /* IFUNC (STT_GNU_IFUNC) resolution through the dynamic linker */
+        long pid=fork();
+        if(pid==0){
+            char *argv[]={"/bin/ifuncdemo",0};
+            char *envp[]={"HOME=/home/yart","TERM=nyra",0};
+            exec("/bin/ifuncdemo",argv,envp);
+            klog("nyra: ifuncdemo exec failed\n"); exit(1);
+        } else if(pid>0){ int st=0; waitpid(pid,&st); add_line("ifuncdemo done (see serial / kernel log)"); }
+        else add_line("fork failed");
+    } else if(strcmp(cmd,"copydemo")==0){
+        /* copy relocation (a .so referencing a program global) */
+        long pid=fork();
+        if(pid==0){
+            char *argv[]={"/bin/copydemo",0};
+            char *envp[]={"HOME=/home/yart","TERM=nyra",0};
+            exec("/bin/copydemo",argv,envp);
+            klog("nyra: copydemo exec failed\n"); exit(1);
+        } else if(pid>0){ int st=0; waitpid(pid,&st); add_line("copydemo done (see serial / kernel log)"); }
+        else add_line("fork failed");
+    } else if(strcmp(cmd,"tlstest")==0){
+        /* verify TLS: arch_prctl ARCH_SET_FS -> %fs base round-trip */
+        long pid=fork();
+        if(pid==0){
+            char *argv[]={"/bin/test_tls",0};
+            char *envp[]={"HOME=/home/yart","TERM=nyra",0};
+            exec("/bin/test_tls",argv,envp);
+            klog("nyra: tlstest exec failed\n"); exit(1);
+        } else if(pid>0){ int st=0; waitpid(pid,&st); add_line("tlstest done (see serial / kernel log)"); }
+        else add_line("fork failed");
     } else if(strcmp(cmd,"exit")==0){
         add_line("bye"); wm_flip(G_win_id); sleep(200); goto do_exit;
     } else if(strcmp(cmd,"jobs")==0){
@@ -791,19 +902,30 @@ static void run_one(const char *cmd){
         else if(!G_jobs[idx].stopped){ add_line("bg: job already running"); }
         else { raise(G_jobs[idx].pid, 18); G_jobs[idx].stopped=false; job_status_line(idx, "Running &"); }
     } else if(cmd[0]=='/'){
-        /* external program: run as a JOB.  Trailing '&' = background. */
+        /* external program: run as a JOB, with real argv (space-separated
+         * arguments, like a real shell).  Trailing '&' = background. */
         char prog[LINE_LEN]; strncpy(prog, cmd, LINE_LEN-1); prog[LINE_LEN-1]=0;
         bool bg=false;
         int len=strlen(prog);
         while(len>0 && (prog[len-1]==' ' || prog[len-1]=='\t')){ prog[--len]=0; }
         if(len>0 && prog[len-1]=='&'){ bg=true; prog[--len]=0; }
         while(len>0 && (prog[len-1]==' ' || prog[len-1]=='\t')){ prog[--len]=0; }
-        bool has_space=false; for(int i=0;prog[i];i++) if(prog[i]==' '){ has_space=true; break; }
-        if(has_space){ add_line("usage: /bin/prog [&]  (no args yet)"); return; }
+        if(!prog[0]){ add_line("usage: /bin/prog [args...] [&]"); return; }
+        /* tokenize in place into argv (path + up to 30 args) */
+        char *argv[32]; int argc=0;
+        char *p=prog;
+        while(*p && argc<31){
+            while(*p==' '||*p=='\t') p++;
+            if(!*p) break;
+            argv[argc++]=p;
+            while(*p && *p!=' ' && *p!='\t') p++;
+            if(*p){ *p=0; p++; }
+        }
+        argv[argc]=0;
         long pid=fork();
         if(pid==0){
-            char *argv[]={prog,0}; char *envp[]={"HOME=/home/yart",0};
-            exec(prog, argv, envp);
+            char *envp[]={"HOME=/home/yart","TERM=nyra",0};
+            exec(argv[0], argv, envp);
             klog("nyra: exec failed\n"); exit(1);
         } else if(pid>0){
             int n=job_add(pid, prog);
@@ -970,9 +1092,12 @@ int main_entry(int argc, char **argv, char **envp){
             else if(left && G_btn_left){ if(lr!=G_sel_end){ G_sel_end=lr; G_did_drag=true; G_sel_active=true; } }
             else if(!left && G_btn_left){
                 G_btn_left=false;
-                if(G_did_drag) term_copy_lines(G_sel_anchor, G_sel_end);
-                else term_paste();
-                G_sel_active=false; G_sel_anchor=G_sel_end=-1;
+                if(G_did_drag) term_copy_lines(G_sel_anchor, G_sel_end);  /* drag = select + copy */
+                else term_paste();                                        /* plain click = paste */
+                /* Keep the selection HIGHLIGHT visible after the drag (the old
+                 * code cleared it here, so text deselected immediately with no
+                 * way to copy again - the user's "it just deselects" complaint).
+                 * It clears on the next press or on Ctrl+C. */
             }
         }
         int ev; while((ev=poll_key())!=0){
@@ -993,8 +1118,27 @@ int main_entry(int argc, char **argv, char **envp){
                 }
                 continue;
             }
+            /* Ctrl+Shift+C = copy, Ctrl+Shift+V = paste (the REAL terminal
+             * convention).  Ctrl+C stays "interrupt/cancel" (SIGINT) and is
+             * NEVER copy - that is what a real OS terminal does.  The driver
+             * reports a shifted key as the UPPERCASE ascii ('C'/'V') plus the
+             * KEY_SHIFT flag, so we distinguish them from plain ctrl. */
+            if(ctrl && ascii=='C'){
+                if(G_sel_active){ term_copy_lines(G_sel_anchor, G_sel_end); G_sel_active=false; G_sel_anchor=G_sel_end=-1; }
+                continue;
+            }
+            if(ctrl && ascii=='V'){ term_paste(); continue; }
             if(ctrl && (ascii=='c' || ascii==3)){
-                if(G_fg_pid>0){ add_line("^C"); G_fg_pid=-1; continue; }  /* fg running: nothing to cancel yet */
+                if(G_fg_pid>0){
+                    /* SIGINT the foreground job (real Ctrl+C): the child gets
+                     * signal 2, and with no handler it terminates (status 130)
+                     * and is reaped by the waitpid loop.  The old code just
+                     * printed ^C and cleared G_fg_pid, ORPHANING the child and
+                     * leaking its zombie forever. */
+                    add_line("^C");
+                    raise(G_fg_pid, 2);
+                    continue;
+                }
                 cmd_cancel(); continue;
             }
             if(ctrl && (ascii=='l' || ascii==12)){ screen_clear_and_prompt(); continue; }
@@ -1050,6 +1194,29 @@ int main_entry(int argc, char **argv, char **envp){
                 G_fg_pid=-1;
                 prompt_print();
                 dirty=true;
+            }
+        }
+        /* reap exited BACKGROUND jobs (throttled to ~2x/s).  Without this,
+         * a background job that finishes stays a zombie forever (its parent -
+         * this shell - is alive, so the kernel orphan reaper never touches it)
+         * and `jobs` keeps listing it as "Running".  This is the classic
+         * shell zombie leak. */
+        {
+            static int bg_reap_tick = 0;
+            if(++bg_reap_tick >= 40){
+                bg_reap_tick = 0;
+                for(int i=0;i<G_job_count;){
+                    if(G_jobs[i].pid == G_fg_pid){ i++; continue; }
+                    int st=0;
+                    long r=waitpid_nohang(G_jobs[i].pid, &st);
+                    if(r==G_jobs[i].pid){
+                        if(st==-19){ G_jobs[i].stopped=true; job_status_line(i, "Stopped"); i++; }
+                        else { job_status_line(i, "Done"); job_remove(i); dirty=true; }
+                    } else if(r==-1){
+                        /* ECHILD: never ours / already gone - drop the slot */
+                        job_remove(i); dirty=true;
+                    } else i++;
+                }
             }
         }
         G_cursor_blink++;

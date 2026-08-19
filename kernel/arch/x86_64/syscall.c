@@ -40,7 +40,7 @@
  * (no PBKDF2/Argon2) remains the honest, documented limitation. */
 #define DOAS_MAX_USERS     8
 #define DOAS_MAX_FAILS     5
-#define DOAS_LOCKOUT_TICKS 100          /* 1 s per failed attempt window */
+#define DOAS_LOCKOUT_TICKS MS_TO_TICKS(1000)  /* 1 s per failed attempt window */
 typedef struct {
     char account[32];
     char salt[16];
@@ -416,6 +416,49 @@ static i64 sys_close(int fd) {
 /* dup2(oldfd, newfd): POSIX fd duplication.  Closes newfd if open, then
  * copies the oldfd entry onto it, taking a fresh reference on the shared
  * resource (vnode or pipe) so close() of either end is balanced. */
+/* symlink(target, linkpath): create a symlink.  Returns 0 or -1. */
+static i64 sys_symlink(const char *target, const char *linkpath) {
+    char kt[VFS_MAX_PATH], kl[VFS_MAX_PATH];
+    if (!copy_user_str((u64)target, kt, sizeof kt)) return -1;
+    if (!copy_user_str((u64)linkpath, kl, sizeof kl)) return -1;
+    task_t *t = cur();
+    /* split linkpath into dir + base */
+    char dir[VFS_MAX_PATH] = "/", base[VFS_MAX_NAME];
+    const char *slash = NULL;
+    for (const char *p = kl; *p; p++) if (*p == '/') slash = p;
+    if (slash && slash != kl) {
+        size_t l = slash - kl; if (l >= sizeof dir) return -1;
+        memcpy(dir, kl, l); dir[l] = 0;
+        strncpy(base, slash + 1, sizeof base - 1);
+    } else if (slash) {
+        strncpy(base, kl + 1, sizeof base - 1);
+    } else {
+        strncpy(base, kl, sizeof base - 1);
+    }
+    vnode_t *d = vfs_lookup_at(t->cwd, dir);
+    if (!d || d->type != VN_DIR) return -1;
+    if (!perm_ok(d, PERM_W)) return -1;
+    return vfs_symlink(d, base, kt) ? 0 : -1;
+}
+
+/* readlink(path, buf, size): copy the symlink target into buf (NUL-terminated,
+ * truncated to size-1).  Returns the target length or -1. */
+static i64 sys_readlink(const char *path, char *buf, u64 size) {
+    char kp[VFS_MAX_PATH];
+    if (!copy_user_str((u64)path, kp, sizeof kp)) return -1;
+    if (!uptr((u64)buf, size)) return -1;
+    task_t *t = cur();
+    vnode_t *v = vfs_lookup_at_nofollow(t->cwd, kp);
+    if (!v || v->type != VN_SYMLINK) return -1;
+    u64 n = v->size;
+    if (n >= size) n = size ? size - 1 : 0;
+    stac();
+    memcpy(buf, v->data, n);
+    if (size) buf[n] = 0;
+    clac();
+    return (i64)v->size;
+}
+
 static i64 sys_dup2(int oldfd, int newfd) {
     if (newfd < 0 || newfd >= MAX_FD) return -1;
     task_t *t = cur(); if (!t || !g_sys_from_user) return -1;
@@ -537,7 +580,7 @@ static i64 sys_unlink(const char *path) {
     if (!copy_user_str((u64)path, kpath, sizeof kpath)) return -1;
     path = kpath;
     task_t *t = cur();
-    vnode_t *v = vfs_lookup_at(t->cwd, path);
+    vnode_t *v = vfs_lookup_at_nofollow(t->cwd, path);  /* act on the link */
     if (!v || !v->parent) return -1;
     if (!perm_ok(v->parent, PERM_W)) return -1;   /* need write on parent */
     /* sticky dir: only the dir owner, the file owner, or root may delete */
@@ -670,7 +713,7 @@ static i64 sys_rename(const char *oldp, const char *newp) {
     if (!copy_user_str((u64)oldp, kold, sizeof kold)) return -1;
     if (!copy_user_str((u64)newp, knew, sizeof knew)) return -1;
     task_t *t = cur();
-    vnode_t *v = vfs_lookup_at(t->cwd, kold);
+    vnode_t *v = vfs_lookup_at_nofollow(t->cwd, kold);  /* rename the link */
     if (!v) return -1;
     if (!perm_ok(v->parent, PERM_W)) return -1;
     if ((v->parent->mode & PERM_STICKY) && t->euid != 0 &&
@@ -788,30 +831,36 @@ static i64 sys_kill(u32 pid) {
  * non-executable) in the mmap arena.  This is what lets a program grow its
  * memory at runtime - the foundation of malloc() and of big allocations
  * like "give me 64 MiB".  Returns the VA, or -1. */
+static i64 sys_mmap_prot(u64 len, bool exec);   /* defined below */
 static i64 sys_mmap(u64 len) {
+    return sys_mmap_prot(len, false);
+}
+
+/* mmap with a protection hint: exec=true maps the pages executable (needed
+ * by the dynamic linker to load shared libraries' code).  exec=false is the
+ * classic anonymous data mapping. */
+static i64 sys_mmap_prot(u64 len, bool exec) {
     if (!g_sys_from_user) return -1;
     task_t *t = cur();
     if (!t) return -1;
     if (len == 0 || len > USER_MMAP_END - USER_MMAP_BASE) return -1;
     len = PAGE_ALIGN_UP(len);
     u64 pages = len / PAGE_SIZE;
+    u64 flags = PTE_RW | PTE_US | (exec ? 0 : PTE_NX);
 
     for (int wrap = 0; wrap < 2; wrap++) {
         u64 cand = PAGE_ALIGN_UP(t->mmap_next);
         if (cand < USER_MMAP_BASE) cand = USER_MMAP_BASE;
-        while (cand + len <= USER_MMAP_END) {
-            if (vmm_user_reserve(cand, pages, PTE_RW | PTE_US | PTE_NX,
-                                 VMM_USER_LAZY) == 0) {
-                /* GUARD PAGE: advance past one extra unmapped page so the
-                 * next region starts a page later - a 1-page overflow past
-                 * this region faults instead of silently touching the next
-                 * allocation (or unmapped memory) */
-                t->mmap_next = cand + len + PAGE_SIZE;
-                kprintf("mmap: pid %d got %lu bytes at %p (demand-paged)\n",
-                        t->pid, len, (void *)cand);
-                return (i64)cand;
-            }
-            cand += PAGE_SIZE;         /* this spot is taken, try next    */
+        /* find the first free spot quietly (O(regions)), then reserve it */
+        u64 found = vmm_user_find_free(cand, pages, USER_MMAP_END);
+        if (found && vmm_user_reserve(found, pages, flags,
+                                      VMM_USER_LAZY) == 0) {
+            /* GUARD PAGE: advance past one extra unmapped page so the
+             * next region starts a page later - a 1-page overflow past
+             * this region faults instead of silently touching the next
+             * allocation (or unmapped memory) */
+            t->mmap_next = found + len + PAGE_SIZE;
+            return (i64)found;
         }
         t->mmap_next = USER_MMAP_BASE; /* wrap around the arena once      */
     }
@@ -1456,9 +1505,466 @@ static void sys_sigreturn(cpu_regs_t *r);
 static i64 sys_pipe(int *fds);
 static i64 sys_dup2(int oldfd, int newfd);
 
+/* ---------------------------------------------------------------------------
+ * Linux x86_64 ABI layer.
+ *
+ * A foreign (ET_EXEC) Linux binary issues `syscall` with LINUX syscall
+ * numbers in rax and args in rdi/rsi/rdx/r10/r8/r9.  Two kinds:
+ *   1. Simple 1:1 mappings -> rewrite rax (and reorder args) then fall
+ *      through to the normal YartOS switch.
+ *   2. Complex (different struct layouts / arg counts) -> handled here
+ *      directly, result stored in r->rax, and dispatch returns "handled".
+ *
+ * HONEST SCOPE: file/console/process syscalls + the auxv (see user.c).  NOT
+ * yet: TLS via arch_prctl(ARCH_SET_FS) is stored but not applied to %fs,
+ * clone/threads, futex, poll/select, sockets, ioctl, full execve-with-auxv
+ * is done but a PT_INTERP dynamic linker is not loaded yet.  So this runs
+ * SELF-CONTAINED STATIC Linux binaries; it is not yet "any Linux program".
+ * ------------------------------------------------------------------------- */
+
+#define LINUX_AT_FDCWD (-100)
+#define LINUX_ENOSYS   38
+#define LINUX_EBADF     9
+#define LINUX_EINVAL   22
+#define LINUX_ENOENT    2
+#define LINUX_EACCES   13
+
+/* Linux x86_64 struct stat (glibc/musl layout, 144 bytes). */
+typedef struct PACKED {
+    u64 st_dev, st_ino, st_nlink;
+    u32 st_mode, st_uid, st_gid, __pad0;
+    u64 st_rdev, st_size, st_blksize, st_blocks;
+    i64 st_atim_sec,  st_atim_nsec;
+    i64 st_mtim_sec,  st_mtim_nsec;
+    i64 st_ctim_sec,  st_ctim_nsec;
+    i64 __unused[3];
+} linux_stat_t;
+
+#define S_IFMT  0xF000
+#define S_IFREG 0x8000
+#define S_IFDIR 0x4000
+#define S_IFLNK 0xA000
+#define DT_UNKNOWN 0
+#define DT_REG 8
+#define DT_DIR 4
+#define DT_LNK 10
+
+/* Linux struct utsname (6 x 65 bytes = 390 bytes). */
+typedef struct { char s[390]; } linux_utsname_t;
+
+static u64 linux_epoch_seconds(void) {
+    rtc_time_t t; rtc_read(&t);
+    static const int mdays[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    long days = (long)(t.year - 1970) * 365;
+    days += (t.year - 1969) / 4 - (t.year - 1901) / 100 + (t.year - 1601) / 400;
+    for (int m = 1; m < (int)t.month; m++) days += mdays[m - 1];
+    int leap = ((t.year % 4 == 0 && t.year % 100 != 0) || t.year % 400 == 0);
+    if (t.month > 2 && leap) days += 1;
+    days += t.day - 1;
+    return (u64)days * 86400ULL + t.hour * 3600ULL + t.minute * 60ULL + t.second;
+}
+
+/* fill a Linux struct stat from a vnode (writes into validated user memory) */
+static void linux_fill_stat(vnode_t *v, void *ubuf) {
+    linux_stat_t st;
+    memset(&st, 0, sizeof st);
+    st.st_ino   = v->ino ? v->ino : (u64)(uintptr_t)v;
+    st.st_nlink = 1;
+    u32 type = (v->type == VN_DIR) ? S_IFDIR : (v->type == VN_SYMLINK ? S_IFLNK : S_IFREG);
+    st.st_mode  = type | (v->mode & 07777u);
+    st.st_uid   = v->uid;
+    st.st_gid   = v->gid;
+    st.st_size  = v->size;
+    st.st_blksize = 4096;
+    st.st_blocks  = (v->size + 511) / 512;
+    u64 mt = v->mtime;
+    st.st_atim_sec = st.st_mtim_sec = st.st_ctim_sec = (i64)mt;
+    stac(); memcpy(ubuf, &st, sizeof st); clac();
+}
+
+/* Linux getdents64: fill dirent64 records from a dir fd's children */
+static i64 linux_getdents64(int fd, char *ubuf, u64 count) {
+    if (!uptr((u64)ubuf, count)) return -LINUX_EINVAL;
+    fd_entry_t *f = fd_get(fd);
+    if (!f || f->vn->type != VN_DIR) return -LINUX_EBADF;
+    u64 off = 0;
+    for (vnode_t *c = f->vn->child; c; c = c->sibling) {
+        u64 namelen = strlen(c->name);
+        u64 reclen = (19 + namelen + 1 + 7) & ~7ULL;   /* align8 */
+        if (off + reclen > count) break;
+        u8 d_type = (c->type == VN_DIR) ? DT_DIR
+                  : (c->type == VN_SYMLINK) ? DT_LNK : DT_REG;
+        stac();
+        u64 *ino = (u64 *)(ubuf + off);       *ino = c->ino ? c->ino : (u64)(uintptr_t)c;
+        i64 *doff = (i64 *)(ubuf + off + 8);  *doff = (i64)(off + reclen);
+        u16 *rl = (u16 *)(ubuf + off + 16);   *rl = (u16)reclen;
+        ubuf[off + 18] = d_type;
+        memcpy(ubuf + off + 19, c->name, namelen + 1);
+        clac();
+        off += reclen;
+    }
+    return (i64)off;
+}
+
+/* Linux writev: gather-write a vector of iovec {base, len} pairs */
+static i64 linux_writev(int fd, const void *iov_ubuf, u64 iovcnt) {
+    if (iovcnt > 64 || !uptr((u64)iov_ubuf, iovcnt * 16)) return -LINUX_EINVAL;
+    i64 total = 0;
+    for (u64 i = 0; i < iovcnt; i++) {
+        u64 base, len;
+        stac();
+        base = *(u64 *)((u8 *)iov_ubuf + i * 16);
+        len  = *(u64 *)((u8 *)iov_ubuf + i * 16 + 8);
+        clac();
+        i64 w = sys_write(fd, (const char *)base, len);
+        if (w < 0) return w;
+        total += w;
+        if ((u64)w < len) break;
+    }
+    return total;
+}
+
+/* Linux mmap(addr, len, prot, flags, fd, offset).  Anonymous mappings use the
+ * arena and honour PROT_EXEC (so the dynamic linker can map .so code); file
+ * mappings + MAP_FIXED are not yet supported (-ENOSYS). */
+static i64 linux_mmap(u64 addr, u64 len, u64 prot, u64 flags, u64 fd, u64 off) {
+    (void)fd; (void)off;
+    if (flags & 0x10) {                    /* MAP_FIXED: not yet supported */
+        return -LINUX_ENOSYS;
+    }
+    (void)addr;                             /* hint ignored: arena-allocated */
+    return sys_mmap_prot(len, (prot & 4) != 0);
+}
+
+/* Linux access(path, mode): existence + basic mode check. */
+static i64 linux_access(const char *path, u64 mode) {
+    char kpath[VFS_MAX_PATH];
+    if (!copy_user_str((u64)path, kpath, sizeof kpath)) return -LINUX_EINVAL;
+    vnode_t *v = vfs_lookup_at(cur()->cwd, kpath);
+    if (!v) return -LINUX_ENOENT;
+    if (mode & 2 && !perm_ok(v, PERM_W)) return -LINUX_EACCES;   /* W_OK */
+    if (mode & 4 && !perm_ok(v, PERM_R)) return -LINUX_EACCES;   /* R_OK */
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Linux socket layer: maps Linux socket/bind/connect/listen/accept/send/recv/
+ * sendto/recvfrom/shutdown onto the kernel's existing TCP/UDP stack.  Socket
+ * fds live in a SEPARATE namespace (SOCK_FD_BASE + slot) so they never
+ * collide with file fds (0..MAX_FD).  sockaddr_in is AF_INET (2) with
+ * network-byte-order port + addr, which matches the net stack's u32 IP.
+ * ------------------------------------------------------------------------- */
+#define LINUX_SOCK_MAX   32
+#define LINUX_SOCK_FD    100        /* socket fds start here (file fds < 32) */
+#define LINUX_SOCK_STREAM 1
+#define LINUX_SOCK_DGRAM  2
+#define LINUX_AF_INET     2
+#define LINUX_ENOTSOCK   88
+#define LINUX_ECONNREFUSED 111
+
+typedef struct {
+    int  in_use;
+    int  type;          /* STREAM(conn) / LISTENER / DGRAM */
+    int  id;            /* conn id (STREAM) or listener id */
+    u32  peer_ip;       /* DGRAM default peer */
+    u16  peer_port;
+    u16  bound_port;
+} linux_sock_t;
+static linux_sock_t g_lsock[LINUX_SOCK_MAX];
+static spinlock_t    g_lsock_lock;
+
+static u16 ntohs16(u16 v) { return (u16)((v >> 8) | (v << 8)); }
+
+static int linux_sock_slot(int fd) {
+    int slot = fd - LINUX_SOCK_FD;
+    if (slot < 0 || slot >= LINUX_SOCK_MAX) return -1;
+    if (!g_lsock[slot].in_use) return -1;
+    return slot;
+}
+
+/* Linux socket(domain, type, protocol).  Returns a socket fd. */
+static i64 linux_socket(u64 domain, u64 type, u64 protocol) {
+    (void)protocol;
+    if (domain != LINUX_AF_INET) return -LINUX_EINVAL;
+    int st = ((type & 0xF) == LINUX_SOCK_STREAM) ? 1
+           : ((type & 0xF) == LINUX_SOCK_DGRAM)  ? 3 : 0;
+    if (!st) return -LINUX_EINVAL;
+    u64 fl = irq_save(); spin_lock(&g_lsock_lock);
+    int slot = -1;
+    for (int i = 0; i < LINUX_SOCK_MAX; i++) if (!g_lsock[i].in_use) { slot = i; break; }
+    if (slot >= 0) { g_lsock[slot].in_use = 1; g_lsock[slot].type = st; g_lsock[slot].id = -1; }
+    spin_unlock(&g_lsock_lock); irq_restore(fl);
+    return slot >= 0 ? (i64)(LINUX_SOCK_FD + slot) : -1;
+}
+
+/* parse a sockaddr_in from user memory into (ip, port).  sin_addr/port are
+ * NETWORK byte order; the net stack wants ip as a network-order u32
+ * (127.0.0.1 == 0x7F000001) and port in host order. */
+static int linux_parse_sockaddr(u64 addr, u64 len, u32 *ip, u16 *port) {
+    if (len < 8 || !uptr(addr, 8)) return -1;
+    u8 b[8];
+    stac(); memcpy(b, (void *)addr, 8); clac();
+    if ((b[0] | (b[1] << 8)) != LINUX_AF_INET) return -1;
+    *ip   = ((u32)b[4] << 24) | ((u32)b[5] << 16) | ((u32)b[6] << 8) | b[7];
+    *port = ntohs16((u16)(b[2] | (b[3] << 8)));
+    return 0;
+}
+
+static i64 linux_sock_close(int fd) {
+    int slot = linux_sock_slot(fd);
+    if (slot < 0) return -LINUX_ENOTSOCK;
+    u64 fl = irq_save(); spin_lock(&g_lsock_lock);
+    if (g_lsock[slot].type == 1 && g_lsock[slot].id >= 0)
+        net_tcp_close(g_lsock[slot].id);
+    g_lsock[slot].in_use = 0;
+    spin_unlock(&g_lsock_lock); irq_restore(fl);
+    return 0;
+}
+
+static i64 linux_sock_connect(int fd, u64 addr, u64 len) {
+    int slot = linux_sock_slot(fd);
+    if (slot < 0) return -LINUX_ENOTSOCK;
+    u32 ip; u16 port;
+    if (linux_parse_sockaddr(addr, len, &ip, &port) != 0) return -LINUX_EINVAL;
+    if (g_lsock[slot].type == 3) {           /* DGRAM: just record the peer */
+        g_lsock[slot].peer_ip = ip; g_lsock[slot].peer_port = port;
+        return 0;
+    }
+    int conn = net_tcp_connect(ip, port);
+    if (conn < 0) return -LINUX_ECONNREFUSED;
+    g_lsock[slot].id = conn;
+    return 0;
+}
+
+static i64 linux_sock_bind(int fd, u64 addr, u64 len) {
+    int slot = linux_sock_slot(fd);
+    if (slot < 0) return -LINUX_ENOTSOCK;
+    u32 ip; u16 port;
+    if (linux_parse_sockaddr(addr, len, &ip, &port) != 0) return -LINUX_EINVAL;
+    (void)ip;
+    g_lsock[slot].bound_port = port;
+    if (g_lsock[slot].type == 3) return net_udp_bind(port);
+    return 0;                                 /* TCP bind: listen() does the work */
+}
+
+static i64 linux_sock_listen(int fd, u64 backlog) {
+    (void)backlog;
+    int slot = linux_sock_slot(fd);
+    if (slot < 0) return -LINUX_ENOTSOCK;
+    int l = net_tcp_listen(g_lsock[slot].bound_port);
+    if (l < 0) return -1;
+    g_lsock[slot].type = 2;                  /* now a listener */
+    g_lsock[slot].id = l;
+    return 0;
+}
+
+static i64 linux_sock_accept(int fd, u64 addr, u64 addrlen) {
+    int slot = linux_sock_slot(fd);
+    if (slot < 0) return -LINUX_ENOTSOCK;
+    int child = net_tcp_accept(g_lsock[slot].id);
+    if (child == -2) return -1;              /* not yet: EAGAIN-ish */
+    if (child < 0) return -1;
+    /* allocate a new STREAM socket for the accepted connection */
+    u64 fl = irq_save(); spin_lock(&g_lsock_lock);
+    int s2 = -1;
+    for (int i = 0; i < LINUX_SOCK_MAX; i++) if (!g_lsock[i].in_use) { s2 = i; break; }
+    if (s2 >= 0) { g_lsock[s2].in_use = 1; g_lsock[s2].type = 1; g_lsock[s2].id = child; }
+    spin_unlock(&g_lsock_lock); irq_restore(fl);
+    if (addr && addrlen) {                   /* best-effort peer addr (zeros) */
+        if (uptr(addr, 16)) { stac(); memset((void *)addr, 0, 16); *(u32 *)(void *)addrlen = 16; clac(); }
+    }
+    return s2 >= 0 ? (i64)(LINUX_SOCK_FD + s2) : -1;
+}
+
+static i64 linux_sock_send(int fd, u64 buf, u64 len, u64 flags, u64 addr, u64 addrlen) {
+    (void)flags;
+    int slot = linux_sock_slot(fd);
+    if (slot < 0) return -LINUX_ENOTSOCK;
+    if (len > 4096) len = 4096;
+    if (!uptr(buf, len)) return -LINUX_EINVAL;
+    u8 k[4096]; stac(); memcpy(k, (void *)buf, len); clac();
+    if (g_lsock[slot].type == 3) {
+        u32 ip = g_lsock[slot].peer_ip; u16 port = g_lsock[slot].peer_port;
+        if (addr) {                          /* sendto: explicit dest */
+            u32 a; u16 p;
+            if (linux_parse_sockaddr(addr, addrlen, &a, &p) != 0) return -LINUX_EINVAL;
+            ip = a; port = p;
+        }
+        return net_udp_send(ip, port, k, (u16)len);
+    }
+    return net_tcp_send(g_lsock[slot].id, k, (int)len);
+}
+
+static i64 linux_sock_recv(int fd, u64 buf, u64 len, u64 flags, u64 addr, u64 addrlen) {
+    (void)flags;
+    int slot = linux_sock_slot(fd);
+    if (slot < 0) return -LINUX_ENOTSOCK;
+    if (len > 4096) len = 4096;
+    if (!uptr(buf, len)) return -LINUX_EINVAL;
+    if (g_lsock[slot].type == 3) {
+        u8 k[4096]; int n = net_udp_recv(k, (u16)len);
+        if (n <= 0) return 0;
+        stac(); memcpy((void *)buf, k, (size_t)n); clac();
+        return n;
+    }
+    u8 k[4096]; int n = net_tcp_recv(g_lsock[slot].id, k, (int)len);
+    if (n <= 0) return 0;
+    stac(); memcpy((void *)buf, k, (size_t)n); clac();
+    return n;
+}
+
+static i64 linux_sock_shutdown(int fd, u64 how) {
+    (void)how;
+    int slot = linux_sock_slot(fd);
+    if (slot < 0) return -LINUX_ENOTSOCK;
+    if (g_lsock[slot].type == 1 && g_lsock[slot].id >= 0)
+        net_tcp_close(g_lsock[slot].id);
+    g_lsock[slot].id = -1;
+    return 0;
+}
+
+/* Dispatch a Linux syscall.  Returns 1 = handled (rax set), 0 = translated
+ * (fall through to the YartOS switch). */
+static int linux_dispatch(cpu_regs_t *r) {
+    u64 nr = r->rax;
+    u64 a0 = r->rdi, a1 = r->rsi, a2 = r->rdx, a3 = r->r10, a4 = r->r8, a5 = r->r9;
+    switch (nr) {
+    /* ---- simple 1:1 -> translate and fall through ---- */
+    case 0:   r->rax = SYS_READ;   break;
+    case 1:   r->rax = SYS_WRITE;  break;
+    case 2:   r->rax = SYS_OPEN;   r->rdx = 0; break;
+    case 3:   /* close: route socket fds to the socket table, files to VFS */
+              if (a0 >= (u64)LINUX_SOCK_FD) { r->rax = (u64)linux_sock_close((int)a0); return 1; }
+              r->rax = SYS_CLOSE; break;
+    case 8:   r->rax = SYS_LSEEK;  break;
+    case 12:  r->rax = SYS_BRK;    break;                 /* brk(addr) */
+    case 39:  r->rax = SYS_GETPID; break;
+    case 59:  r->rax = SYS_EXEC;   break;                 /* execve(path,argv,envp) */
+    case 60:  r->rax = SYS_EXIT;   break;
+    case 79:  r->rax = SYS_GETCWD; break;                 /* getcwd */
+    case 80:  r->rax = SYS_CHDIR;  break;
+    case 81:  r->rax = SYS_MKDIR;  r->rsi = 0; break;     /* mkdir(path) */
+    case 82:  r->rax = SYS_RENAME; break;
+    case 87:  r->rax = SYS_UNLINK; break;                 /* unlink */
+    case 89:  r->rax = SYS_READLINK; break;               /* readlink */
+    case 90:  r->rax = SYS_CHMOD;  break;                 /* chmod */
+    case 231: { task_t *t = cur();                       /* exit_group */
+               sched_exit_group(t->pml4, (int)a0);
+               r->rax = SYS_EXIT; break; }               /* self exits after */
+
+    /* ---- Linux sockets -> the kernel TCP/UDP stack ---- */
+    case 41:  r->rax = (u64)linux_socket(a0, a1, a2); return 1;         /* socket */
+    case 42:  r->rax = (u64)linux_sock_connect((int)a0, a1, a2); return 1;
+    case 43:  r->rax = (u64)linux_sock_accept((int)a0, a1, a2); return 1;
+    case 44:  r->rax = (u64)linux_sock_send((int)a0, a1, a2, a3, a4, a5); return 1; /* sendto */
+    case 45:  r->rax = (u64)linux_sock_recv((int)a0, a1, a2, a3, a4, a5); return 1; /* recvfrom */
+    case 46:  r->rax = (u64)linux_sock_send((int)a0, a1, a2, a3, 0, 0); return 1;   /* send */
+    case 47:  r->rax = (u64)linux_sock_recv((int)a0, a1, a2, a3, 0, 0); return 1;   /* recv */
+    case 48:  r->rax = (u64)linux_sock_shutdown((int)a0, a1); return 1;
+    case 49:  r->rax = (u64)linux_sock_bind((int)a0, a1, a2); return 1;
+    case 50:  r->rax = (u64)linux_sock_listen((int)a0, a1); return 1;
+
+    /* ---- threads: clone(flags, stack, ptid, tls, ctid) ---- */
+    case 56:  { task_t *t = cur();
+                task_t *c = sched_clone_thread(t, r, a1, a4);
+                r->rax = c ? (u64)c->pid : (u64)-1;
+                return 1; }
+
+    /* ---- futex(addr, op, val, ...): the Linux fast mutex ---- */
+    case 202: { if (!uptr(a0, 4)) { r->rax = (u64)-LINUX_EINVAL; return 1; }
+                int op = (int)(a1 & 0x7F);
+                if (op == 0) {                                   /* FUTEX_WAIT */
+                    u32 curval; stac(); curval = *(u32 *)(void *)a0; clac();
+                    if (curval != (u32)a2) { r->rax = (u64)-11; return 1; }  /* -EAGAIN */
+                    sched_futex_wait(a0);
+                    r->rax = 0; return 1;
+                }
+                if (op == 1) {                                   /* FUTEX_WAKE */
+                    r->rax = (u64)sched_futex_wake(a0, (int)a2);
+                    return 1;
+                }
+                r->rax = (u64)-LINUX_ENOSYS; return 1; }
+
+    /* ---- complex: handled here ---- */
+    case 4:  { char kp[VFS_MAX_PATH];                       /* stat */
+               if (!copy_user_str(a0, kp, sizeof kp) || !uptr(a1, sizeof(linux_stat_t))) { r->rax = (u64)-LINUX_EINVAL; return 1; }
+               vnode_t *v = vfs_lookup_at(cur()->cwd, kp);
+               if (!v) { r->rax = (u64)-LINUX_ENOENT; return 1; }
+               linux_fill_stat(v, (void *)a1); r->rax = 0; return 1; }
+    case 5:  { fd_entry_t *f = fd_get((int)a0);             /* fstat */
+               if (!f || !uptr(a1, sizeof(linux_stat_t))) { r->rax = (u64)-LINUX_EBADF; return 1; }
+               linux_fill_stat(f->vn, (void *)a1); r->rax = 0; return 1; }
+    case 6:  { char kp[VFS_MAX_PATH];                       /* lstat (no symlink follow) */
+               if (!copy_user_str(a0, kp, sizeof kp) || !uptr(a1, sizeof(linux_stat_t))) { r->rax = (u64)-LINUX_EINVAL; return 1; }
+               vnode_t *v = vfs_lookup_at_nofollow(cur()->cwd, kp);
+               if (!v) { r->rax = (u64)-LINUX_ENOENT; return 1; }
+               linux_fill_stat(v, (void *)a1); r->rax = 0; return 1; }
+    case 9:   r->rax = (u64)linux_mmap(a0, a1, a2, a3, a4, a5); return 1;
+    case 10:  if (!uptr(a0, a1)) { r->rax = (u64)-LINUX_EINVAL; return 1; }
+              r->rax = 0; return 1;                          /* mprotect: accepted */
+    case 11:  r->rax = (u64)sys_munmap(a0); return 1;        /* munmap */
+    case 13:  if (uptr(a1, 32)) {                            /* rt_sigaction */
+                  u64 handler; stac(); handler = *(u64 *)(void *)a1; clac();
+                  sys_sigaction((u32)a0, handler);
+              }
+              r->rax = 0; return 1;
+    case 14:  r->rax = 0; return 1;                          /* rt_sigprocmask: no-op */
+    case 20:  r->rax = (u64)linux_writev((int)a0, (void *)a1, a2); return 1;
+    case 21:  r->rax = (u64)linux_access((const char *)a0, a1); return 1;
+    case 63:  { if (!uptr(a0, sizeof(linux_utsname_t))) { r->rax = (u64)-LINUX_EINVAL; return 1; }
+                linux_utsname_t u; memset(&u, 0, sizeof u);
+                const char *sys = "YartOS", *node = "yart", *rel = "0.8.0",
+                           *ver = "YartOS 0.8.0-max", *mach = "x86_64";
+                stac();
+                memcpy(u.s, sys, 6); memcpy(u.s + 65, node, 5);
+                memcpy(u.s + 130, rel, 6); memcpy(u.s + 195, ver, 18);
+                memcpy(u.s + 260, mach, 7);
+                memcpy((void *)a0, &u, sizeof u); clac();
+                r->rax = 0; return 1; }
+    case 96:  { if (!uptr(a0, 16)) { r->rax = (u64)-LINUX_EINVAL; return 1; }  /* gettimeofday */
+                u64 sec = linux_epoch_seconds(), usec = 0;
+                stac(); *(u64 *)(void *)a0 = sec; *(u64 *)(void *)(a0 + 8) = usec; clac();
+                r->rax = 0; return 1; }
+    case 102: r->rax = (u64)cur()->uid;  return 1;           /* getuid */
+    case 104: r->rax = (u64)cur()->gid;  return 1;           /* getgid */
+    case 107: r->rax = (u64)cur()->euid; return 1;           /* geteuid */
+    case 108: r->rax = (u64)cur()->gid;  return 1;           /* getegid */
+    case 158: { task_t *t = cur();                            /* arch_prctl */
+                if (a0 == 0x1002) {                            /* SET_FS */
+                    t->linux_fs_base = a1;
+                    /* apply IMMEDIATELY (this CPU is running the task); the
+                     * switch_to path also re-applies it for other CPUs */
+                    wrmsr64(MSR_FS_BASE, a1);
+                    r->rax = 0; return 1;
+                }
+                if (a0 == 0x1003) { r->rax = (u64)t->linux_fs_base; return 1; }      /* GET_FS */
+                r->rax = (u64)-LINUX_EINVAL; return 1; }
+    case 201: r->rax = (u64)linux_epoch_seconds(); return 1; /* time() */
+    case 217: r->rax = (u64)linux_getdents64((int)a0, (char *)a1, a2); return 1;
+    case 228: { if (!uptr(a1, 16)) { r->rax = (u64)-LINUX_EINVAL; return 1; }  /* clock_gettime */
+                u64 sec = linux_epoch_seconds(), nsec = 0;
+                stac(); *(u64 *)(void *)a1 = sec; *(u64 *)(void *)(a1 + 8) = nsec; clac();
+                r->rax = 0; return 1; }
+    case 257: { char kp[VFS_MAX_PATH];                       /* openat */
+                if (!copy_user_str(a1, kp, sizeof kp)) { r->rax = (u64)-LINUX_EINVAL; return 1; }
+                if ((i64)a0 != LINUX_AT_FDCWD) { r->rax = (u64)-LINUX_ENOSYS; return 1; }
+                r->rax = SYS_OPEN; r->rdi = a1; r->rsi = a2; r->rdx = 0;
+                return 0; }                                  /* fall through as open */
+
+    default:
+        r->rax = (u64)-LINUX_ENOSYS;
+        return 1;
+    }
+    return 0;   /* fall through to the YartOS switch */
+}
+
 static void syscall_handler(cpu_regs_t *r) {
     check_user_segments(r);
     g_sys_from_user = ((r->cs & 3) == 3);
+    if (g_sys_from_user && cur()->linux_abi) {
+        if (linux_dispatch(r) == 1) return;   /* handled (or -ENOSYS) */
+        /* else: translated -> fall through to the YartOS switch */
+    }
     u64 a0 = r->rdi, a1 = r->rsi, a2 = r->rdx;
             switch (r->rax) {
     case SYS_EXIT:     sched_exit((int)a0); r->rax = 0; break;
@@ -1567,6 +2073,8 @@ static void syscall_handler(cpu_regs_t *r) {
     case SYS_PASSWD:       r->rax = (u64)sys_passwd((const char *)a0, (const char *)a1); break;
     case SYS_REBOOT:       sys_reboot(); r->rax = -1; break;
     case SYS_DUP2:         r->rax = (u64)sys_dup2((int)a0, (int)a1); break;
+    case SYS_SYMLINK:      r->rax = (u64)sys_symlink((const char *)a0, (const char *)a1); break;
+    case SYS_READLINK:     r->rax = (u64)sys_readlink((const char *)a0, (char *)a1, a2); break;
     default:
         kprintf("syscall: bad #%lu\n", r->rax);
         r->rax = (u64)-1;
@@ -2151,13 +2659,26 @@ void wm_surface_owner_died(u32 pid) {
             wm_surface_teardown(s, false);
     }
     if (g_focus_pid == pid) g_focus_pid = 0;
+
+    /* If the COMPOSITOR itself died, reclaim the framebuffer so a new
+     * compositor (a restarted graphical session) can claim it.  Without this,
+     * g_wm_task points at a dead task forever and no process can ever take
+     * over the screen - the WM session model is impossible.  The wm task's
+     * pml4 (and its fb PTEs) is freed by the reaper, which unrefs the fb
+     * pages we ref'd in sys_fb_info, so this just clears the claim. */
+    if (g_wm_task && g_wm_task->pid == pid) {
+        kprintf("wm: compositor (pid %u) died - reclaiming framebuffer\n", pid);
+        g_wm_task = NULL;
+        g_wm_uaddr = NULL;
+        g_wm_pages = 0;
+        /* drop to the text fallback screen (no wm to composite for us) */
+        fb_fallback_screen();
+    }
 }
 
-/* SYS_TIME_MS -> uptime in milliseconds */
+/* SYS_TIME_MS -> uptime in milliseconds (TSC-backed monotonic clock). */
 static u64 sys_time_ms(void) {
-    /* PIT/pit_ticks() increments at 100 Hz -> 10 ms per tick (PIT remains
-     * active as a backup time source). */
-    return pit_ticks() * 10ULL;
+    return time_ms();
 }
 
 void syscall_install_percpu(void) {

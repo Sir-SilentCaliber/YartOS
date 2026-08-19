@@ -4,6 +4,144 @@
  * main loop, input routing, cursor, backdrop compositing, config loading,
  * process management and app launching. */
 #include "wm.h"
+#include "jpeg_enc.h"
+
+/* ---- screenshot + screen recording (roadmap #6) ----
+ * The compositor owns the framebuffer (G_fb), so it captures a rectangle by
+ * copying it into a contiguous buffer, JPEG-encoding it (jpeg_enc.c), and
+ * writing to /home/yart/Screenshots/.  Screen recording appends the same
+ * encoded frames to an MJPEG file. */
+static int shot_counter = 0;
+
+static void capture_rect(int x, int y, int w, int h, const char *path) {
+    if (w <= 0 || h <= 0) return;
+    /* the encoder needs dims that are multiples of 16 (4:2:0) */
+    if ((w & 15) || (h & 15)) return;
+    /* clamp to the framebuffer */
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > G_fb.w) w = G_fb.w - x;
+    if (y + h > G_fb.h) h = G_fb.h - y;
+    if (w <= 0 || h <= 0) return;
+
+    u32 *buf = (u32 *)mmap((long)w * h * 4 + 4096);
+    if (!buf) return;
+    for (int row = 0; row < h; row++)
+        memcpy(buf + (long)row * w, G_fb.px + (long)(y + row) * G_fb.pitch + x, (size_t)w * 4);
+
+    unsigned char *jpg = (unsigned char *)mmap((long)w * h * 2 + 4096);
+    int len = jpeg_encode(buf, w, h, w, 85, jpg, (unsigned int)w * h * 2);
+
+    if (len > 0) {
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC);
+        if (fd >= 0) { write(fd, jpg, (size_t)len); fsync(fd); close(fd); }
+    }
+    munmap((long)buf);
+    munmap((long)jpg);
+}
+
+static void screenshot_full(void) {
+    mkdir("/home/yart/Screenshots");
+    char path[96];
+    /* Screenshots/shot_N.jpg */
+    int k = 0; const char *p = "/home/yart/Screenshots/shot_"; while (*p) path[k++] = *p++;
+    char num[16]; int j = 0, v = shot_counter++; if (!v) num[j++] = '0';
+    while (v) { num[j++] = (char)('0' + v % 10); v /= 10; }
+    while (j) path[k++] = num[--j];
+    const char *e = ".jpg"; while (*e) path[k++] = *e++;
+    path[k] = 0;
+    capture_rect(0, 0, G_fb.w, G_fb.h, path);
+    osd("Screenshot saved");
+}
+
+static void screenshot_window(void) {
+    if (G_focus_win < 0 || G_focus_win >= MAX_WIN) return;
+    win_t *w = &G_win[G_focus_win];
+    if (!w->active) return;
+    int cx, cy, cw, ch; win_client_rect(w, &cx, &cy, &cw, &ch);
+    mkdir("/home/yart/Screenshots");
+    char path[96];
+    int k = 0; const char *p = "/home/yart/Screenshots/win_"; while (*p) path[k++] = *p++;
+    char num[16]; int j = 0, v = shot_counter++; if (!v) num[j++] = '0';
+    while (v) { num[j++] = (char)('0' + v % 10); v /= 10; }
+    while (j) path[k++] = num[--j];
+    const char *e = ".jpg"; while (*e) path[k++] = *e++;
+    path[k] = 0;
+    capture_rect(cx, cy, cw, ch, path);
+    osd("Window captured");
+}
+
+/* region selection: drag a rectangle, then capture it on release */
+static bool G_shot_region = false;
+static int G_shot_x0, G_shot_y0;
+
+/* ---- screen recording (MJPEG) ---- */
+static bool G_recording = false;
+static int  G_rec_fd = -1;
+static int  G_rec_frame = 0;
+static long G_rec_last = 0;
+
+static void record_frame(void) {
+    /* capture a downscaled (2x) frame to keep the file size + TCG cost sane */
+    int w = G_fb.w / 2, h = G_fb.h / 2;
+    u32 *buf = (u32 *)mmap((long)w * h * 4 + 4096);
+    if (!buf) return;
+    for (int row = 0; row < h; row++) {
+        u32 *src = G_fb.px + (long)(row * 2) * G_fb.pitch;
+        u32 *dst = buf + (long)row * w;
+        for (int col = 0; col < w; col++)
+            dst[col] = src[col * 2];   /* nearest-neighbour 2x downscale */
+    }
+    unsigned char *jpg = (unsigned char *)mmap((long)w * h * 2 + 4096);
+    int len = jpeg_encode(buf, w, h, w, 80, jpg, (unsigned int)w * h * 2);
+    if (len > 0 && G_rec_fd >= 0) {
+        unsigned char sz[4] = { (unsigned char)(len >> 24), (unsigned char)(len >> 16),
+                                (unsigned char)(len >> 8),  (unsigned char)len };
+        write(G_rec_fd, sz, 4);
+        write(G_rec_fd, jpg, (size_t)len);
+    }
+    munmap((long)buf);
+    munmap((long)jpg);
+}
+
+static void record_toggle(void) {
+    if (G_recording) {
+        G_recording = false;
+        if (G_rec_fd >= 0) { fsync(G_rec_fd); close(G_rec_fd); G_rec_fd = -1; }
+        osd("Recording saved");
+    } else {
+        mkdir("/home/yart/Screenshots");
+        char path[96]; int k = 0; const char *p = "/home/yart/Screenshots/rec_";
+        while (*p) path[k++] = *p++;
+        char num[16]; int j = 0, v = shot_counter++; if (!v) num[j++] = '0';
+        while (v) { num[j++] = (char)('0' + v % 10); v /= 10; }
+        while (j) path[k++] = num[--j];
+        const char *e = ".mjpeg"; while (*e) path[k++] = *e++;
+        path[k] = 0;
+        G_rec_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC);
+        if (G_rec_fd < 0) { osd("Recording failed"); return; }
+        G_recording = true;
+        G_rec_frame = 0;
+        G_rec_last = time_ms();
+        osd("Recording started (Super+R to stop)");
+    }
+}
+
+/* ---- userland TSC clock (for precise frame pacing) ----
+ * `time_ms()` is a syscall (expensive per call), so the frame loop must not
+ * busy-poll it.  We calibrate the TSC rate ONCE here (rdtsc is unprivileged)
+ * against two time_ms() samples 50 ms apart, then busy-wait with an inline
+ * rdtsc - zero syscalls in the pacing tail.  This is the same vDSO trick a
+ * real OS uses to hand the clock to userspace. */
+static inline u64 wm_rdtsc(void){ u32 lo,hi; __asm__ volatile("rdtsc":"=a"(lo),"=d"(hi)); return ((u64)hi<<32)|lo; }
+static u64 g_tsc_per_ms;         /* TSC counts per ms (0 = uncalibrated) */
+static u64 g_tsc_base;           /* TSC value at a known time_ms()        */
+static long g_ms_base;           /* the known time_ms() value             */
+
+/* absolute TSC value for a given time_ms() deadline */
+static inline u64 tsc_deadline(long ms){
+    return g_tsc_base + (u64)(ms - g_ms_base) * g_tsc_per_ms;
+}
 
 /* ---- global state definitions (see wm.h for the shared contract) ---- */
 surface_t G_fb, G_wp;
@@ -22,6 +160,9 @@ int     G_apps;
 bool    G_grid, G_overview, G_quick, G_calendar, G_dockmenu, G_switcher;
 bool    G_locked = true;   /* login at boot: the lock screen is the login screen (real auth, like an enterprise OS) */
 bool    G_super_held = false;
+/* Session-end flag: Ctrl+Alt+Backspace sets it; wm_run()'s loop checks it and
+ * returns, so init can exit and the kernel can reclaim the framebuffer. */
+static bool G_session_end = false;
 /* Lock screen auth state (real password check via SYS_AUTH_VERIFY). */
 bool    G_lock_prompt = false;
 char    G_lock_pw[64];
@@ -77,12 +218,31 @@ int     G_pending_n;
 
 void osd(const char *m){ int i=0; while(m[i]&&i<(int)sizeof(G_osd)-1){G_osd[i]=m[i];i++;} G_osd[i]=0; G_osd_t0=time_ms(); }
 
+/* Ask the compositor to end the graphical session. */
+void wm_session_end(void){ G_session_end = true; }
+
 int icon_for_path(const char *p){
     if(strcmp(p,"/bin/nyra")==0) return ICON_DOCK_TERMINAL;
     if(strcmp(p,"/bin/files")==0) return ICON_DOCK_FILES;
     if(strcmp(p,"/bin/settings")==0) return ICON_DOCK_SETTINGS;
     if(strcmp(p,"/bin/browser")==0) return ICON_DOCK_BROWSER;
     if(strcmp(p,"/bin/editor")==0) return ICON_DOCK_EDITOR;
+    if(strcmp(p,"/bin/camera")==0) return ICON_DEV_CAMERA_PHOTO;
+    if(strcmp(p,"/bin/viewer")==0) return ICON_MIME_IMAGE_X_GENERIC;
+    return ICON_MIME_APPLICATION_X_EXECUTABLE;
+}
+
+/* map a .desktop Icon= name to an icon enum */
+int icon_for_name(const char *n){
+    if(strcmp(n,"calculator")==0) return ICON_DOCK_CALC;
+    if(strcmp(n,"camera")==0) return ICON_DEV_CAMERA_PHOTO;
+    if(strcmp(n,"viewer")==0 || strcmp(n,"image")==0) return ICON_MIME_IMAGE_X_GENERIC;
+    if(strcmp(n,"terminal")==0) return ICON_DOCK_TERMINAL;
+    if(strcmp(n,"files")==0) return ICON_DOCK_FILES;
+    if(strcmp(n,"settings")==0) return ICON_DOCK_SETTINGS;
+    if(strcmp(n,"editor")==0) return ICON_DOCK_EDITOR;
+    if(strcmp(n,"browser")==0) return ICON_DOCK_BROWSER;
+    if(strcmp(n,"video")==0) return ICON_DEV_CAMERA_VIDEO;
     return ICON_MIME_APPLICATION_X_EXECUTABLE;
 }
 
@@ -92,9 +252,85 @@ void add_app(const char *name,const char *path,int icon){
     for(int i=0;i<G_apps;i++) if(strcmp(G_app[i].path,path)==0) return;
     copy_str(G_app[G_apps].name,name,sizeof(G_app[0].name));
     copy_str(G_app[G_apps].path,path,sizeof(G_app[0].path));
-    G_app[G_apps].icon=icon; G_app[G_apps].removable=(path[0]=='/'); G_apps++;
+    G_app[G_apps].icon=icon; G_app[G_apps].removable=(path[0]=='/'); G_app[G_apps].dynamic=false; G_apps++;
 }
 int app_index(const char *path){ for(int i=0;i<G_apps;i++) if(strcmp(G_app[i].path,path)==0) return i; return -1; }
+
+/* add/refresh an app discovered from a the desktop-entry dir file.
+ * Dynamic apps are re-derived every scan, so `apk del` (which removes the
+ * .desktop file) makes the app vanish from the launcher on the next scan. */
+static void add_desktop_app(const char *name,const char *path,int icon){
+    for(int i=0;i<G_apps;i++){
+        if(G_app[i].dynamic && strcmp(G_app[i].path,path)==0){
+            copy_str(G_app[i].name,name,sizeof(G_app[0].name));
+            G_app[i].icon=icon; return;
+        }
+    }
+    if(G_apps>=MAX_APPS) return;
+    for(int i=0;i<G_apps;i++) if(strcmp(G_app[i].path,path)==0) return;
+    copy_str(G_app[G_apps].name,name,sizeof(G_app[0].name));
+    copy_str(G_app[G_apps].path,path,sizeof(G_app[0].path));
+    G_app[G_apps].icon=icon; G_app[G_apps].removable=true; G_app[G_apps].dynamic=true; G_apps++;
+}
+
+/* drop dynamic apps whose .desktop entry no longer exists */
+static void prune_desktop_apps(void){
+    for(int i=0;i<G_apps;){
+        if(!G_app[i].dynamic){ i++; continue; }
+        char dp[180]; copy_str(dp,"/usr/share/applications/",sizeof dp);
+        int k=(int)strlen(dp);
+        const char *base=G_app[i].path;
+        for(const char *p=base;*p;p++) if(*p=='/') base=p+1;
+        for(const char *p=base;*p&&k<170;p++) dp[k++]=*p;
+        const char *suf=".desktop"; while(*suf&&k<179) dp[k++]=*suf++;
+        dp[k]=0;
+        int fd=open(dp,0);
+        if(fd>=0){ close(fd); i++; continue; }
+        for(int j=i;j<G_apps-1;j++) G_app[j]=G_app[j+1];
+        G_apps--;
+    }
+}
+
+/* Scan the desktop-entry dir and register every launchable app.
+ * This is the same mechanism GNOME/KDE use: `apk add <pkg>` drops a .desktop
+ * entry, the compositor notices, and the app appears in the Super launcher. */
+void scan_desktop_apps(void){
+    prune_desktop_apps();
+    int fd=open("/usr/share/applications",0);
+    if(fd<0) return;
+    yart_dirent_t de[32];
+    long n;
+    while((n=getdents(fd,de,32))>0){
+        for(long i=0;i<n;i++){
+            if(de[i].type!=1) continue;
+            const char *nm=de[i].name;
+            int L=(int)strlen(nm);
+            if(L<=8 || strcmp(nm+L-8,".desktop")!=0) continue;
+            char full[180]; copy_str(full,"/usr/share/applications/",sizeof full);
+            int k=(int)strlen(full);
+            for(int j=0;nm[j]&&k<170;j++) full[k++]=nm[j];
+            full[k]=0;
+            char buf[512];
+            int f2=open(full,0);
+            if(f2<0) continue;
+            long r=read(f2,buf,sizeof buf-1); close(f2);
+            if(r<=0) continue;
+            buf[r]=0;
+            char name[40]={0}, exec[72]={0}, iconn[32]={0};
+            for(int p=0;buf[p];){
+                int e=p; while(buf[e]&&buf[e]!='\n') e++;
+                char saved=buf[e]; buf[e]=0;
+                if(strncmp(buf+p,"Name=",5)==0) copy_str(name,buf+p+5,sizeof name);
+                else if(strncmp(buf+p,"Exec=",5)==0) copy_str(exec,buf+p+5,sizeof exec);
+                else if(strncmp(buf+p,"Icon=",5)==0) copy_str(iconn,buf+p+5,sizeof iconn);
+                buf[e]=saved; p=saved?e+1:e;
+            }
+            if(!name[0]||!exec[0]) continue;
+            add_desktop_app(name,exec,icon_for_name(iconn));
+        }
+    }
+    close(fd);
+}
 
 void save_config(void){
     int fd=open("/home/yart/desktop.conf",O_WRONLY|O_CREAT|O_TRUNC); if(fd<0) return;
@@ -108,6 +344,9 @@ static void load_apps_config(void){
     add_app("Files","/bin/files",ICON_DOCK_FILES);
     add_app("Settings","/bin/settings",ICON_DOCK_SETTINGS);
     add_app("Text","/bin/editor",ICON_DOCK_EDITOR);
+    add_app("Video","/bin/media",ICON_ACT_MEDIA_PLAYBACK_START);
+    add_app("Camera","/bin/camera",ICON_DEV_CAMERA_PHOTO);
+    add_app("Viewer","/bin/viewer",ICON_MIME_IMAGE_X_GENERIC);
 }
 static void load_desktop_config(void){
     G_desk_n=0;
@@ -127,7 +366,7 @@ static void load_desktop_config(void){
     }
 }
 void load_all(void){
-    load_apps_config(); default_dock(); dock_apply_hidden();
+    load_apps_config(); scan_desktop_apps(); default_dock(); dock_apply_hidden();
     int fd=open("/home/yart/dock.conf",0);
     if(fd>=0){ char buf[1024]; long n=read(fd,buf,sizeof(buf)-1); close(fd); if(n>0){ buf[n]=0; char *p=buf; while(*p){ char *e=p; while(*e&&*e!='\n')e++; char old=*e; *e=0; if(strncmp(p,"pin=",4)==0) add_dock_app(p+4,p+4,icon_for_path(p+4),true); p=old?e+1:e; } } }
     load_desktop_config();
@@ -327,14 +566,28 @@ static bool netlist_ssid_at(int idx, char *out){
 static void handle_press(int x,int y,int button){
     if(G_locked) return;      /* ignore clicks while locked */
     G_pressed_x=x; G_pressed_y=y;
+    if(G_shot_region && button==1){
+        /* region-select mode: start the selection rectangle */
+        G_shot_x0 = G_mx0 = G_mx1 = x;
+        G_shot_y0 = G_my0 = G_my1 = y;
+        G_marquee = true;
+        return;
+    }
     if(button==3){
         if(G_menu){menu_close();return;}
         if(G_grid){ int ai; if(app_grid_hit(x,y,&ai)){ if(ai>=0)menu_open(x,y,2,ai); return; } }
         /* right-click a window titlebar -> Skift window menu (Restore /
-         * Maximize / Minimize / Snap Left / Snap Right / Close) */
+         * Maximize / Minimize / Snap Left / Snap Right / Close).  A
+         * right-click in the window CONTENT area (not the titlebar) must NOT
+         * fall through to the desktop menu - it previously did, so
+         * right-clicking inside the Console showed "Personalize/Settings"
+         * (the desktop menu).  Content-area right-clicks are now a no-op
+         * (the app owns its own context menu if any). */
         win_t *rw=win_at(x,y);
         if(rw){ int rty=rw->y-TB_H; if(rty<PANEL_H)rty=PANEL_H;
-            if(ptin(x,y,rw->x,rty,rw->x+rw->w,rty+TB_H)){ menu_open_win(x,y,rw); return; } }
+            if(ptin(x,y,rw->x,rty,rw->x+rw->w,rty+TB_H)){ menu_open_win(x,y,rw); return; }
+            return;   /* inside window content: swallow, no desktop menu */
+        }
         int i=dock_hit(x,y); if(i>=0){menu_open(x,y,1,i);return;}
         int di=desk_hit(x,y); if(desktop_area(y)&&di>=0){G_sel_desk=di; menu_open(x,y,3,di);return;}
         if(desktop_area(y)){G_sel_desk=-1; menu_open(x,y,3,-1);return;}
@@ -387,10 +640,13 @@ static void handle_press(int x,int y,int button){
         return;
     }
     win_t *w=win_at(x,y);
-    if(w){ int ty=w->y-TB_H; if(ty<PANEL_H)ty=PANEL_H; bring_front(w); wm_focus(w->owner); G_focus_win=(int)(w-G_win);
-        if(ptin(x,y,w->x,ty,w->x+w->w,ty+TB_H)){
+    if(w){
+        int cx0, cy0, cw0, ch0; win_client_rect(w, &cx0, &cy0, &cw0, &ch0);
+        int ty=cy0-TB_H; if(ty<PANEL_H)ty=PANEL_H;
+        bring_front(w); wm_focus(w->owner); G_focus_win=(int)(w-G_win);
+        if(ptin(x,y,cx0,ty,cx0+cw0,ty+TB_H)){
             /* [min] [max] [close] buttons on the right (Skift style) */
-            int bx=w->x+w->w-TB_H+4, by=ty+4, bs=TB_H-8;
+            int bx=cx0+cw0-TB_H+4, by=ty+4, bs=TB_H-8;
             if(ptin(x,y,bx,by,bx+bs,by+bs)){ close_win(w); return; }         /* close */
             bx-=bs+2;
             if(ptin(x,y,bx,by,bx+bs,by+bs)){ toggle_max(w); return; }        /* maximize */
@@ -400,12 +656,15 @@ static void handle_press(int x,int y,int button){
                 long now=time_ms();
                 if(now-G_last_title_click<320){ toggle_max(w); G_last_title_click=0; return; }
                 G_last_title_click=now;
-                G_title_drag=true;G_drag_win=(int)(w-G_win);G_drag_dx=x-w->x;G_drag_dy=(y+TB_H)-w->y;
+                /* anchor = offset of the grab point inside the titlebar, so the
+                 * window tracks the cursor exactly (no jump). */
+                G_title_drag=true;G_drag_win=(int)(w-G_win);
+                G_drag_dx=x-cx0; G_drag_dy=y-ty;
             } return;
         }
         if(!w->maximized){
-            int onl=x>=w->x-4&&x<=w->x+6, onr=x<=w->x+w->w+4&&x>=w->x+w->w-6;
-            int onb=y<=ty+TB_H+w->h+4&&y>=ty+TB_H+w->h-6;
+            int onl=x>=cx0-4&&x<=cx0+6, onr=x<=cx0+cw0+4&&x>=cx0+cw0-6;
+            int onb=y<=ty+TB_H+ch0+4&&y>=ty+TB_H+ch0-6;
             int ont=y>=ty-4&&y<=ty+4;
             if(onl||onr||onb||ont){ G_resize_win=(int)(w-G_win); G_resize_edges=(onl?1:0)|(onr?2:0)|(ont?4:0)|(onb?8:0); return; }
         }
@@ -435,20 +694,38 @@ void win_snap(win_t*w,int side){
 }
 static win_t*focused_win(void){ if(G_focus_win<0)return 0; win_t*w=&G_win[G_focus_win]; if(w->active)return w; return 0; }
 static void handle_drag(int x,int y){
+    if(G_shot_region && G_marquee){
+        G_mx1 = x; G_my1 = y;
+        damage_whole();
+        return;
+    }
     if(G_quick){ int bx=G_quick_x+16, slx=bx+26, slw=G_quick_w-58;
         if(G_mb&1 && x>=slx-4 && x<=slx+slw+4){ int v=(x-slx)*100/slw; if(v<0)v=0; if(v>100)v=100; G_vol=v; G_audio=v>0; audio_vol(v); damage_add((GfxRect){G_quick_x-4,G_quick_y-4,G_quick_w+8,G_quick_h+8}); return; } }
     if(G_resize_win>=0&&G_resize_win<MAX_WIN&&G_win[G_resize_win].active){ win_t*w=&G_win[G_resize_win];
-        int nx=w->x, ny=w->y, nw=w->w, nh=w->h;
-        if(G_resize_edges&1){ int dx=x-w->x; if(w->w-dx>=240){nx=x;nw=w->w-dx;} }
-        if(G_resize_edges&2){ nw=x-w->x; if(nw<240)nw=240; }
-        if(G_resize_edges&4){ int dh=w->y-y; if(w->h+dh>=120){ ny=y; nh=w->h+dh; } }
-        if(G_resize_edges&8){ nh=y-(w->y-TB_H)-TB_H; if(nh<120)nh=120; }
+        int cx0, cy0, cw0, ch0; win_client_rect(w, &cx0, &cy0, &cw0, &ch0);
+        int nx=cx0, ny=cy0, nw=cw0, nh=ch0;
+        if(G_resize_edges&1){ /* left  : right edge stays, left follows cursor */ int n=cx0+cw0-x; if(n>=240){ nx=x; nw=n; } }
+        if(G_resize_edges&2){ /* right : left stays, right follows cursor  */ nw=x-cx0; if(nw<240)nw=240; }
+        if(G_resize_edges&4){ /* top   : bottom stays, titlebar top follows */ int nt=y+TB_H; int nh2=(cy0+ch0)-nt; if(nh2>=120&&nt>=PANEL_H+TB_H){ ny=nt; nh=nh2; } }
+        if(G_resize_edges&8){ /* bottom: top stays, bottom follows cursor   */ nh=y-cy0; if(nh<120)nh=120; }
         if(nx<0){nx=0;} if(nx+nw>G_fb.w){nw=G_fb.w-nx;}
+        /* kernel surface caps (WM_SURF_MAX_*): never ask the kernel to resize
+         * beyond them or wm_resize() fails and the rect disagrees next scan. */
+        if(nw>640)nw=640;
+        if(nh>480)nh=480;
         wm_move(w->id,nx,ny); wm_resize(w->id,nw,nh); w->x=nx;w->y=ny;w->w=nw;w->h=nh;w->dirty=true; }
     else if(G_title_drag&&G_drag_win>=0&&G_drag_win<MAX_WIN&&G_win[G_drag_win].active){
         /* drag slop: ignore tiny movements so clicks don't jiggle the window */
         if(absi(x-G_pressed_x)+absi(y-G_pressed_y) < 5) return;
-        win_t*w=&G_win[G_drag_win]; int nx=x-G_drag_dx,ny=maxi(PANEL_H+24,y-G_drag_dy); if(nx<20)nx=20; if(nx>G_fb.w-60)nx=G_fb.w-60; wm_move(w->id,nx,ny); w->x=nx;w->y=ny;w->dirty=true; }
+        win_t*w=&G_win[G_drag_win];
+        /* G_drag_dx/dy = grab offset within the client/titlebar, so the window
+         * tracks the cursor exactly.  Client top = titlebar top + TB_H. */
+        int nx=x-G_drag_dx;
+        int ny=(y-G_drag_dy)+TB_H;
+        if(nx<0)nx=0;
+        if(nx+w->w>G_fb.w)nx=G_fb.w-w->w;
+        if(ny<PANEL_H+TB_H)ny=PANEL_H+TB_H;
+        wm_move(w->id,nx,ny); w->x=nx;w->y=ny;w->dirty=true; }
     if(G_icon_drag&&G_drag_icon>=0){ int nx=x-G_icon_dx,ny=y-G_icon_dy; if(nx<8)nx=8; if(ny<PANEL_H+8)ny=PANEL_H+8; if(nx>G_fb.w-96)nx=G_fb.w-96; if(ny>G_dock_y-96)ny=G_dock_y-96; G_desk[G_drag_icon].gx=nx; G_desk[G_drag_icon].gy=ny; g_backdrop_dirty=true; damage_whole(); }
     else if(G_desktop_drag&&desktop_area(G_pressed_y)){ if(absi(x-G_pressed_x)>4||absi(y-G_pressed_y)>4)G_marquee=true;
         GfxRect oldr={(G_mx0<G_mx1?G_mx0:G_mx1)-1,(G_my0<G_my1?G_my0:G_my1)-1,absi(G_mx1-G_mx0)+2,absi(G_my1-G_my0)+2};
@@ -459,6 +736,31 @@ static void handle_drag(int x,int y){
 }
 static void handle_release(int x,int y,int button){
     if(button!=1)return;
+    if(G_shot_region && G_marquee){
+        G_shot_region = false; G_marquee = false;
+        int x0 = G_mx0 < G_mx1 ? G_mx0 : G_mx1;
+        int y0 = G_my0 < G_my1 ? G_my0 : G_my1;
+        int x1 = G_mx0 > G_mx1 ? G_mx0 : G_mx1;
+        int y1 = G_my0 > G_my1 ? G_my0 : G_my1;
+        /* round to multiples of 16 (encoder's 4:2:0 requirement) */
+        int w = (x1 - x0) & ~15, h = (y1 - y0) & ~15;
+        if (w >= 16 && h >= 16) {
+            mkdir("/home/yart/Screenshots");
+            char path[96]; int k = 0; const char *p = "/home/yart/Screenshots/region_";
+            while (*p) path[k++] = *p++;
+            char num[16]; int j = 0, v = shot_counter++; if (!v) num[j++] = '0';
+            while (v) { num[j++] = (char)('0' + v % 10); v /= 10; }
+            while (j) path[k++] = num[--j];
+            const char *e = ".jpg"; while (*e) path[k++] = *e++;
+            path[k] = 0;
+            capture_rect(x0 & ~15, y0 & ~15, w, h, path);
+            osd("Region captured");
+        } else {
+            osd("Region too small");
+        }
+        damage_whole();
+        return;
+    }
     if(G_grid&&G_sel_app>=0){ int ai; if(app_grid_hit(x,y,&ai)&&ai==G_sel_app){launch_app(G_app[ai].path);G_grid=false;} G_sel_app=-1; }
     if(G_title_drag){
         G_title_drag=false; G_drag_win=-1;
@@ -498,8 +800,25 @@ static void handle_release(int x,int y,int button){
         }
         G_drag_icon=-1;
     }
-    if(G_desktop_drag){ if(!G_marquee&&G_sel_desk<0){} G_desktop_drag=false; }
+    if(G_desktop_drag){ G_desktop_drag=false; G_marquee=false; G_multi_sel=false; damage_whole(); }
 }
+/* Advance the window switcher to the next window (or open it on first press).
+ * Shared by Alt+Tab and Super+Tab. */
+static void switcher_advance(void){
+    if(!G_switcher) G_switcher_idx = -1;        /* first press: start fresh */
+    G_switcher = true;
+    int start = G_switcher_idx;
+    for(int step=0; step<MAX_WIN; step++){
+        G_switcher_idx = (G_switcher_idx+1) % MAX_WIN;
+        win_t *c = &G_win[G_switcher_idx];
+        if(c->active && !c->minimized && !c->closing && (c->workspace==G_workspace || c->workspace<0)) break;
+    }
+    if(start == G_switcher_idx && !(G_win[G_switcher_idx].active && !G_win[G_switcher_idx].minimized && !G_win[G_switcher_idx].closing && (G_win[G_switcher_idx].workspace==G_workspace || G_win[G_switcher_idx].workspace<0))){
+        G_switcher = false;
+    }
+    damage_whole();
+}
+
 static void handle_key(int ev){
     int ascii=ev&255, make=!(ev&WM_KEY_RELEASE), sc=(ev>>8)&255;
     /* Track Super as a modifier (it arrives as an E0-prefixed 5B/5C). */
@@ -544,6 +863,19 @@ static void handle_key(int ev){
     if(G_super_held && sc==0x26){ G_locked=true; G_super_held=false; damage_whole(); return; }
     /* Ctrl+W -> close the focused window (standard enterprise-OS shortcut). */
     if((ev&WM_KEY_CTRL) && sc==0x11){ win_t *fw=focused_win(); if(fw) close_win(fw); return; }
+    /* Ctrl+Alt+Backspace -> end the graphical session (classic X11 "zap").
+     * wm_run() returns, init exits, the kernel reclaims the framebuffer and
+     * paints the text fallback screen. */
+    if((ev&WM_KEY_CTRL) && (ev&WM_KEY_ALT) && sc==0x0E){
+        klog("wm: Ctrl+Alt+Backspace - ending session\n");
+        wm_session_end();
+        return;
+    }
+    /* Super+Tab -> window switcher (all windows), the "Win+Tab task view" /
+     * "GNOME Super+Tab" model.  Super alone opens the app launcher; pressing
+     * Tab while Super is held switches to the window switcher instead.  Must
+     * run BEFORE the G_grid search handler, which would otherwise swallow Tab. */
+    if(G_super_held && sc==0x0F){ G_grid=false; G_dockmenu=false; switcher_advance(); return; }
     if(G_dockmenu){ if(ascii>=32&&ascii<127&&G_search_len<(int)sizeof(G_search)-1){G_search[G_search_len++]=(char)ascii;G_search[G_search_len]=0;} else if(ascii==8||ascii==127){if(G_search_len>0){G_search_len--;G_search[G_search_len]=0;}} else if(ascii==27){G_dockmenu=false;G_search_len=0;G_search[0]=0;} else if(ascii==13||ascii==10){ for(int i=0;i<G_apps;i++) if(search_match(G_app[i].name)){launch_app(G_app[i].path);G_dockmenu=false;G_search_len=0;G_search[0]=0;break;} } return; }
     if(G_grid){ if(ascii>=32&&ascii<127&&G_search_len<(int)sizeof(G_search)-1){G_search[G_search_len++]=(char)ascii;G_search[G_search_len]=0;} else if(ascii==8||ascii==127){if(G_search_len>0){G_search_len--;G_search[G_search_len]=0;}} else if(ascii==27){G_grid=false;G_search_len=0;G_search[0]=0;} else if(ascii==13||ascii==10){ for(int i=0;i<G_apps;i++) if(search_match(G_app[i].name)){launch_app(G_app[i].path);G_grid=false;break;} } return; }
     if(ascii==27){ if(G_switcher){ if(G_switcher_idx>=0&&G_switcher_idx<MAX_WIN){win_t*w=&G_win[G_switcher_idx]; if(w->active){bring_front(w); wm_focus(w->owner); G_focus_win=G_switcher_idx; if(w->minimized)restore_win(w);}} G_switcher=false; g_backdrop_dirty=true; damage_whole(); return; } close_all_overlays();return;}
@@ -551,6 +883,19 @@ static void handle_key(int ev){
     if((ev&WM_KEY_EXT) && (sc==0x5B || sc==0x5C)){ G_grid=!G_grid; if(G_grid){G_search_len=0; G_search[0]=0;} return; }
     if(sc==0x3B||sc==0x3F){ G_grid=!G_grid; if(G_grid){G_search_len=0; G_search[0]=0;} return; }
     if(sc==0x3C||sc==0x3D){ show_desktop_toggle(); }
+    /* PrintScreen (E0 0x37): full screenshot.  Alt+PrintScreen: focused window.
+     * Shift+PrintScreen: drag a region to capture. */
+    if((ev&WM_KEY_EXT) && sc==0x37){
+        if(ev & (1<<17)){ G_shot_region=true; osd("Drag to select screenshot area"); damage_whole(); return; }
+        if(ev & WM_KEY_ALT){ screenshot_window(); return; }
+        screenshot_full(); return;
+    }
+    /* Super+R: toggle screen recording */
+    if(G_super_held && sc==0x13){ record_toggle(); return; }
+    /* F9: full screenshot, F10: toggle recording (alternates that map
+     * cleanly through QMP/PS/2, unlike PrintScreen's E0 2A E0 37 sequence). */
+    if(sc==0x43){ screenshot_full(); return; }
+    if(sc==0x44){ record_toggle(); return; }
     if(sc==0x3E){ theme_reset_defaults(); if(theme_load("/home/yart/theme.ini")==0) osd("Theme reloaded (F4)"); else osd("Theme reset (F4)"); g_backdrop_dirty=true; damage_whole(); return; }
     /* Workspace switching: Super+1..4 or Ctrl+Alt+Left/Right */
     if((ev&WM_KEY_CTRL) && sc>=0x03 && sc<=0x06){ int ws=sc-0x03; if(ws<MAX_WORKSPACES && ws!=G_workspace){ G_workspace=ws; char b[32]; int k=0; const char*q="Workspace "; while(q[k]){b[k]=q[k];k++;} b[k++]='0'+1+ws; b[k]=0; osd(b); g_backdrop_dirty=true; damage_whole(); wm_focus(0); } return; }
@@ -558,30 +903,21 @@ static void handle_key(int ev){
     if((ev&WM_KEY_CTRL) && sc==0x4D){ if(G_workspace<MAX_WORKSPACES-1){G_workspace++; if(G_workspace>=G_ws_count)G_ws_count=G_workspace+1; char b[32];int k=0;const char*q="Workspace ";while(q[k]){b[k]=q[k];k++;} b[k++]='0'+1+G_workspace; b[k]=0; osd(b); g_backdrop_dirty=true; damage_whole();} return; }
     /* Ctrl+Alt+Up/Down -> Mission-Control-style overview */
     if((ev&WM_KEY_CTRL) && (ev&WM_KEY_ALT) && (sc==0x48 || sc==0x50)){ G_overview=!G_overview; return; }
-    /* Alt+Tab window switcher (with live previews) */
-    if((ev&WM_KEY_ALT) && sc==0x0F && make){
-        if(!G_switcher) G_switcher_idx = -1;      /* first press: start fresh */
-        G_switcher=true;
-        int start=G_switcher_idx;
-        for(int step=0;step<MAX_WIN;step++){ G_switcher_idx=(G_switcher_idx+1)%MAX_WIN;
-            win_t*c=&G_win[G_switcher_idx];
-            if(c->active&&!c->minimized&&!c->closing&&(c->workspace==G_workspace||c->workspace<0)) break;
-        }
-        if(start==G_switcher_idx && !(G_win[G_switcher_idx].active&&!G_win[G_switcher_idx].minimized&&!G_win[G_switcher_idx].closing&&(G_win[G_switcher_idx].workspace==G_workspace||G_win[G_switcher_idx].workspace<0))){ G_switcher=false; }
-        damage_whole(); return;
-    }
+    /* Alt+Tab window switcher (with live previews) — Super+Tab does the same */
+    if((ev&WM_KEY_ALT) && sc==0x0F){ switcher_advance(); return; }
 }
 static int cursor_pick(void){
     int x=G_cx,y=G_cy;
     if(G_menu){ if(menu_hit(x,y)>=-2) return 1; }
     win_t *w=win_at(x,y);
     if(w){
-        int ty=w->y-TB_H; if(ty<PANEL_H)ty=PANEL_H;
-        if(ptin(x,y,w->x,ty,w->x+w->w,ty+TB_H)) return 1;
+        int cx0, cy0, cw0, ch0; win_client_rect(w, &cx0, &cy0, &cw0, &ch0);
+        int ty=cy0-TB_H; if(ty<PANEL_H)ty=PANEL_H;
+        if(ptin(x,y,cx0,ty,cx0+cw0,ty+TB_H)) return 1;
         /* resize cursor over the window edges (Skift ResizeCursor) */
         if(!w->maximized){
-            int onl=x>=w->x-4&&x<=w->x+6, onr=x<=w->x+w->w+4&&x>=w->x+w->w-6;
-            int onb=y<=ty+TB_H+w->h+4&&y>=ty+TB_H+w->h-6;
+            int onl=x>=cx0-4&&x<=cx0+6, onr=x<=cx0+cw0+4&&x>=cx0+cw0-6;
+            int onb=y<=ty+TB_H+ch0+4&&y>=ty+TB_H+ch0-6;
             int ont=y>=ty-4&&y<=ty+4;
             if(onl||onr||onb||ont) return 2;
         }
@@ -598,64 +934,28 @@ static int cursor_pick(void){
  * per-rect repaint re-derives the pixels under the cursor from the scene. */
 static int G_cursor_last_x, G_cursor_last_y, G_cursor_last_w, G_cursor_last_h;
 static bool G_cursor_moved = false;
-/* Cursor render scale: the photo cursors are packed at 48px; 4/5 draws them
- * at ~38px — a touch smaller, Skift's own vector cursors are 28-32px. */
-#define CURSOR_SCALE_NUM 4
-#define CURSOR_SCALE_DEN 5
-/* Bilinear-downscaled alpha-blend of a cursor image (straight-alpha ARGB). */
-static void cursor_blit_raw(surface_t *dst, int dx, int dy, const cursor_img_t *im){
-    const int SN = CURSOR_SCALE_NUM, SD = CURSOR_SCALE_DEN;
-    int dw = (im->w * SN) / SD; if(dw < 1) dw = 1;
-    int dh = (im->h * SN) / SD; if(dh < 1) dh = 1;
-    for(int y = 0; y < dh; y++){
+/* Cursor images are pre-scaled once to their draw size by cursors_draw_img()
+ * (see cursors.c); the per-frame path is a plain integer alpha blit - no
+ * per-pixel float math, so the pointer glides instead of lagging/jumping. */
+static void cursor_blit(surface_t *dst, int dx, int dy, const cursor_img_t *im){
+    for(int y = 0; y < im->h; y++){
         int yy = dy + y; if(yy < 0 || yy >= dst->h) continue;
-        int sy = (y * SD * 256) / SN;
-        int iy = sy >> 8, fy = sy & 255;
-        int iy1 = iy + 1; if(iy1 >= im->h) iy1 = im->h - 1;
-        for(int x = 0; x < dw; x++){
-            int xx = dx + x; if(xx < 0 || xx >= dst->w || !sf_clip_ok(xx, yy)) continue;
-            int sx = (x * SD * 256) / SN;
-            int ix = sx >> 8, fx = sx & 255;
-            int ix1 = ix + 1; if(ix1 >= im->w) ix1 = im->w - 1;
-            u32 c00 = im->px[iy  * im->w + ix];
-            u32 c10 = im->px[iy  * im->w + ix1];
-            u32 c01 = im->px[iy1 * im->w + ix];
-            u32 c11 = im->px[iy1 * im->w + ix1];
-            /* premultiplied bilinear (avoids dark fringing on the edges) */
-            int a00 = (int)(c00 >> 24), r00 = (int)(u8)(c00 >> 16) * a00, g00 = (int)(u8)(c00 >> 8) * a00, b00 = (int)(u8)c00 * a00;
-            int a10 = (int)(c10 >> 24), r10 = (int)(u8)(c10 >> 16) * a10, g10 = (int)(u8)(c10 >> 8) * a10, b10 = (int)(u8)c10 * a10;
-            int a01 = (int)(c01 >> 24), r01 = (int)(u8)(c01 >> 16) * a01, g01 = (int)(u8)(c01 >> 8) * a01, b01 = (int)(u8)c01 * a01;
-            int a11 = (int)(c11 >> 24), r11 = (int)(u8)(c11 >> 16) * a11, g11 = (int)(u8)(c11 >> 8) * a11, b11 = (int)(u8)c11 * a11;
-            int r0 = r00 + (((r10 - r00) * fx) >> 8);
-            int g0 = g00 + (((g10 - g00) * fx) >> 8);
-            int b0 = b00 + (((b10 - b00) * fx) >> 8);
-            int al0 = a00 + (((a10 - a00) * fx) >> 8);
-            int r1 = r01 + (((r11 - r01) * fx) >> 8);
-            int g1 = g01 + (((g11 - g01) * fx) >> 8);
-            int b1 = b01 + (((b11 - b01) * fx) >> 8);
-            int al1 = a01 + (((a11 - a01) * fx) >> 8);
-            int pr = r0 + (((r1 - r0) * fy) >> 8);
-            int pg = g0 + (((g1 - g0) * fy) >> 8);
-            int pb = b0 + (((b1 - b0) * fy) >> 8);
-            int pa = al0 + (((al1 - al0) * fy) >> 8);   /* straight alpha (0..255) */
-            if(pa <= 0) continue;
-            int A = pa; if(A > 255) A = 255;
-            if(A == 0) continue;
-            int R = (pr * 255 + pa / 2) / pa;
-            int G = (pg * 255 + pa / 2) / pa;
-            int B = (pb * 255 + pa / 2) / pa;
-            if(R > 255) R = 255;
-            if(G > 255) G = 255;
-            if(B > 255) B = 255;
-            u32 bg = dst->px[yy * dst->pitch + xx];
-            u8 br = (u8)bg, bg2 = (u8)(bg >> 8), bb = (u8)(bg >> 16);
-            if(A == 255) dst->px[yy * dst->pitch + xx] = ARGB(255, R, G, B);
-            else {
-                u8 rr = (u8)((R * A + br * (255 - A)) / 255);
-                u8 gg = (u8)((G * A + bg2 * (255 - A)) / 255);
-                u8 bb2 = (u8)((B * A + bb * (255 - A)) / 255);
-                dst->px[yy * dst->pitch + xx] = 0xFF000000u | (bb2 << 16) | (gg << 8) | rr;
-            }
+        const u32 *sp = im->px + (long)y * im->w;
+        u32 *dp = dst->px + (long)yy * dst->pitch + dx;
+        for(int x = 0; x < im->w; x++){
+            int xx = dx + x; if(xx < 0 || xx >= dst->w) continue;
+            u32 c = sp[x];
+            u32 sa = (c >> 24) & 0xFF;
+            if(sa == 0) continue;
+            u32 d = dp[x];
+            if(sa == 255) { dp[x] = c; continue; }
+            u32 sr = (c >> 16) & 0xFF, sg = (c >> 8) & 0xFF, sb = c & 0xFF;
+            u32 dr = (d >> 16) & 0xFF, dg = (d >> 8) & 0xFF, db = d & 0xFF;
+            u32 ia = 255 - sa;
+            dp[x] = 0xFF000000
+                  | (((sr*sa + dr*ia + 127)/255) << 16)
+                  | (((sg*sa + dg*ia + 127)/255) << 8)
+                  |  ((sb*sa + db*ia + 127)/255);
         }
     }
 }
@@ -663,50 +963,45 @@ static void cursor_damage_prev(void){
     if(G_cursor_last_w > 0) damage_add((GfxRect){G_cursor_last_x, G_cursor_last_y, G_cursor_last_w, G_cursor_last_h});
 }
 
+/* Draw-size cursor at the current position/kind (pre-scaled image). */
+static cursor_img_t *cursor_current_img(int *dx, int *dy){
+    if(G_cur_theme<0){ G_cur_theme=cursors_theme_by_name("roblox"); if(G_cur_theme<0) G_cur_theme=0; }
+    int k = cursor_pick();
+    cursor_img_t *im = cursors_draw_img(G_cur_theme, k);
+    if(!im && k == 2) im = cursors_draw_img(G_cur_theme, 0);  /* no resize: arrow */
+    if(im){
+        *dx = G_cx - im->hotx;
+        *dy = G_cy - im->hoty;
+        return im;
+    }
+    *dx = G_cx - 14; *dy = G_cy - 14;
+    return NULL;
+}
+
 /* Footprint of the cursor at its current position/kind.  Used to damage the
  * cursor region BEFORE the compositing pass so the cursor is presented in
  * the SAME frame it moved to (Skift draws the cursor in the render pass;
  * damaging it only for the next frame made it trail 16ms + ghost). */
 static GfxRect cursor_rect(void){
-    if(G_cur_theme<0){ G_cur_theme=cursors_theme_by_name("roblox"); if(G_cur_theme<0) G_cur_theme=0; }
-    int kind=cursor_pick();
-    cursor_theme_t *t=cursors_theme(G_cur_theme);
-    int dx=G_cx,dy=G_cy,cw=24,ch=24;
-    int k=kind;
-    if(t && !t->img[k].present && k==2) k=0;
-    if(t && t->img[k].present){
-        cursor_img_t *im=&t->img[k];
-        cw = (im->w  * CURSOR_SCALE_NUM) / CURSOR_SCALE_DEN;
-        ch = (im->h  * CURSOR_SCALE_NUM) / CURSOR_SCALE_DEN;
-        dx = G_cx - (im->hotx * CURSOR_SCALE_NUM) / CURSOR_SCALE_DEN;
-        dy = G_cy - (im->hoty * CURSOR_SCALE_NUM) / CURSOR_SCALE_DEN;
-    } else {
-        cw=28; ch=28; dx=G_cx-14; dy=G_cy-14;
-    }
-    return (GfxRect){dx,dy,cw,ch};
+    int dx, dy;
+    cursor_img_t *im = cursor_current_img(&dx, &dy);
+    if(im) return (GfxRect){dx, dy, im->w, im->h};
+    return (GfxRect){dx, dy, 28, 28};
 }
 
 static void cursor_draw(surface_t*s){
-    if(G_cur_theme<0){ G_cur_theme=cursors_theme_by_name("roblox"); if(G_cur_theme<0) G_cur_theme=0; }
-    int kind=cursor_pick();
-    cursor_theme_t *t=cursors_theme(G_cur_theme);
-    int dx=G_cx,dy=G_cy,cw=24,ch=24;
-    /* resize falls back to the arrow when the theme has no resize cursor */
-    int k = kind;
-    if(t && !t->img[k].present && k==2) k=0;
-    if(t && t->img[k].present){
-        cursor_img_t *im=&t->img[k];
-        cw = (im->w  * CURSOR_SCALE_NUM) / CURSOR_SCALE_DEN;
-        ch = (im->h  * CURSOR_SCALE_NUM) / CURSOR_SCALE_DEN;
-        dx = G_cx - (im->hotx * CURSOR_SCALE_NUM) / CURSOR_SCALE_DEN;
-        dy = G_cy - (im->hoty * CURSOR_SCALE_NUM) / CURSOR_SCALE_DEN;
-        cursor_blit_raw(s,dx,dy,im);
+    int dx, dy;
+    cursor_img_t *im = cursor_current_img(&dx, &dy);
+    if(im){
+        cursor_blit(s, dx, dy, im);
+        G_cursor_last_x=dx; G_cursor_last_y=dy;
+        G_cursor_last_w=im->w; G_cursor_last_h=im->h;
     } else {
-        icon_t ic=icon_get(k==1?ICON_CURSOR_HAND:ICON_CURSOR_ARROW);
+        icon_t ic=icon_get(cursor_pick()==1?ICON_CURSOR_HAND:ICON_CURSOR_ARROW);
         sf_icon_scaled(s,G_cx,G_cy,ic,0,24,48);
-        cw=28; ch=28; dx=G_cx-14; dy=G_cy-14;
+        G_cursor_last_x=dx; G_cursor_last_y=dy;
+        G_cursor_last_w=28; G_cursor_last_h=28;
     }
-    G_cursor_last_x=dx; G_cursor_last_y=dy; G_cursor_last_w=cw; G_cursor_last_h=ch;
 }
 
 /* ---------- Skift-style compositor core ---------- */
@@ -759,12 +1054,20 @@ static void composite_rect(GfxRect r, long now){
             draw_window(w);
         }
     }
-    /* overlays, topmost (gated by rect where bounds are known) */
-    if(G_quick && rect_colide(r,(GfxRect){G_quick_x,G_quick_y,G_quick_w,G_quick_h})) draw_quick(&G_fb);
-    if(G_calendar && rect_colide(r,(GfxRect){G_cal_x,G_cal_y,G_cal_w,G_cal_h})) draw_calendar(&G_fb);
-    if(G_clip_open && rect_colide(r,(GfxRect){G_clip_x,G_clip_y,G_clip_w,G_clip_h})) draw_clipboard(&G_fb);
-    if(G_netlist_open && rect_colide(r,(GfxRect){G_nl_x,G_nl_y,G_nl_w,G_nl_h})) draw_netlist(&G_fb);
-    if(G_dockmenu && rect_colide(r,(GfxRect){G_dockmenu_x,G_dockmenu_y,G_dockmenu_w,G_dockmenu_h})) draw_dockmenu(&G_fb);
+    /* overlays, topmost.  Drawn unconditionally (the global clip already
+     * confines the actual pixel writes to this dirty rect) because their
+     * geometry is only assigned INSIDE the draw call.  Gating them on
+     * rect_colide() against their own (initially zero) bounds meant they
+     * NEVER rendered: on the first frame G_quick_x/y/w/h are all 0, so the
+     * 0x0 rect never collides, draw_quick never runs, and the bounds stay 0
+     * forever.  Clicking the clock / clipboard / wifi-chevron / status
+     * cluster therefore showed nothing.  (app_grid/overview/switcher/menu
+     * below were already drawn unconditionally for the same reason.) */
+    if(G_quick)        draw_quick(&G_fb);
+    if(G_calendar)     draw_calendar(&G_fb);
+    if(G_clip_open)    draw_clipboard(&G_fb);
+    if(G_netlist_open) draw_netlist(&G_fb);
+    if(G_dockmenu)     draw_dockmenu(&G_fb);
     if(G_grid) draw_app_grid(&G_fb);
     if(G_overview) draw_overview(&G_fb);
     if(G_switcher) draw_switcher(&G_fb);
@@ -776,7 +1079,13 @@ static void composite_rect(GfxRect r, long now){
 
 /* ---------- entry / render loop ---------- */
 void wm_run(void){
-    fb_info_t fi; void*fb=fb_info(&fi); if(!fb)return;
+    /* Claim the framebuffer.  When a session is RESTARTED (startwm), the
+     * previous getty child is being reaped right as we exec, so the kernel
+     * may not have cleared its fb claim yet - poll briefly, like the text
+     * console does. */
+    fb_info_t fi; void*fb=0;
+    for(int i=0;i<200 && !fb;i++){ fb=fb_info(&fi); if(!fb) sleep(10); }
+    if(!fb) return;
     G_fb.px=fb; G_fb.w=fi.w; G_fb.h=fi.h; G_fb.pitch=fi.pitch; G_cx=G_fb.w/2; G_cy=G_fb.h/2;
     G_backdrop=sf_alloc(G_fb.w,G_fb.h);
     if(!G_backdrop.px){ klog("wm: backdrop alloc failed\n"); return; }
@@ -799,12 +1108,23 @@ void wm_run(void){
         if(G_cal_month<1||G_cal_month>12)G_cal_month=1;
     }
     osd("YartOS ready");
+    /* calibrate the TSC rate for sub-ms frame pacing (50 ms span) */
+    {   u64 t0 = wm_rdtsc(); long m0 = time_ms();
+        sleep(50);
+        u64 t1 = wm_rdtsc(); long m1 = time_ms();
+        if(m1 > m0 && t1 > t0){ g_tsc_per_ms = (t1 - t0) / (u64)(m1 - m0); g_tsc_base = t1; g_ms_base = m1; }
+    }
     bool first_frame=true;
     int prev_overlay_state=-1;
     bool osd_was_visible=false;
     static bool s_overlay_focus=false;
     long next_frame=time_ms();
     for(;;){
+        /* ---- session end (Ctrl+Alt+Backspace) ---- */
+        if(G_session_end) break;
+        /* cursor position at the START of this frame (for hover damage) */
+        int frm_prev_cx = G_cx, frm_prev_cy = G_cy;
+
         /* ---- input ---- */
         bool moved=false;
         int ev; while((ev=poll_key())!=0){ handle_key(ev); moved=true; }
@@ -833,6 +1153,18 @@ void wm_run(void){
         if(G_cursor_moved){
             cursor_damage_prev();        /* repaint what was under the old pos */
             damage_add(cursor_rect());   /* paint the cursor this same frame  */
+            /* Panel button hover highlights are drawn from the cursor position
+             * and are WIDER than the cursor footprint, so moving off a button
+             * left a stale "brushed" highlight behind (the dock already
+             * handles this in dock_update()).  Damage the panel strip between
+             * the old and new cursor X so the hover state repaints cleanly. */
+            if(frm_prev_cy < PANEL_H + 6 || G_cy < PANEL_H + 6){
+                int x0 = (frm_prev_cx < G_cx ? frm_prev_cx : G_cx) - 44;
+                int x1 = (frm_prev_cx > G_cx ? frm_prev_cx : G_cx) + 44;
+                if(x0 < 0) x0 = 0;
+                if(x1 > G_fb.w) x1 = G_fb.w;
+                damage_add((GfxRect){x0, 0, x1 - x0, PANEL_H});
+            }
             G_cursor_moved = false;
         } else if(G_ndirty > 0){
             damage_add(cursor_rect());   /* scene changed under the cursor    */
@@ -845,7 +1177,14 @@ void wm_run(void){
             if(nnow-ln >= 500){ unsigned ni[5]; G_net_up=(net_info(ni)==0&&ni[4]!=0); ln=nnow; }
         }
         static int hf=0;
-        pid_forget_dead();
+        /* reap dead children at most ~2x/s.  pid_forget_dead() issues one
+         * waitpid_nohang() syscall PER recorded pid, and it ran every frame
+         * (up to MAX_PIDS=24 syscalls/frame) - a large chunk of per-frame
+         * latency under TCG.  Reaping twice a second is plenty: a closed app
+         * shows as vanished within 500 ms. */
+        static long last_reap=0;
+        long rnow=time_ms();
+        if(rnow-last_reap >= 500){ pid_forget_dead(); last_reap=rnow; }
         if((hf++ & 1)==0) scan_windows();   /* every other frame (32ms) */
         /* drain the kernel notification ring: toast + calendar list */
         char nb[128];
@@ -873,6 +1212,19 @@ void wm_run(void){
         /* ---- persisted settings (Settings app writes settings.conf) ---- */
         settings_poll(now);
 
+        /* ---- installed-app scan: `apk add/del` writes .desktop files, so
+         * re-scan every ~2s to keep the Super launcher in sync ---- */
+        static long last_appscan=0;
+        if(now - last_appscan >= 2000){ last_appscan = now; scan_desktop_apps(); }
+
+        /* screen recording: capture a frame ~10x/s while recording */
+        if(G_recording && now - G_rec_last >= 100){
+            G_rec_last = now;
+            record_frame();
+            G_rec_frame++;
+            if((G_rec_frame & 7) == 0) osd("recording...");
+        }
+
         /* ---- dock animation/hover ---- */
         dock_update(now);
 
@@ -883,9 +1235,16 @@ void wm_run(void){
          * While any overlay is up, the wm owns the keyboard (search typing,
          * Esc); when the last overlay closes, focus returns to the top
          * window so apps get their typing back. */
+        /* Every popover MUST be in this mask.  G_clip_open and G_netlist_open
+         * were MISSING, so opening/closing the clipboard or the Wi-Fi network
+         * list never triggered a full repaint: their pixels lingered on screen
+         * after "click elsewhere to dismiss" (they never cleared), and moving
+         * the cursor over the stale popover redrew the backdrop in a trail -
+         * the "brushing" erase the user saw. */
         int overlay_state = G_grid | (G_overview<<1) | (G_switcher<<2) |
                            (G_quick<<3) | (G_calendar<<4) |
-                           (G_dockmenu<<5) | (G_menu<<6);
+                           (G_dockmenu<<5) | (G_menu<<6) |
+                           (G_clip_open<<7) | (G_netlist_open<<8);
         if(overlay_state != prev_overlay_state){
             damage_whole();
             prev_overlay_state = overlay_state;
@@ -928,10 +1287,28 @@ void wm_run(void){
         fb_present(fb, (const fb_rect_t*)G_dirty, G_ndirty);
         G_ndirty = 0;
 
-        /* ---- fixed 60 Hz frame pacing (Skift: sleepAsync(lastFrame+16ms)) ---- */
-        next_frame += 16;
+        /* ---- frame pacing (Skift: sleepAsync(lastFrame + interval)) ----
+         * When the user is actively moving the mouse / typing, poll + render
+         * at ~125 Hz (8 ms) instead of 60 Hz (16 ms), halving input latency.
+         * The final sleep is split: a coarse tick-sleep for the bulk, then a
+         * TSC busy-poll for the sub-4ms remainder, so frames land on a
+         * precise sub-millisecond cadence instead of quantising to the
+         * 250 Hz tick (4 ms) - this removes the last visible micro-jitter in
+         * cursor motion. */
+        int interval = moved ? 8 : 16;
+        next_frame += interval;
         now = time_ms();
-        if(next_frame > now) sleep(next_frame - now);
+        if(next_frame > now){
+            long remain = next_frame - now;
+            /* coarse tick-sleep for the bulk, then a TSC busy-poll (inline
+             * rdtsc, NO syscall) for the sub-4ms remainder - precise cadence
+             * without per-iteration syscall cost. */
+            if(remain > 4) sleep(remain - 4);
+            if(g_tsc_per_ms){
+                u64 dl = tsc_deadline(next_frame);
+                while(wm_rdtsc() < dl) __asm__ volatile("pause");
+            }
+        }
         else if(now - next_frame > 100) next_frame = now;
     }
 }

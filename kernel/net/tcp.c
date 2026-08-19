@@ -28,10 +28,10 @@
 #define TCP_RXBUF       4096
 #define TCP_MAX_DATA    1400          /* fits one Ethernet frame          */
 
-#define TCP_RETRANS_TICKS 25          /* 250 ms @ 100 Hz                  */
+#define TCP_RETRANS_TICKS  MS_TO_TICKS(250)   /* retransmit every 250 ms  */
 #define TCP_MAX_RETRIES   8
-#define TCP_CONNECT_TIMEOUT 800       /* 8 s                              */
-#define TCP_CLOSE_TIMEOUT   250       /* 2.5 s                            */
+#define TCP_CONNECT_TIMEOUT MS_TO_TICKS(8000) /* 8 s                      */
+#define TCP_CLOSE_TIMEOUT   MS_TO_TICKS(2500) /* 2.5 s                    */
 
 /* TCP flags */
 #define TF_FIN 0x01

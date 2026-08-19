@@ -88,3 +88,80 @@ int cursors_theme_by_name(const char *name) {
     }
     return -1;
 }
+
+/* ---- pre-scaled (draw-size) cursor cache ----
+ * Scaled ONCE per (theme, kind), then blitted every frame with an integer
+ * alpha blend.  Straight-ARGB output (A in 31:24, R 23:16, G 15:8, B 7:0). */
+static u32  G_scaled[CURSOR_THEME_COUNT][CURSOR_KIND_COUNT][48 * 48];
+static cursor_img_t G_scaled_img[CURSOR_THEME_COUNT][CURSOR_KIND_COUNT];
+static bool G_scaled_ok[CURSOR_THEME_COUNT][CURSOR_KIND_COUNT];
+
+/* Bilinear downscale of one cursor (premultiplied-alpha correct), producing a
+ * straight-ARGB bitmap.  Runs once; the per-frame path is a plain blit. */
+static void cursor_prescale(const cursor_img_t *im, u32 *dst, int dw, int dh) {
+    const int SN = CURSOR_SCALE_NUM, SD = CURSOR_SCALE_DEN;
+    for (int y = 0; y < dh; y++) {
+        int sy = (y * SD * 256) / SN;
+        int iy = sy >> 8, fy = sy & 255;
+        int iy1 = iy + 1; if (iy1 >= im->h) iy1 = im->h - 1;
+        for (int x = 0; x < dw; x++) {
+            int sx = (x * SD * 256) / SN;
+            int ix = sx >> 8, fx = sx & 255;
+            int ix1 = ix + 1; if (ix1 >= im->w) ix1 = im->w - 1;
+            u32 c00 = im->px[iy  * im->w + ix];
+            u32 c10 = im->px[iy  * im->w + ix1];
+            u32 c01 = im->px[iy1 * im->w + ix];
+            u32 c11 = im->px[iy1 * im->w + ix1];
+            int a00 = (int)(c00 >> 24), r00 = (int)(u8)(c00 >> 16) * a00, g00 = (int)(u8)(c00 >> 8) * a00, b00 = (int)(u8)c00 * a00;
+            int a10 = (int)(c10 >> 24), r10 = (int)(u8)(c10 >> 16) * a10, g10 = (int)(u8)(c10 >> 8) * a10, b10 = (int)(u8)c10 * a10;
+            int a01 = (int)(c01 >> 24), r01 = (int)(u8)(c01 >> 16) * a01, g01 = (int)(u8)(c01 >> 8) * a01, b01 = (int)(u8)c01 * a01;
+            int a11 = (int)(c11 >> 24), r11 = (int)(u8)(c11 >> 16) * a11, g11 = (int)(u8)(c11 >> 8) * a11, b11 = (int)(u8)c11 * a11;
+            int r0 = r00 + (((r10 - r00) * fx) >> 8);
+            int g0 = g00 + (((g10 - g00) * fx) >> 8);
+            int b0 = b00 + (((b10 - b00) * fx) >> 8);
+            int al0 = a00 + (((a10 - a00) * fx) >> 8);
+            int r1 = r01 + (((r11 - r01) * fx) >> 8);
+            int g1 = g01 + (((g11 - g01) * fx) >> 8);
+            int b1 = b01 + (((b11 - b01) * fx) >> 8);
+            int al1 = a01 + (((a11 - a01) * fx) >> 8);
+            int pr = r0 + (((r1 - r0) * fy) >> 8);
+            int pg = g0 + (((g1 - g0) * fy) >> 8);
+            int pb = b0 + (((b1 - b0) * fy) >> 8);
+            int pa = al0 + (((al1 - al0) * fy) >> 8);
+            u32 out = 0;
+            if (pa > 0) {
+                if (pa > 255) pa = 255;
+                int R = (pr * 255 + pa / 2) / pa;
+                int G = (pg * 255 + pa / 2) / pa;
+                int B = (pb * 255 + pa / 2) / pa;
+                if (R > 255) R = 255;
+                if (G > 255) G = 255;
+                if (B > 255) B = 255;
+                out = ((u32)pa << 24) | ((u32)R << 16) | ((u32)G << 8) | (u32)B;
+            }
+            dst[y * dw + x] = out;
+        }
+    }
+}
+
+cursor_img_t *cursors_draw_img(int theme, int kind) {
+    if (theme < 0 || theme >= G_count || kind < 0 || kind >= CURSOR_KIND_COUNT)
+        return NULL;
+    if (G_scaled_ok[theme][kind])
+        return &G_scaled_img[theme][kind];
+    cursor_img_t *im = &G_themes[theme].img[kind];
+    if (!im->present) return NULL;
+    int dw = (im->w * CURSOR_SCALE_NUM) / CURSOR_SCALE_DEN; if (dw < 1) dw = 1;
+    int dh = (im->h * CURSOR_SCALE_NUM) / CURSOR_SCALE_DEN; if (dh < 1) dh = 1;
+    if (dw * dh > 48 * 48) return NULL;
+    cursor_prescale(im, G_scaled[theme][kind], dw, dh);
+    cursor_img_t *out = &G_scaled_img[theme][kind];
+    out->px = G_scaled[theme][kind];
+    out->w = dw;
+    out->h = dh;
+    out->hotx = (im->hotx * CURSOR_SCALE_NUM) / CURSOR_SCALE_DEN;
+    out->hoty = (im->hoty * CURSOR_SCALE_NUM) / CURSOR_SCALE_DEN;
+    out->present = true;
+    G_scaled_ok[theme][kind] = true;
+    return out;
+}

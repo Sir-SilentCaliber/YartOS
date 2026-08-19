@@ -39,6 +39,38 @@ If the build stops with `ERROR: rsvg-convert not found` or
 `ERROR: Pillow not found`, run `./bootstrap.sh` (or install the listed package)
 and retry.
 
+**Reproducible container build** (no host toolchain needed — Docker):
+
+```bash
+docker build -t yartos .
+docker run --rm -v "$PWD":/src yartos make -j"$(nproc)" iso
+```
+
+Verify the tree has no stray build artifacts: `make portable-check`.
+
+## Linux compatibility layer (static + dynamic ELF)
+
+YartOS runs **genuine Linux x86_64 ELF binaries** through a translated
+syscall ABI (`kernel/arch/x86_64/syscall.c`) and a from-scratch **dynamic
+linker** (`tests/ld-yart.c`, installed as `/lib/ld-yart.so`):
+
+- **Static ET_EXEC** binaries — file/console/process syscalls, `stat`,
+  `getdents64`, `uname`, `mmap`, `writev`, `clock_gettime`, the auxiliary
+  vector, and **threads** (`clone` + `futex`), **sockets** (TCP/UDP),
+  **execve**, and **TLS** (`arch_prctl ARCH_SET_FS` → `%fs`).
+- **Dynamically-linked PIE** binaries — `PT_INTERP` loading, `DT_NEEDED`
+  shared objects, and `RELATIVE/GLOB_DAT/JUMP_SLOT/64` relocations.
+
+Prove it from the terminal (Nyra): `linuxtest`, `linuxtest2`, `dynhello`,
+`tlstest`.  Honest limit: the linker resolves the common relocations + TLS
+base; glibc/musl-class TLS *data* relocations and IFUNC are the next step.
+
+## Package manager (apk)
+
+`apk add/del/list/search/info` installs native `.ypkg` packages; GUI packages
+drop a `/usr/share/applications/*.desktop` entry the compositor auto-scans,
+so installed apps appear in the Super launcher (`apk add calc` → press Super).
+
 ## Layout
 
 ```

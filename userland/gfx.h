@@ -117,10 +117,11 @@ static inline void sf_icon_sz(surface_t *s, int cx, int cy, icon_t ico, u32 tint
     sf_icon_scaled(s, cx, cy, ico, tint, px, ico.w);
 }
 
-/* Wallpaper pack: wallpaper_count() returns how many are built in.
- * wallpaper_load_index() selects which one is active; wallpaper_load() is a
- * backwards-compatible alias that selects index 0.  wallpaper_bind() attaches
- * the currently-selected wallpaper to a surface_t (points into the blob). */
+/* Wallpaper pack: WALLPAPER_COUNT is the number of frames the generator
+ * (scripts/gen_wallpaper_pack.py) packs - used by apps that only need the
+ * count without linking the 16 MB blob.  The compositor links userland/
+ * wallpaper.c for the real pixel accessors (wallpaper_load/bind/px). */
+#define WALLPAPER_COUNT 4
 int  wallpaper_count(void);
 int  wallpaper_load(surface_t *out);
 int  wallpaper_load_index(int idx);

@@ -53,10 +53,41 @@ static char f_path[128]="/home/yart";
 static int f_sel, f_scroll, f_count;
 static int f_renaming;             /* index being renamed, or -1 */
 static char f_renamebuf[96];
+static int  f_rcur;                /* rename edit cursor (0..len) */
 static char f_status[80]="";
 static char f_copybuf[160];        /* clipboard: source path for copy/cut   */
 static int  f_copybuf_cut;         /* 1 = move (cut), 0 = copy              */
 static struct { char name[96]; u8 isdir; u64 size; } f_ent[FE_MAX];
+
+/* ---- Skift-style navigation history (back/forward) ---- */
+#define F_HIST_MAX 32
+static char f_hist[F_HIST_MAX][128];
+static int  f_hist_len, f_hist_idx;
+static bool f_can_back(void){ return f_hist_idx > 0; }
+static bool f_can_fwd(void){ return f_hist_idx < f_hist_len - 1; }
+static void f_set_path(const char *p){ int k=0; while(p[k]&&k<127){f_path[k]=p[k];k++;} f_path[k]=0; }
+static void f_back(void){ if(f_can_back()){ f_hist_idx--; f_set_path(f_hist[f_hist_idx]); f_sel=0; } }
+static void f_fwd(void){ if(f_can_fwd()){ f_hist_idx++; f_set_path(f_hist[f_hist_idx]); f_sel=0; } }
+static void f_goto(const char *path){
+    if(!path || !path[0]) return;
+    /* truncate forward history, then push the new path */
+    f_hist_len = f_hist_idx + 2; if(f_hist_len > F_HIST_MAX) f_hist_len = F_HIST_MAX;
+    f_hist_idx = f_hist_len - 1;
+    int k=0; while(path[k]&&k<127){ f_hist[f_hist_idx][k]=path[k]; k++; } f_hist[f_hist_idx][k]=0;
+    f_set_path(path);
+    f_sel=0; f_scroll=0;
+}
+static void f_goto_pushed(const char *path){
+    /* push onto history only if it differs from the current head */
+    if(strcmp(f_path, path)==0) return;
+    f_goto(path);
+}
+
+/* ---- sidebar places (Skift favourites) ---- */
+#define F_NPLACES 4
+static const char *f_place_name[F_NPLACES] = {"Home","Documents","Downloads","Trash"};
+static const char *f_place_path[F_NPLACES] = {"/home/yart","/home/yart/Documents","/home/yart/Downloads","/home/yart/.trash"};
+static const int   f_place_icon[F_NPLACES] = {ICON_PLACE_HOME, ICON_PLACE_DOCS, ICON_PLACE_DL, ICON_DOCK_TRASH};
 static void f_setstatus(const char*t){ int k=0; while(t[k]&&k<79){f_status[k]=t[k];k++;} f_status[k]=0; }
 static void f_new_folder(void);   /* defined later (after files_click) */
 static int  f_copy_file(const char *src,const char *dst);
@@ -155,24 +186,38 @@ static void f_paste(void){
 static void f_begin_rename(void){
     if(f_sel<0||f_sel>=f_count){f_setstatus("Nothing selected");return;}
     f_renaming=f_sel; int k=0; while(f_ent[f_sel].name[k]&&k<95){f_renamebuf[k]=f_ent[f_sel].name[k];k++;} f_renamebuf[k]=0;
+    f_rcur=k;   /* cursor at end; use arrows/Home/End to edit anywhere */
 }
 static void f_up(void){
-    if(f_is_trash()){ int k=0; const char*h="/home/yart"; while(h[k]&&k<127){f_path[k]=h[k];k++;} f_path[k]=0; }
-    else { int slash=0; for(int i=0;f_path[i];i++) if(f_path[i]=='/')slash=i;
-           if(slash<=0){ f_path[0]='/';f_path[1]=0; } else f_path[slash]=0; }
+    /* navigate to the parent directory (pushes history so Back returns) */
+    char parent[128];
+    if(f_is_trash()){ f_goto_pushed("/home/yart"); return; }
+    int slash=0; for(int i=0;f_path[i];i++) if(f_path[i]=='/')slash=i;
+    if(slash<=0){ f_goto_pushed("/"); }
+    else { int k=0; while(k<slash && k<127){ parent[k]=f_path[k]; k++; } parent[k]=0;
+           f_goto_pushed(parent[0]?parent:"/"); }
     f_sel=0; f_scroll=0;
 }
 static void files_key(int ev){
     int a=ev&255, sc=(ev>>8)&0xFF, ctrl=(ev&(1<<18))!=0;
     if(f_renaming>=0){
-        if(a==8||a==127){ int k=0; while(f_renamebuf[k])k++; if(k>0){f_renamebuf[k-1]=0;} }
+        /* rename editing: full cursor support (Left/Right/Home/End/insert/
+         * backspace/delete) - real-text-field behaviour, like renaming a file
+         * in any desktop OS. */
+        int len=0; while(f_renamebuf[len])len++;
+        if(a==0xE3){ if(f_rcur>0)f_rcur--; }                              /* Left  */
+        else if(a==0xE4){ if(f_rcur<len)f_rcur++; }                       /* Right */
+        else if(a==0xE5){ f_rcur=0; }                                     /* Home  */
+        else if(a==0xE6){ f_rcur=len; }                                   /* End   */
+        else if(a==8||a==127){ if(f_rcur>0){ for(int i=f_rcur-1;i<len;i++)f_renamebuf[i]=f_renamebuf[i+1]; f_rcur--; } }
+        else if(sc==0x53){ if(f_rcur<len){ for(int i=f_rcur;i<len;i++)f_renamebuf[i]=f_renamebuf[i+1]; } }  /* Del */
         else if(a==13||a==10){
             char oldp[160],newp[160]; f_fullpath(oldp,f_ent[f_renaming].name);
             f_fullpath(newp,f_renamebuf);
             if(rename(oldp,newp)==0) f_setstatus("Renamed"); else f_setstatus("Rename failed");
             f_renaming=-1;
         } else if(a==27){ f_renaming=-1; }
-        else if(a>=32&&a<127){ int k=0;while(f_renamebuf[k])k++; if(k<94){f_renamebuf[k]=(char)a;f_renamebuf[k+1]=0;} }
+        else if(a>=32&&a<127){ if(len<94){ for(int i=len;i>f_rcur;i--)f_renamebuf[i]=f_renamebuf[i-1]; f_renamebuf[f_rcur]=(char)a; f_rcur++; } }
         return;
     }
     if(ctrl && (a==3||a==('c'-96))){ f_copy_sel(); return; }
@@ -183,7 +228,7 @@ static void files_key(int ev){
     else if(a==13||a==10){
         if(f_sel>=0&&f_sel<f_count&&f_ent[f_sel].isdir){
             char np[128]; f_join(np,f_path,f_ent[f_sel].name);
-            int k=0; while(np[k]){f_path[k]=np[k];k++;} f_path[k]=0; f_sel=0;
+            f_goto_pushed(np);
         }
     } else if(a==8){ f_up(); }
     else if(a=='n'||a=='N'){ f_new_folder(); }
@@ -192,12 +237,41 @@ static void files_key(int ev){
     else if(a=='e'||a=='E'){ if(f_is_trash()) f_empty_trash(); }
 }
 static int f_last=-1, f_last_frames;
+#define F_TB_H 36                 /* toolbar height */
+#define F_SB_W 132                /* sidebar width  */
+#define F_STATUS_H 24
 static void files_click(int x,int y,int frame){
-    if(y<32){ if(x<36){f_up();} return; }
-    int idx=(y-60)/20; if(idx<0||idx>=f_count)return; f_sel=idx;
+    /* ---- toolbar (y < F_TB_H) ---- */
+    if(y<F_TB_H){
+        int bx=8;
+        /* back / forward / up buttons */
+        if(x>=bx&&x<bx+26){ f_back(); return; }
+        bx+=28;
+        if(x>=bx&&x<bx+26){ f_fwd(); return; }
+        bx+=28;
+        if(x>=bx&&x<bx+26){ f_up(); return; }
+        bx+=34;
+        /* New Folder button (right side) */
+        int nx=I.w-34;
+        if(x>=nx&&x<nx+26){ if(!f_is_trash()) f_new_folder(); return; }
+        return;
+    }
+    /* ---- sidebar (x < F_SB_W) ---- */
+    if(x<F_SB_W){
+        int sy=F_TB_H+8;
+        for(int i=0;i<F_NPLACES;i++){
+            if(y>=sy&&y<sy+30){ f_goto_pushed(f_place_path[i]); return; }
+            sy+=32;
+        }
+        return;
+    }
+    /* ---- list area ---- */
+    int yy=y-(F_TB_H+22);
+    if(yy<0) return;              /* column header */
+    int idx=yy/20; if(idx<0||idx>=f_count)return; f_sel=idx;
     if(f_last==idx && frame-f_last_frames<18){ if(!f_ent[idx].isdir){f_last=-1;return;}
         char np[128]; f_join(np,f_path,f_ent[idx].name);
-        int k=0; while(np[k]){f_path[k]=np[k];k++;} f_path[k]=0; f_sel=0; f_last=-1;
+        f_goto_pushed(np); f_last=-1;
     } else { f_last=idx; f_last_frames=frame; } }
 
 static void f_new_folder(void){
@@ -214,31 +288,108 @@ static void f_new_folder(void){
 static void draw_files(void){
     f_readdir();
     fill(0,0,I.w,I.h,COL_BG);
-    fill(0,0,I.w,32,COL_TOOLBAR);
-    sf_text(&S,10,9,"[..]",COL_ACCENT);
-    sf_text(&S,46,9,f_path,COL_TEXT);
-    if(f_is_trash()) sf_text(&S,I.w-250,9,"R:Restore  E:Empty  Del",COL_DIM);
-    else             sf_text(&S,I.w-210,9,"N:New  R:Ren  Del",COL_DIM);
-    sf_hline(&S,0,31,I.w,RGB(0x27,0x27,0x2A));
-    fill(0,32,I.w,22,RGB(0x27,0x27,0x2A));
-    sf_text(&S,16,37,"Name",COL_DIM); sf_text(&S,I.w-110,37,"Size",COL_DIM);
-    sf_hline(&S,0,53,I.w,RGB(0x27,0x27,0x2A));
-    for(int i=0;i<f_count;i++){
-        int y=60+i*20; if(y<56||y>(int)I.h-34)continue;
-        if(i==f_sel) fill(8,y-2,I.w-16,20,COL_SEL);
-        const char*nm=(f_renaming==i)?f_renamebuf:f_ent[i].name;
-        sf_text(&S,18,y,nm,f_ent[i].isdir?COL_ACCENT:COL_TEXT);
-        if(!f_ent[i].isdir){
-            char sz[16]; int k=0; u64 v=f_ent[i].size; char tmp[16]; int t=0;
-            if(v==0)sz[k++]='0'; else {while(v){tmp[t++]=(char)('0'+v%10);v/=10;} while(t)sz[k++]=tmp[--t];}
-            sz[k++]='B'; sz[k]=0; sf_text(&S,I.w-110,y,sz,COL_DIM);
+
+    /* ===== toolbar ===== */
+    fill(0,0,I.w,F_TB_H,COL_TOOLBAR);
+    {   int bx=8;
+        int btns[3]={ICON_ACT_GO_PREVIOUS, ICON_ACT_GO_NEXT, ICON_ACT_GO_UP};
+        bool en[3]={f_can_back(), f_can_fwd(), true};
+        for(int i=0;i<3;i++){
+            bool hov=inside(g_mx,g_my,bx,6,bx+24,30);
+            if(hov) sf_round_rect_blend(&S,bx,6,24,24,6,ARGB(40,255,255,255));
+            icon_t ic=icon_get(btns[i]);
+            if(ic.px) sf_icon_sz(&S,bx+12,18,ic,en[i]?COL_TEXT:COL_DIM,16);
+            bx+=28;
+        }
+        /* path bar */
+        bx+=6;
+        sf_round_rect(&S,bx,6,I.w-bx-40,24,6,RGB(0x24,0x24,0x29));
+        sf_text(&S,bx+10,9,f_path,COL_TEXT);
+        /* new-folder button */
+        int nx=I.w-32;
+        {   bool hov=inside(g_mx,g_my,nx,6,nx+24,30);
+            if(hov) sf_round_rect_blend(&S,nx,6,24,24,6,ARGB(40,255,255,255));
+            icon_t ic=icon_get(ICON_ACT_FOLDER_NEW);
+            if(ic.px) sf_icon_sz(&S,nx+12,18,ic,COL_ACCENT,16);
         }
     }
-    fill(0,I.h-22,I.w,22,COL_TOOLBAR);
-    const char *hint = f_is_trash()
-        ? "Del=delete forever  R=restore  E=empty  Ctrl+C/X/V copy-cut-paste"
-        : "Up/Down select  Enter open  N new  R rename  Del trash  Ctrl+C/X/V";
-    sf_text(&S,10,I.h-16,f_status[0]?f_status:hint,COL_DIM);
+    sf_hline(&S,0,F_TB_H-1,I.w,RGB(0x27,0x27,0x2A));
+
+    /* ===== sidebar ===== */
+    fill(0,F_TB_H,F_SB_W,I.h-F_TB_H,RGB(0x1C,0x1C,0x20));
+    sf_vline(&S,F_SB_W-1,F_TB_H,I.h-F_TB_H,RGB(0x27,0x27,0x2A));
+    sf_text(&S,12,F_TB_H+6,"Places",COL_DIM);
+    {   int sy=F_TB_H+28;
+        for(int i=0;i<F_NPLACES;i++){
+            bool active = (strcmp(f_path, f_place_path[i])==0);
+            bool hov = inside(g_mx,g_my,4,sy,F_SB_W-4,sy+30);
+            if(active) sf_round_rect(&S,6,sy,F_SB_W-12,28,6,RGB(0x3B,0x82,0xF6));
+            else if(hov) sf_round_rect_blend(&S,6,sy,F_SB_W-12,28,6,ARGB(24,255,255,255));
+            icon_t ic=icon_get(f_place_icon[i]);
+            if(ic.px) sf_icon_sz(&S,20,sy+14,ic,active?RGB(0xFF,0xFF,0xFF):COL_TEXT,15);
+            sf_text(&S,34,sy+5,f_place_name[i],active?RGB(0xFF,0xFF,0xFF):COL_TEXT);
+            sy+=32;
+        }
+    }
+
+    /* ===== list ===== */
+    {   int lx=F_SB_W, lw=I.w-F_SB_W;
+        /* column header */
+        fill(lx,F_TB_H,lw,22,RGB(0x27,0x27,0x2A));
+        sf_text(&S,lx+16,F_TB_H+2,"Name",COL_DIM);
+        sf_text(&S,I.w-110,F_TB_H+2,"Size",COL_DIM);
+        sf_hline(&S,lx,F_TB_H+21,I.w,RGB(0x27,0x27,0x2A));
+        int list_top=F_TB_H+22, list_bot=(int)I.h-F_STATUS_H;
+        for(int i=0;i<f_count;i++){
+            int y=list_top+i*20; if(y+18>list_bot)break;
+            if(i==f_sel) fill(lx,y-1,lw,20,COL_SEL);
+            /* icon: folder vs file (by extension) */
+            int fidx=ICON_PLACE_FOLDER;
+            if(!f_ent[i].isdir){
+                int e=-1; for(int q=0;f_ent[i].name[q];q++) if(f_ent[i].name[q]=='.')e=q;
+                fidx=ICON_MIME_TEXT_X_GENERIC;
+                if(e>=0){
+                    const char *ext=f_ent[i].name+e+1;
+                    if(strcmp(ext,"png")==0) fidx=ICON_MIME_IMAGE_X_GENERIC;
+                    else if(strcmp(ext,"html")==0) fidx=ICON_MIME_TEXT_HTML;
+                }
+            }
+            icon_t ic=icon_get(fidx);
+            if(ic.px) sf_icon_sz(&S,lx+18,y+8,ic,f_ent[i].isdir?COL_ACCENT:COL_TEXT,14);
+            if(f_renaming==i){
+                sf_round_rect(&S,lx+30,y-1,lw-140,20,4,RGB(0x2A,0x2A,0x30));
+                sf_rect_outline(&S,lx+30,y-1,lw-140,20,RGB(0x3B,0x82,0xF6));
+                sf_text(&S,lx+34,y,f_renamebuf,COL_TEXT);
+                int cw=sf_text_width_n(f_renamebuf,f_rcur);
+                sf_vline(&S,lx+34+cw,y,18,COL_TEXT);
+            } else {
+                sf_text(&S,lx+34,y,f_ent[i].name,f_ent[i].isdir?COL_ACCENT:COL_TEXT);
+            }
+            if(!f_ent[i].isdir){
+                char sz[16]; int k=0; u64 v=f_ent[i].size; char tmp[16]; int t=0;
+                if(v==0)sz[k++]='0'; else {while(v){tmp[t++]=(char)('0'+v%10);v/=10;} while(t)sz[k++]=tmp[--t];}
+                sz[k++]='B'; sz[k]=0; sf_text(&S,I.w-110,y,sz,COL_DIM);
+            }
+        }
+    }
+
+    /* ===== status bar ===== */
+    fill(0,I.h-F_STATUS_H,I.w,F_STATUS_H,COL_TOOLBAR);
+    sf_hline(&S,0,I.h-F_STATUS_H,I.w,RGB(0x27,0x27,0x2A));
+    {   char cnt[32]; int k=0;
+        const char *p = f_is_trash() ? "Trash — " : "";
+        while(*p&&k<30) cnt[k++]=*p++;
+        char nb[8]; int j=0, v=f_count; if(!v)nb[j++]='0'; while(v){nb[j++]=(char)('0'+v%10);v/=10;}
+        while(j&&k<30) cnt[k++]=nb[--j];
+        const char *q=" item(s)";
+        while(*q&&k<30) cnt[k++]=*q++;
+        cnt[k]=0;
+        sf_text(&S,10,I.h-F_STATUS_H+5,cnt,COL_DIM);
+        const char *hint = f_is_trash()
+            ? "Del=delete  R=restore  E=empty  Ctrl+C/X/V copy/cut/paste"
+            : "Enter=open  N=new  R=rename  Del=trash  Ctrl+C/X/V";
+        sf_text(&S,I.w-sf_text_width(f_status[0]?f_status:hint)-10,I.h-F_STATUS_H+5, f_status[0]?f_status:hint, f_status[0]?COL_ACCENT:COL_DIM);
+    }
 }
 
 #elif defined(APP_EDITOR)
@@ -756,7 +907,8 @@ static void page_account(void){
 /* PERSONALIZATION: accent colour, cursor theme, wallpaper — real + persisted */
 static void page_personalization(void){
     int y = 84;
-    sf_text(&S, CTX_X, y, "Accent colour", COL_DIM);
+    { icon_t ic = icon_get(ICON_ACT_PREFERENCES_DESKTOP); if(ic.px) sf_icon_sz(&S, CTX_X+8, y+8, ic, COL_TEXT, 16); }
+    sf_text(&S, CTX_X+26, y, "Accent colour", COL_DIM);
     for(int i = 0; i < NACCENT; i++){
         int sx = CTX_X + i * 48;
         u32 c = hex_color(accent_hex[i]);
@@ -765,12 +917,14 @@ static void page_personalization(void){
         else if(inside(g_mx, g_my, sx, y + 24, sx + 40, y + 64)) sf_rect_outline(&S, sx - 2, y + 22, 44, 44, RGB(0x60, 0xA5, 0xFA));
     }
     y += 92;
-    sf_text(&S, CTX_X, y, "Cursor theme", COL_DIM);
+    { icon_t ic = icon_get(ICON_TRAY_USER); if(ic.px) sf_icon_sz(&S, CTX_X+8, y+8, ic, COL_TEXT, 16); }
+    sf_text(&S, CTX_X+26, y, "Cursor theme", COL_DIM);
     const char *cn = cursors_theme_name(s_cursor); if(!cn) cn = "?";
     sf_text(&S, CTX_X, y + 24, cn, COL_ACCENT);
     sf_text(&S, CTX_X, y + 48, "Click to cycle", COL_DIM);
     y += 76;
-    sf_text(&S, CTX_X, y, "Wallpaper", COL_DIM);
+    { icon_t ic = icon_get(ICON_PLACE_PICS); if(ic.px) sf_icon_sz(&S, CTX_X+8, y+8, ic, COL_TEXT, 16); }
+    sf_text(&S, CTX_X+26, y, "Wallpaper", COL_DIM);
     char val[8]; itoa0(s_wallpaper + 1, val, 0);
     sf_text(&S, CTX_X, y + 24, val, COL_ACCENT);
     sf_text(&S, CTX_X, y + 48, "Click to cycle", COL_DIM);
@@ -797,18 +951,21 @@ static void page_packages(void){
 /* SYSTEM: dock, volume, UI scale — real controls, persisted */
 static void page_system(void){
     int y = 84;
-    sf_text(&S, CTX_X, y, "Dock", COL_DIM);
+    { icon_t ic = icon_get(ICON_DOCK_APPS_GRID); if(ic.px) sf_icon_sz(&S, CTX_X+8, y+8, ic, COL_TEXT, 16); }
+    sf_text(&S, CTX_X+26, y, "Dock", COL_DIM);
     sf_text(&S, CTX_X, y + 24, s_dock ? "Visible" : "Hidden", COL_ACCENT);
     sf_text(&S, CTX_X + 120, y + 24, "(click to toggle)", COL_DIM);
     y += 56;
-    sf_text(&S, CTX_X, y, "Volume", COL_DIM);
+    { icon_t ic = icon_get(s_vol ? ICON_TRAY_AUDIO_HI : ICON_TRAY_AUDIO_MUTE); if(ic.px) sf_icon_sz(&S, CTX_X+8, y+8, ic, COL_TEXT, 16); }
+    sf_text(&S, CTX_X+26, y, "Volume", COL_DIM);
     char vv[8]; itoa0(s_vol, vv, 0); sf_text(&S, CTX_X + 90, y, vv, COL_ACCENT);
     int slw = CTX_W - 40;
     sf_round_rect_blend(&S, CTX_X, y + 20, slw, 10, 5, ARGB(70, 255, 255, 255));
     int fw = slw * s_vol / 100;
     if(fw > 0) sf_round_rect(&S, CTX_X, y + 20, fw, 10, 5, RGB(0x3B, 0x82, 0xF6));
     y += 52;
-    sf_text(&S, CTX_X, y, "UI Scale", COL_DIM);
+    { icon_t ic = icon_get(ICON_DEV_DISPLAY); if(ic.px) sf_icon_sz(&S, CTX_X+8, y+8, ic, COL_TEXT, 16); }
+    sf_text(&S, CTX_X+26, y, "UI Scale", COL_DIM);
     sf_text(&S, CTX_X + 90, y, s_scale == 2 ? "2x (HiDPI)" : "1x", COL_ACCENT);
     sf_text(&S, CTX_X, y + 24, "(click to toggle)", COL_DIM);
 }
@@ -940,7 +1097,7 @@ static void settings_click(int x, int y){
         }
         int wy = cyy + 76;
         if(inside(x, y, CTX_X, wy + 20, CTX_X + 160, wy + 48)){
-            s_wallpaper = (s_wallpaper + 1) % wallpaper_count(); conf_write(); return;
+            s_wallpaper = (s_wallpaper + 1) % WALLPAPER_COUNT; conf_write(); return;
         }
         break;
     }
@@ -997,6 +1154,9 @@ int main_entry(int argc,char**argv,char**envp){
         int k=0; while(argv[1][k] && k<127){ f_path[k]=argv[1][k]; k++; }
         f_path[k]=0; f_sel=0;
     }
+    /* seed the navigation history with the starting directory */
+    f_hist_len=1; f_hist_idx=0;
+    { int k=0; while(f_path[k]&&k<127){ f_hist[0][k]=f_path[k]; k++; } f_hist[0][k]=0; }
 #elif defined(APP_EDITOR)
     title="Text";
 #elif defined(APP_SETTINGS)

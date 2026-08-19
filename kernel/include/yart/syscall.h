@@ -99,6 +99,8 @@ enum {
     SYS_PASSWD       = 89, /* change the account password (old,new) - real rehash     */
     SYS_REBOOT       = 90, /* reset the machine (ACPI, 8042 fallback)                  */
     SYS_DUP2         = 91, /* duplicate an fd onto a specific number (POSIX dup2)      */
+    SYS_SYMLINK      = 92, /* create a symlink: symlink(target, linkpath)              */
+    SYS_READLINK     = 93, /* read a symlink target: readlink(path, buf, size)         */
     SYS_MAX
 };
 

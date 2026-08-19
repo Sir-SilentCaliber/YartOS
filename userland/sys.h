@@ -120,6 +120,8 @@ enum {
     SYS_PASSWD       = 89,
     SYS_REBOOT       = 90,
     SYS_DUP2         = 91,
+    SYS_SYMLINK      = 92,
+    SYS_READLINK     = 93,
 };
 
 #define O_RDONLY 0x0
@@ -127,6 +129,7 @@ enum {
 #define O_RDWR   0x2
 #define O_CREAT  0x40
 #define O_TRUNC  0x200
+#define O_APPEND 0x400
 
 static inline long _sc(long n, long a, long b, long c) {
     long r;
@@ -200,6 +203,8 @@ static inline long mouse_pos(int *out) { return _sc(SYS_MOUSE_POS, (long)out, 0,
 static inline long passwd(const char *oldpw, const char *newpw) { return _sc(SYS_PASSWD, (long)oldpw, (long)newpw, 0); }
 static inline long reboot(void) { return _sc(SYS_REBOOT, 0, 0, 0); }
 static inline long dup2(long oldfd, long newfd) { return _sc(SYS_DUP2, oldfd, newfd, 0); }
+static inline long symlink(const char *target, const char *link) { return _sc(SYS_SYMLINK, (long)target, (long)link, 0); }
+static inline long readlink(const char *path, char *buf, long size) { return _sc(SYS_READLINK, (long)path, (long)buf, size); }
 static inline long mmap(long len) { return _sc(SYS_MMAP, len, 0, 0); }
 static inline long munmap(long addr) { return _sc(SYS_MUNMAP, addr, 0, 0); }
 static inline long setuid(long uid) { return _sc(SYS_SETUID, uid, 0, 0); }
@@ -220,6 +225,16 @@ static inline char *strncpy(char *d, const char *s, size_t n) { size_t i=0; whil
 static inline int puts(const char *s) { klog(s); return 0; }
 static inline void *memcpy(void *dst, const void *src, size_t n) { unsigned char *d=dst; const unsigned char *s=src; for (size_t i=0;i<n;i++) d[i]=s[i]; return dst; }
 static inline void *memset(void *dst, int c, size_t n) { unsigned char *d=dst; for (size_t i=0;i<n;i++) d[i]=(unsigned char)c; return dst; }
+
+/* Directory entry + stat (mirror kernel/include/yart/syscall.h). */
+typedef struct { u32 type; u32 reclen; u64 size; char name[96]; } yart_dirent_t;
+typedef struct { u32 type; u32 mode; u64 size; u64 mtime; } yart_stat_t;
+static inline long lseek(int fd, i64 off, int whence) { return _sc(SYS_LSEEK, fd, off, whence); }
+static inline long getdents(int fd, yart_dirent_t *out, u64 cnt) { return _sc(SYS_GETDENTS, fd, (long)out, (long)cnt); }
+static inline long stat(const char *p, yart_stat_t *out) { return _sc(SYS_STAT, (long)p, (long)out, 0); }
+static inline long getcwd(char *out, u64 cap) { return _sc(SYS_GETCWD, (long)out, (long)cap, 0); }
+static inline long chdir(const char *p) { return _sc(SYS_CHDIR, (long)p, 0, 0); }
+static inline long truncate(const char *p, u64 n) { return _sc(SYS_TRUNCATE, (long)p, (long)n, 0); }
 
 /* compositor */
 typedef struct { unsigned w, h, pitch, bpp, rgb; } fb_info_t;

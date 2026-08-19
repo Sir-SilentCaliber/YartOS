@@ -51,6 +51,12 @@ typedef struct task {
     task_state_t   state;
     int            exit_status;
     bool           is_user;        /* false = kernel/desktop task        */
+    bool           linux_abi;      /* runs a LINUX-ABI binary (foreign    */
+                                   /* ELF: ET_EXEC, Linux syscall numbers */
+                                   /* translated in syscall_handler)      */
+    u64            linux_fs_base;  /* arch_prctl(ARCH_SET_FS) value       */
+                                   /* (stored; %fs base not yet applied — */
+                                   /* real TLS/errno is deferred)          */
     u64           *pml4;           /* NULL = kernel page tables          */
     u32            uid;            /* real user id                       */
     u32            euid;           /* effective uid (doas can make it 0)  */
@@ -150,3 +156,18 @@ task_t *sched_find(u32 pid);
  * (they were reserved before the task existed). */
 void    vmm_take_boot_regions(task_t *t);
 void    sched_sleep_ms(u32 ms);        /* block the current task for ms   */
+
+/* ---- Linux ABI: futex (basic WAIT/WAKE) + shared-PML4 thread clone ----
+ * futex: the Linux fast userspace mutex.  WAIT blocks the current task on a
+ * userspace u32 address; WAKE unblocks up to `max` waiters on that address.
+ * clone(CLONE_VM|CLONE_THREAD|...): a THREAD shares the parent's address
+ * space (same PML4, refcounted so the last thread to exit frees it) and
+ * resumes at the same instruction with a new stack + TLS base. */
+void    sched_futex_wait(u64 addr);
+int     sched_futex_wake(u64 addr, int max);
+task_t *sched_clone_thread(task_t *parent, cpu_regs_t *frame,
+                           u64 child_stack, u64 tls);
+void    sched_pml4_ref(u64 *pml4);                 /* thread shares pml4   */
+int     sched_pml4_unref(u64 *pml4);               /* 1 = last ref (free it)*/
+bool    sched_pml4_is_shared(u64 *pml4);           /* shared with a thread  */
+void    sched_exit_group(u64 *pml4, int status);   /* kill all threads (TGID)*/

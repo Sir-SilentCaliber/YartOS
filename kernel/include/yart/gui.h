@@ -38,3 +38,5 @@ void fb_present_rects(const fb_rect_t *rects, u32 count);
 /* Primitive helpers kept in the kernel for boot-time recovery painting
  * (e.g. watchdog reset splash).  Compositor uses its own drawing code. */
 void fb_clear(color_t c);
+void fb_draw_text(int x, int y, const char *s, color_t fg);
+void fb_fallback_screen(void);   /* text mode shown when the wm dies */

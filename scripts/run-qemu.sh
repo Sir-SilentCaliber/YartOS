@@ -6,7 +6,26 @@ ISO="$ROOT/yart.iso"
 [ -f "$ISO" ] || { echo "Build first: make iso"; exit 1; }
 
 ACCEL="-enable-kvm -cpu host"
-[ -w /dev/kvm ] || { echo "(no /dev/kvm, falling back to TCG)"; ACCEL="-cpu qemu64"; }
+if [ -w /dev/kvm ]; then
+    echo "[OK] KVM acceleration detected - smooth desktop."
+else
+    cat >&2 <<'EOF'
+
+=========================================================================
+ WARNING: no /dev/kvm - falling back to TCG (pure software emulation).
+ TCG is 10-50x SLOWER than KVM. The desktop (especially the cursor) WILL
+ feel laggy no matter how optimized the code is. This is NOT a YartOS bug.
+
+ To fix (pick one):
+   1. Enable KVM:  sudo modprobe kvm-intel   (or kvm-amd)
+                   sudo usermod -aG kvm $USER   (then log out/in)
+      Re-run and confirm:  ls -l /dev/kvm
+   2. Or boot the ISO on real hardware (USB):  scripts/usb-deploy.sh
+=========================================================================
+
+EOF
+    ACCEL="-cpu qemu64"
+fi
 
 # Find OVMF firmware (path varies between Ubuntu/Debian releases)
 OVMF=""

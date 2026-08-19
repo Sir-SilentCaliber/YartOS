@@ -14,13 +14,14 @@
 #define VFS_ACL_MAX 8      /* per-file access-control entries           */
 typedef struct { u32 uid; u16 mask; } vfs_acl_entry_t; /* mask = PERM_* bits */
 
-typedef enum { VN_FILE = 1, VN_DIR = 2 } vnode_type_t;
+typedef enum { VN_FILE = 1, VN_DIR = 2, VN_SYMLINK = 3 } vnode_type_t;
 
 typedef int icon_id_t;   /* icons live in ring-3 now; kernel stores int */
 
 typedef struct vnode {
     char         name[VFS_MAX_NAME];
     vnode_type_t type;
+    u32          ino;         /* on-disk inode number (0 = not yet persisted) */
     size_t       size;        /* bytes for files, 0 for dirs              */
     size_t       cap;         /* allocated capacity for files             */
     void        *data;        /* heap-owned for files                     */
@@ -56,6 +57,12 @@ void     vfs_init(void *initrd, size_t size);
 vnode_t *vfs_root(void);
 vnode_t *vfs_lookup(const char *path);
 vnode_t *vfs_lookup_at(vnode_t *cwd, const char *path);
+/* No-follow variants: return the symlink node itself instead of its target
+ * (used by unlink/rename/stat, which must act on the link, not the target). */
+vnode_t *vfs_lookup_nofollow(const char *path);
+vnode_t *vfs_lookup_at_nofollow(vnode_t *cwd, const char *path);
+/* Create a symlink whose target is `target`. */
+vnode_t *vfs_symlink(vnode_t *parent, const char *name, const char *target);
 
 /* file ops */
 int  vfs_read   (vnode_t *v, void *buf, size_t off, size_t n);
@@ -71,6 +78,7 @@ int      vfs_mkdir_p(const char *path);     /* mkdir -p relative to /     */
 void  vfs_dump(void);
 int   vfs_path_of(vnode_t *v, char *out, size_t cap);
 size_t vfs_count_children(vnode_t *dir);
+vnode_t *vfs_find_child(vnode_t *parent, const char *name);  /* NULL if absent */
 
 /* Permission check: does `euid` have all `want` bits (PERM_R/W/X) on `v`?
  * uid 0 always passes; owner bits apply when v->uid == euid, otherwise the

@@ -84,10 +84,13 @@ static void mouse_irq(cpu_regs_t *r) {
     int dy = (int)pkt[2];
     if (flags & 0x10) dx -= 256;
     if (flags & 0x20) dy -= 256;
-    /* NOTE: no Y inversion here.  PS/2 already encodes "up" as a negative Y
-     * (sign bit set in the flags byte), which is the correct convention for
-     * a top-left-origin framebuffer.  The old `dy = -dy` inverted the axis,
-     * so moving the mouse down moved the cursor up (and vice-versa). */
+    /* Invert Y: the PS/2 mouse device (and QEMU's emulation) reports a
+     * NEGATIVE Y count when the mouse moves DOWN (towards the user), i.e. the
+     * Y axis is the opposite of the framebuffer's top-left origin.  Without
+     * this flip, moving the mouse down moves the cursor up and vice-versa.
+     * (QEMU ps2.c: mouse_dy -= evt->rel.value for INPUT_AXIS_Y, then the
+     * packet sets the Y sign bit, giving down == negative dy.) */
+    dy = -dy;
 
     int wheel = (i8)pkt[3];
     if (wheel > 15) wheel = 15;

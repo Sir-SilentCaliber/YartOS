@@ -444,7 +444,7 @@ int vfs_mkdir_p(const char *path) {
         if (i == 0) continue;
         vnode_t *e = find_child(cur, part);
         if (!e) e = vfs_create(cur, part, VN_DIR);
-        else if (e->type != VN_DIR) return -1;
+        else if (e->type != VN_DIR) { vfs_unlock(); return -1; }
         cur = e;
     }
     vfs_unlock(); return 0;
@@ -453,7 +453,14 @@ int vfs_mkdir_p(const char *path) {
 int vfs_path_of(vnode_t *v, char *out, size_t cap) {
     vfs_lock();
     if (!v) { vfs_unlock(); return -1; }
-    if (v == root_node) { strncpy(out, "/", cap); return 1; }
+    if (v == root_node) {
+        strncpy(out, "/", cap);
+        vfs_unlock();   /* MUST release the lock before returning: the root
+                         * path is taken by getcwd() when the cwd is "/" (the
+                         * default for every task), and leaking the lock here
+                         * deadlocked the whole system on the next vfs_lock. */
+        return 1;
+    }
     char tmp[VFS_MAX_PATH] = {0};
     int pos = sizeof tmp - 1;
     tmp[pos] = 0;

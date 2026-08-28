@@ -1823,6 +1823,199 @@ static i64 linux_sock_shutdown(int fd, u64 how) {
     return 0;
 }
 
+/* ---- Wave-1 Linux syscalls (Phase 0 of the Linux-compat roadmap).
+ * These are the "trivial-but-everywhere" syscalls that static musl programs
+ * call constantly: sleep/yield, dup/pipe variants, fork/wait, kill, fcntl,
+ * truncate, rlimit/rusage/sysinfo, getrandom.  Each is implemented against
+ * existing kernel facilities so a busybox-style static binary can run. ---- */
+
+struct linux_timespec { long tv_sec; long tv_nsec; };
+
+/* nanosleep(ts): block for the given time (YartOS sleeps in whole ms). */
+static i64 linux_nanosleep(u64 ts_ptr) {
+    if (!uptr(ts_ptr, sizeof(struct linux_timespec))) return -LINUX_EINVAL;
+    struct linux_timespec ts;
+    stac(); memcpy(&ts, (void *)ts_ptr, sizeof ts); clac();
+    if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L)
+        return -LINUX_EINVAL;
+    u64 ms = (u64)ts.tv_sec * 1000ULL + (u64)(ts.tv_nsec / 1000000L);
+    if (ts.tv_nsec % 1000000L) ms++;          /* round up: never wake early */
+    if (ms > 0xFFFFFFFFULL) ms = 0xFFFFFFFFULL;
+    if (ms) sched_sleep_ms((u32)ms);
+    return 0;
+}
+
+/* getrandom(buf, len, flags): xorshift64 seeded from TSC+tick.  (The kernel
+ * has no CSPRNG yet — documented limitation, same class as AT_RANDOM.) */
+static u64 linux_rand_u64(void) {
+    static u64 s;
+    if (!s) {
+        u64 t; __asm__ volatile("rdtsc" : "=A"(t));
+        s = t ^ ((u64)pit_ticks() << 32) ^ 0x9E3779B97F4A7C15ULL;
+        if (!s) s = 1;
+    }
+    u64 x = s;
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    return s = x;
+}
+static i64 linux_getrandom(u64 buf, u64 len, u64 flags) {
+    (void)flags;
+    if (len > USER_BUF_MAX || !uptr(buf, len)) return -LINUX_EINVAL;
+    u8 tmp[64];
+    for (u64 off = 0; off < len; off += sizeof tmp) {
+        u64 n = len - off; if (n > sizeof tmp) n = sizeof tmp;
+        for (u64 i = 0; i < n; i += 8) {
+            u64 v = linux_rand_u64();
+            u64 take = n - i; if (take > 8) take = 8;
+            memcpy(tmp + i, &v, (size_t)take);
+        }
+        stac(); memcpy((void *)(buf + off), tmp, (size_t)n); clac();
+    }
+    return (i64)len;
+}
+
+/* ftruncate(fd, len): resize the file behind an open fd. */
+static i64 linux_ftruncate(int fd, u64 len) {
+    fd_entry_t *f = fd_get(fd);
+    if (!f || fd < 3 || f->is_pipe) return -LINUX_EBADF;
+    return vfs_truncate(f->vn, (size_t)len) == 0 ? 0 : -1;
+}
+
+/* dup(oldfd): duplicate onto the lowest free fd >= 3. */
+static i64 linux_dup(int oldfd) {
+    fd_entry_t *f = fd_get(oldfd);
+    if (!f || oldfd < 3) return -LINUX_EBADF;
+    task_t *t = cur();
+    for (int i = 3; i < MAX_FD; i++) {
+        if (t->fds[i].in_use) continue;
+        fd_entry_t *nf = &t->fds[i];
+        *nf = *f;
+        if (nf->is_pipe && nf->pipe) {
+            nf->pipe->refs++;
+            if (nf->pipe_is_read_end) nf->pipe->read_ends++;
+            else                      nf->pipe->write_ends++;
+        } else if (nf->vn) {
+            vnode_ref(nf->vn);
+        }
+        return i;
+    }
+    return -1;                                 /* EMFILE */
+}
+
+/* fcntl(fd, cmd, arg): the subset static programs need. */
+#define LINUX_F_DUPFD  0
+#define LINUX_F_GETFD  1
+#define LINUX_F_SETFD  2
+#define LINUX_F_GETFL  3
+#define LINUX_F_SETFL  4
+#define LINUX_O_APPEND    0x400
+#define LINUX_O_NONBLOCK  0x800
+static i64 linux_fcntl(int fd, u64 cmd, u64 arg) {
+    fd_entry_t *f = fd_get(fd);
+    if (!f || fd < 3) return -LINUX_EBADF;
+    switch (cmd) {
+    case LINUX_F_DUPFD: {
+        task_t *t = cur();
+        int start = arg < 3 ? 3 : (int)arg;
+        if (start >= MAX_FD) return -LINUX_EINVAL;
+        for (int i = start; i < MAX_FD; i++) {
+            if (t->fds[i].in_use) continue;
+            fd_entry_t *nf = &t->fds[i];
+            *nf = *f;
+            if (nf->is_pipe && nf->pipe) {
+                nf->pipe->refs++;
+                if (nf->pipe_is_read_end) nf->pipe->read_ends++;
+                else                      nf->pipe->write_ends++;
+            } else if (nf->vn) vnode_ref(nf->vn);
+            return i;
+        }
+        return -1;                             /* EMFILE */
+    }
+    case LINUX_F_GETFD: return 0;              /* no FD_CLOEXEC yet */
+    case LINUX_F_SETFD: return 0;
+    case LINUX_F_GETFL: return (i64)f->flags;
+    case LINUX_F_SETFL:
+        f->flags = (f->flags & ~(LINUX_O_APPEND | LINUX_O_NONBLOCK)) |
+                   ((u32)arg & (LINUX_O_APPEND | LINUX_O_NONBLOCK));
+        return 0;
+    default:
+        return -LINUX_ENOSYS;
+    }
+}
+
+/* getppid: musl's getppid() / shell job control. */
+static i64 linux_getppid(void) { task_t *t = cur(); return t ? (i64)t->ppid : 0; }
+
+/* sched_getaffinity: report every online CPU. */
+static i64 linux_getaffinity(u64 mask_ptr, u64 len) {
+    if (!mask_ptr || !uptr(mask_ptr, len)) return -LINUX_EINVAL;
+    u8 m[8]; memset(m, 0, sizeof m);
+    for (int i = 0; i < 8; i++) m[i / 8] |= (u8)(1u << (i % 8));
+    u64 n = len < sizeof m ? len : sizeof m;
+    stac(); memcpy((void *)mask_ptr, m, (size_t)n); clac();
+    return (i64)n;
+}
+
+/* getrlimit / prlimit64: report sane defaults (rlim = two u64: cur, max). */
+#define LINUX_RLIMIT_STACK  3
+#define LINUX_RLIMIT_NOFILE 7
+static i64 linux_getrlimit(u64 res, u64 rlim_ptr) {
+    if (!uptr(rlim_ptr, 16)) return -LINUX_EINVAL;
+    u64 cur = (u64)-1, max = (u64)-1;              /* RLIM_INFINITY */
+    if (res == LINUX_RLIMIT_STACK)  cur = max = 8 * 1024 * 1024;
+    if (res == LINUX_RLIMIT_NOFILE) cur = max = 1024;
+    stac();
+    ((u64 *)(void *)rlim_ptr)[0] = cur;
+    ((u64 *)(void *)rlim_ptr)[1] = max;
+    clac();
+    return 0;
+}
+
+/* getrusage: zeroed (we don't track per-process accounting yet). */
+static i64 linux_getrusage(u64 rusage_ptr) {
+    if (!uptr(rusage_ptr, 144)) return -LINUX_EINVAL;
+    stac(); for (int i = 0; i < 144; i++) ((u8 *)(void *)rusage_ptr)[i] = 0; clac();
+    return 0;
+}
+
+/* sysinfo: musl's sysinfo() struct.  Fill uptime + memory sizes. */
+struct linux_sysinfo {
+    long uptime, loads[3], totalram, freeram, sharedram, bufferram,
+         totalswap, freeswap;
+    unsigned short procs, pad;
+    long totalhigh, freehigh;
+    unsigned mem_unit;
+};
+static i64 linux_sysinfo(u64 info_ptr) {
+    if (!uptr(info_ptr, sizeof(struct linux_sysinfo))) return -LINUX_EINVAL;
+    struct linux_sysinfo si;
+    memset(&si, 0, sizeof si);
+    si.uptime = (long)(pit_ticks() / TICK_HZ);
+    si.totalram = (long)(pmm_total_pages() * PAGE_SIZE);
+    si.freeram  = (long)((pmm_total_pages() - pmm_used_pages()) * PAGE_SIZE);
+    si.mem_unit = 1;
+    stac(); memcpy((void *)info_ptr, &si, sizeof si); clac();
+    return 0;
+}
+
+/* sync: flush the disk FS (like POSIX sync()). */
+static i64 linux_sync(void) {
+    extern int  blkfs_sync(void);
+    extern bool blkfs_active(void);
+    if (blkfs_active()) blkfs_sync();
+    return 0;
+}
+
+/* clock_getres: report the 250 Hz tick resolution. */
+static i64 linux_clock_getres(u64 res_ptr) {
+    if (!uptr(res_ptr, 16)) return -LINUX_EINVAL;
+    stac();
+    ((long *)(void *)res_ptr)[0] = 0;
+    ((long *)(void *)res_ptr)[1] = 1000000000L / TICK_HZ;
+    clac();
+    return 0;
+}
+
 /* Dispatch a Linux syscall.  Returns 1 = handled (rax set), 0 = translated
  * (fall through to the YartOS switch). */
 static int linux_dispatch(cpu_regs_t *r) {
@@ -1950,6 +2143,45 @@ static int linux_dispatch(cpu_regs_t *r) {
                 if ((i64)a0 != LINUX_AT_FDCWD) { r->rax = (u64)-LINUX_ENOSYS; return 1; }
                 r->rax = SYS_OPEN; r->rdi = a1; r->rsi = a2; r->rdx = 0;
                 return 0; }                                  /* fall through as open */
+
+    /* ---- Wave-1 quick wins (see docs/LINUX_COMPAT_ROADMAP.md, Phase 0) ---- */
+    case 22:  r->rax = SYS_PIPE;    break;                   /* pipe            */
+    case 24:  r->rax = SYS_YIELD;   break;                   /* sched_yield     */
+    case 32:  r->rax = (u64)linux_dup((int)a0); return 1;    /* dup             */
+    case 33:  r->rax = SYS_DUP2;    break;                   /* dup2            */
+    case 35:  r->rax = (u64)linux_nanosleep(a0); return 1;   /* nanosleep       */
+    case 57:  r->rax = SYS_FORK;    break;                   /* fork            */
+    case 58:  r->rax = SYS_FORK;    break;                   /* vfork (approx)  */
+    case 61:  r->r10 = a2; r->rax = SYS_WAITPID; break;      /* wait4 -> waitpid*/
+    case 62:  r->rax = SYS_KILL;    break;                   /* kill            */
+    case 72:  r->rax = (u64)linux_fcntl((int)a0, a1, a2); return 1;
+    case 74:  r->rax = SYS_FSYNC;   break;                   /* fsync           */
+    case 75:  r->rax = SYS_FSYNC;   break;                   /* fdatasync       */
+    case 76:  r->rax = SYS_TRUNCATE; break;                  /* truncate        */
+    case 77:  r->rax = (u64)linux_ftruncate((int)a0, a1); return 1;
+    case 95:  r->rax = SYS_UMASK;   break;                   /* umask           */
+    case 97:  r->rax = (u64)linux_getrlimit(a0, a1); return 1;
+    case 98:  r->rax = (u64)linux_getrusage(a1); return 1;
+    case 99:  r->rax = (u64)linux_sysinfo(a0); return 1;
+    case 110: r->rax = (u64)linux_getppid(); return 1;       /* getppid         */
+    case 111: r->rax = 0; return 1;                          /* getpgrp         */
+    case 112: r->rax = 0; return 1;                          /* setsid (1 session) */
+    case 121: r->rax = 0; return 1;                          /* getpgid         */
+    case 162: r->rax = (u64)linux_sync(); return 1;          /* sync            */
+    case 186: r->rax = (u64)task_getpid(); return 1;         /* gettid == pid   */
+    case 200: case 234: r->rax = SYS_KILL; break;            /* tkill / tgkill  */
+    case 203: r->rax = 0; return 1;                          /* sched_setaffinity */
+    case 204: r->rax = (u64)linux_getaffinity(a1, a2); return 1;
+    case 218: r->rax = (u64)task_getpid(); return 1;         /* set_tid_address */
+    case 229: r->rax = (u64)linux_clock_getres(a0); return 1;
+    case 230: r->rax = (u64)linux_nanosleep(a0); return 1;   /* clock_nanosleep */
+    case 292: if (a2) { r->rax = (u64)-LINUX_ENOSYS; return 1; }  /* dup3 flags */
+              r->rax = SYS_DUP2; break;
+    case 293: if (a1) { r->rax = (u64)-LINUX_ENOSYS; return 1; }  /* pipe2 flags */
+              r->rax = SYS_PIPE; break;
+    case 302: if (a2) { r->rax = (u64)-LINUX_ENOSYS; return 1; }  /* prlimit64 */
+              r->rax = (u64)linux_getrlimit(a0, a1); return 1;
+    case 318: r->rax = (u64)linux_getrandom(a0, a1, a2); return 1;
 
     default:
         r->rax = (u64)-LINUX_ENOSYS;
@@ -2582,34 +2814,31 @@ static i64 sys_wm_resize(u32 id, u32 w, u32 h) {
     wm_surface_t *s = &g_wm_surfs[id];
     u32 new_pages = (w * h * 4 + PAGE_SIZE - 1) / PAGE_SIZE;
     if (new_pages > WM_SURF_MAX_PAGES) return -1;
-    /* For simplicity, keep old pages if same count, else realloc not yet.
-       We only allow same-page-count resize to avoid complex remap.
-       Full realloc would need unmap+alloc+map both sides.
-     */
-    if (new_pages != s->npages) {
-        /* realloc: free extra or alloc more */
-        if (new_pages > s->npages) {
-            for (u32 i=s->npages;i<new_pages;i++){
-                paddr_t pg = pmm_alloc_page();
-                if (!pg) return -1;
-                s->pages[i]=pg;
-                vmm_map_in(vmm_current_pml4(), s->app_va + i*PAGE_SIZE, pg, PTE_PRESENT|PTE_RW|PTE_US|PTE_NX|PTE_NOSHR);
+
+    /* GROW: allocate the extra pages and map them ONLY on the WM side (the
+     * compositor must be able to read the enlarged canvas).  The app side is
+     * deliberately left alone: the app keeps drawing at its ORIGINAL size, so
+     * extending its mapping is unnecessary. */
+    if (new_pages > s->npages) {
+        for (u32 i = s->npages; i < new_pages; i++) {
+            paddr_t pg = pmm_alloc_page();
+            if (!pg) return -1;
+            s->pages[i] = pg;
+            if (g_wm_task && g_wm_task->pml4) {
+                vmm_map_in(g_wm_task->pml4, s->wm_va + i * PAGE_SIZE, pg,
+                           PTE_PRESENT | PTE_RW | PTE_US | PTE_NX | PTE_NOSHR);
                 pmm_ref_page(pg);
-                if (g_wm_task && g_wm_task->pml4){
-                    vmm_map_in(g_wm_task->pml4, s->wm_va + i*PAGE_SIZE, pg, PTE_PRESENT|PTE_RW|PTE_US|PTE_NX|PTE_NOSHR);
-                    pmm_ref_page(pg);
-                }
-            }
-        } else {
-            for (u32 i=new_pages;i<s->npages;i++){
-                vmm_unmap_in(sched_find(s->owner_pid)?sched_find(s->owner_pid)->pml4:vmm_current_pml4(), s->app_va + i*PAGE_SIZE);
-                if (g_wm_task && g_wm_task->pml4) vmm_unmap_in(g_wm_task->pml4, s->wm_va + i*PAGE_SIZE);
-                pmm_free_page(s->pages[i]);
             }
         }
-        s->npages = new_pages;
         if (g_wm_task != cur()) smp_tlb_shootdown_all();
     }
+    /* SHRINK: do NOT unmap or free pages.  The app keeps drawing at its
+     * original size, and a shrink here used to vmm_unmap_in() the tail pages
+     * out of the app's address space - the app then faulted on the very next
+     * draw ("SIGSEGV on window resize") and was killed.  The WM just
+     * composites a smaller rect; the pages are reclaimed on surface destroy. */
+
+    s->npages = new_pages > s->npages ? new_pages : s->npages;
     s->w = w; s->h = h; s->dirty = true;
     return 0;
 }

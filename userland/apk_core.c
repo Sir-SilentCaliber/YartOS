@@ -24,7 +24,91 @@
 #include "apk.h"
 #include "fsutil.h"
 
+/* ---- remote repository (real networking) --------------------------------
+ * apk is NOT local-only anymore.  Packages that aren't in /repo are fetched
+ * over the network with a plain HTTP/1.0 GET (built on the kernel's TCP
+ * client + optional DNS).  The remote repo serves the SAME .ypkg format as
+ * /repo (native YartOS x86_64 binaries).  The QEMU host is reachable from
+ * the guest at 10.0.2.2, so this default points at a repo server on the
+ * host; change APK_REMOTE_HOST to a hostname/IP to point elsewhere (a
+ * hostname is resolved via the kernel DNS client). */
+#define APK_REMOTE_HOST "10.0.2.2"
+#define APK_REMOTE_PORT 8000
+#define APK_REMOTE_DIR  "/repo"
+
 #define YPKG_MAGIC 0x4B505059u   /* "YPKG" little-endian */
+
+/* parse "a.b.c.d" into a host-order u32, or 0 if not a valid literal */
+static u32 parse_ip4(const char *s) {
+    u32 ip = 0; int part = 0, val = 0, seen = 0;
+    for (const char *p = s; ; p++) {
+        if (*p >= '0' && *p <= '9') { val = val * 10 + (*p - '0'); seen = 1; }
+        else if (*p == '.' || *p == 0) {
+            if (!seen || val > 255) return 0;
+            ip = (ip << 8) | (u32)val;
+            part++; val = 0; seen = 0;
+            if (*p == 0) break;
+        } else return 0;
+    }
+    return (part == 4) ? ip : 0;
+}
+
+/* Minimal HTTP/1.0 GET.  Returns the response BODY length, or -1. */
+static long http_get(const char *host, u16 port, const char *path,
+                     char *out, long cap) {
+    u32 ip = parse_ip4(host);
+    if (!ip) {
+        unsigned int d = 0;
+        if (dns_resolve(host, &d) != 0 || !d) return -1;
+        ip = d;
+    }
+    long c = tcp_connect(ip, port);
+    if (c < 0) return -1;
+
+    char req[640]; int k = 0;
+    const char *g = "GET ";            for (; *g; g++) req[k++] = *g;
+    for (const char *p = path; *p; p++) req[k++] = *p;
+    const char *h1 = " HTTP/1.0\r\nHost: ";
+    for (; *h1; h1++) req[k++] = *h1;
+    for (const char *p = host; *p; p++) req[k++] = *p;
+    const char *h2 = "\r\nConnection: close\r\n\r\n";
+    for (; *h2; h2++) req[k++] = *h2;
+
+    if (tcp_send(c, req, k) < 0) { tcp_close(c); return -1; }
+
+    long total = 0;
+    int  quiet = 0;
+    while (total < cap - 1 && quiet < 200) {      /* ~1 s silence = EOF   */
+        long n = tcp_recv(c, out + total, cap - 1 - total);
+        if (n > 0) { total += n; quiet = 0; }
+        else       { quiet++; sleep(5); }
+    }
+    tcp_close(c);
+    out[total] = 0;
+
+    /* strip the header block */
+    char *body = out;
+    for (long i = 0; i + 3 < total; i++)
+        if (out[i] == '\r' && out[i+1] == '\n' &&
+            out[i+2] == '\r' && out[i+3] == '\n') { body = out + i + 4; break; }
+    long blen = total - (long)(body - out);
+    if (blen < 0) blen = 0;
+    for (long i = 0; i < blen; i++) out[i] = body[i];
+    out[blen] = 0;
+    return blen;
+}
+
+/* Download <name>.ypkg from the remote repo into `out`. */
+static long apk_remote_get(const char *name, char *out, long cap) {
+    char path[160]; int k = 0;
+    const char *d = APK_REMOTE_DIR; for (; *d; d++) path[k++] = *d;
+    path[k++] = '/';
+    for (const char *p = name; *p && k < 150; p++) path[k++] = *p;
+    const char *suf = ".ypkg"; while (*suf && k < 159) path[k++] = *suf++;
+    path[k] = 0;
+    return http_get(APK_REMOTE_HOST, APK_REMOTE_PORT, path, out, cap);
+}
+
 
 typedef struct {
     u32 magic;
@@ -171,20 +255,47 @@ static int add_pkg(const char *name, apk_emit_t emit) {
     if (apk_elevate(emit) != 0) return -1;
     if (is_installed(name)) { emit("apk: already installed"); return 0; }
     char path[160];
-    if (find_pkg(name, path, sizeof path) != 0) {
-        char line[200];
-        fs_copystr(line, "apk: no such package '", sizeof line);
-        int k = (int)strlen(line);
-        for (const char *p = name; *p && k < 196; p++) line[k++] = *p;
-        line[k++] = '\''; line[k] = 0;
-        emit(line);
-        emit("      try: apk search");
-        return -1;
-    }
-
     char *raw = (char *)mmap(16 * 1024 * 1024);
     if (!raw) { emit("apk: out of memory"); return -1; }
-    long n = fs_read_file(path, raw, 16 * 1024 * 1024);
+
+    long n = -1;
+    if (find_pkg(name, path, sizeof path) == 0) {
+        /* local /repo hit */
+        n = fs_read_file(path, raw, 16 * 1024 * 1024);
+    } else {
+        /* not in /repo: fetch it over the network */
+        emit("fetching from remote repo...");
+        n = apk_remote_get(name, raw, 16 * 1024 * 1024);
+        if (n <= 0) {
+            munmap((long)raw);
+            char line[200];
+            fs_copystr(line, "apk: no such package '", sizeof line);
+            int k = (int)strlen(line);
+            for (const char *p = name; *p && k < 196; p++) line[k++] = *p;
+            line[k++] = '\''; line[k] = 0;
+            emit(line);
+            emit("      (checked /repo and the remote repo)");
+            emit("      local packages:");
+            each_pkg(emit, "", 0);
+            return -1;
+        }
+        /* stash the download so the install path below is identical */
+        char tmp[96];
+        fs_copystr(tmp, "/tmp/", sizeof tmp);
+        int tk = (int)strlen(tmp);
+        for (const char *p = name; *p && tk < 90; p++) tmp[tk++] = *p;
+        const char *suf = ".ypkg"; while (*suf && tk < 95) tmp[tk++] = *suf++;
+        tmp[tk] = 0;
+        if (fs_write_file(tmp, raw, n) != 0) {
+            munmap((long)raw); emit("apk: temp write failed"); return -1;
+        }
+        fs_copystr(path, tmp, sizeof path);
+        char dl[80]; fs_copystr(dl, "downloaded ", sizeof dl);
+        int dk = (int)strlen(dl);
+        fs_itoa(n, dl + dk); dk = (int)strlen(dl);
+        fs_copystr(dl + dk, " bytes", (int)(sizeof dl - dk));
+        emit(dl);
+    }
     if (n <= 0) { munmap((long)raw); emit("apk: read failed"); return -1; }
 
     ypkg_header_t h;
@@ -212,16 +323,17 @@ static int add_pkg(const char *name, apk_emit_t emit) {
 
     u32 off = sizeof(ypkg_header_t);
     int ok = 1;
+    const char *why = "";
     for (u32 f = 0; f < h.nfiles && ok; f++) {
-        if (off + 4 > (u32)n) { ok = 0; break; }
+        if (off + 4 > (u32)n) { ok = 0; why = "truncated (plen)"; break; }
         u32 plen = rd_u32((unsigned char *)raw + off); off += 4;
-        if (off + plen + 8 > (u32)n) { ok = 0; break; }
+        if (off + plen + 8 > (u32)n) { ok = 0; why = "truncated (path)"; break; }
         char fpath[192];
         fs_copystr(fpath, raw + off, (plen + 1 < 192 ? plen + 1 : 192));
         off += plen;
         u32 mode = rd_u32((unsigned char *)raw + off); off += 4;
         u32 size = rd_u32((unsigned char *)raw + off); off += 4;
-        if (off + size > (u32)n) { ok = 0; break; }
+        if (off + size > (u32)n) { ok = 0; why = "truncated (data)"; break; }
 
         char parent[192];
         fs_copystr(parent, fpath, sizeof parent);
@@ -229,8 +341,12 @@ static int add_pkg(const char *name, apk_emit_t emit) {
         while (pl > 0 && parent[pl - 1] != '/') pl--;
         if (pl > 0) { parent[pl - 1] = 0; if (parent[0]) fs_mkdir_p(parent); }
 
-        if (fs_write_file(fpath, raw + off, (long)size) != 0) { ok = 0; break; }
+        if (fs_write_file(fpath, raw + off, (long)size) != 0) { ok = 0; why = "write failed"; break; }
         if (mode == 1) chmod(fpath, 0755);
+        { char wl[200]; fs_copystr(wl, "  wrote ", sizeof wl);
+          int wk = (int)strlen(wl);
+          for (const char *p = fpath; *p && wk < 196; p++) wl[wk++] = *p;
+          wl[wk] = 0; emit(wl); }
 
         int fl = (int)strlen(fpath);
         if (dbn + fl + 2 < (int)sizeof(db)) {
@@ -272,12 +388,18 @@ static int add_pkg(const char *name, apk_emit_t emit) {
     if (ok) {
         db[dbn] = 0;
         fs_write_file(dbpath, db, dbn);
+        emit("syncing to disk...");
         fsync(0);
         emit("done - now in the launcher (press Super)");
         notify("apk: installed package");
         return 0;
     }
     emit("apk: install FAILED");
+    { char wl[160]; fs_copystr(wl, "      reason: ", sizeof wl);
+      int wk = (int)strlen(wl);
+      for (const char *p = why; *p && wk < 158; p++) wl[wk++] = *p;
+      wl[wk] = 0;
+      emit(wl); }
     return -1;
 }
 
@@ -367,14 +489,52 @@ static int info_pkg(const char *name, apk_emit_t emit) {
     return 0;
 }
 
+/* `apk update`: fetch the remote repo's INDEX file and show it. */
+static int update_repo(apk_emit_t emit) {
+    char *buf = (char *)mmap(1024 * 1024);
+    if (!buf) { emit("apk: out of memory"); return -1; }
+    char path[80];
+    fs_copystr(path, APK_REMOTE_DIR, sizeof path);
+    int k = (int)strlen(path);
+    const char *suf = "/INDEX"; while (*suf && k < 79) path[k++] = *suf++;
+    path[k] = 0;
+    long n = http_get(APK_REMOTE_HOST, APK_REMOTE_PORT, path, buf, 1024 * 1024);
+    if (n <= 0) {
+        munmap((long)buf);
+        emit("apk: update failed - remote repo unreachable");
+        emit("      repo: http://" APK_REMOTE_HOST "/repo/");
+        return -1;
+    }
+    /* cache the index and echo it */
+    fs_mkdir_p(APK_DB_DIR);
+    char db[96];
+    fs_copystr(db, APK_DB_DIR, sizeof db);
+    int dk = (int)strlen(db);
+    const char *suf2 = "/INDEX"; while (*suf2 && dk < 95) db[dk++] = *suf2++;
+    db[dk] = 0;
+    fs_write_file(db, buf, n);
+    int start = 0;
+    for (long i = 0; i <= n; i++) {
+        if (buf[i] == '\n' || buf[i] == 0) {
+            if (i > start) { char sv = buf[i]; buf[i] = 0; emit(buf + start); buf[i] = sv; }
+            start = (int)i + 1;
+            if (buf[i] == 0) break;
+        }
+    }
+    munmap((long)buf);
+    emit("updated");
+    return 0;
+}
+
 int apk_main(int argc, char **argv, apk_emit_t emit) {
     if (argc < 2) {
-        emit("usage: apk <add|del|list|search|info> [pkg]");
-        emit("  apk add <pkg>    install (appears in the Super launcher)");
+        emit("usage: apk <add|del|list|search|info|update> [pkg]");
+        emit("  apk add <pkg>    install (local /repo, then remote repo)");
         emit("  apk del <pkg>    remove it");
-        emit("  apk list         list the repository");
+        emit("  apk list         list the local repository");
         emit("  apk search <s>   find packages");
         emit("  apk info <pkg>   details");
+        emit("  apk update       fetch the remote repo index");
         return 1;
     }
     const char *sub = argv[1];
@@ -386,7 +546,8 @@ int apk_main(int argc, char **argv, apk_emit_t emit) {
     if (strcmp(sub, "search") == 0) return each_pkg(emit, arg, 0);
     if (strcmp(sub, "info") == 0) return info_pkg(arg, emit);
     if (strcmp(sub, "installed") == 0) return each_pkg(emit, "", 1);
+    if (strcmp(sub, "update") == 0) return update_repo(emit);
 
-    emit("apk: unknown command (add|del|list|search|info)");
+    emit("apk: unknown command (add|del|list|search|info|update)");
     return 1;
 }

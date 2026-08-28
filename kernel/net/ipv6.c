@@ -358,14 +358,15 @@ static void ipv6_send_ns(const ip6_t *target) {
 void net_ipv6_poll(void) {
     static u64 last_action;
     static u64 step_start;
-    if (g_ip6_ok) return;
+    static bool gave_up;      /* no router anywhere: stop probing forever */
+    static int  cycles;       /* full candidate sweeps with no answer      */
+    if (gave_up || g_ip6_ok) return;
     if (pit_ticks() - last_action < MS_TO_TICKS(100)) return;
     last_action = pit_ticks();
 
     /* per-step timeout: a silent router must not wedge the state machine */
     if (v6_step != V6_STEP_RS && v6_step != V6_STEP_PROBE &&
         pit_ticks() - step_start > MS_TO_TICKS(600)) {
-        kprintf("ipv6: step %d timed out - next candidate\n", v6_step);
         v6_step = V6_STEP_PROBE;
         step_start = pit_ticks();
     }
@@ -389,14 +390,21 @@ void net_ipv6_poll(void) {
             memcpy(&v6_target, cands[v6_cand], 16);
             v6_cand++;
             if (nd6_lookup(&v6_target)) continue;      /* known already */
-            kprintf("ipv6: probing router candidate %02x%02x:..%02x%02x\n",
-                    v6_target.b[0], v6_target.b[1], v6_target.b[14], v6_target.b[15]);
             ipv6_send_ns(&v6_target);
             v6_step = V6_STEP_NS;
             step_start = pit_ticks();
             return;
         }
-        v6_step = V6_STEP_RS;                /* all failed: retry cycle */
+        /* Every candidate was probed with no answer.  A real router answers
+         * on the first sweep; an emulated/host-only network never will, so
+         * retrying forever just burns CPU and spams the serial console under
+         * TCG.  Give up after two full sweeps and go silent. */
+        if (++cycles >= 2) {
+            gave_up = true;
+            kprintf("ipv6: no router found - SLAAC disabled (IPv4 only)\n");
+            return;
+        }
+        v6_step = V6_STEP_RS;                /* one more sweep, then stop */
         v6_rs_n = 0;
         return;
     }

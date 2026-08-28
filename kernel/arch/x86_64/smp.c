@@ -112,16 +112,6 @@ static void limine_ap_entry(struct limine_smp_info *info) {
         if (!__atomic_load_n(&c->ap_rq_head, __ATOMIC_RELAXED))
             sched_ap_steal(c);            /* idle + empty: try to steal */
         __atomic_fetch_add(&g_ap_work, 1, __ATOMIC_RELAXED);
-        /* Heartbeat: log once per ~8 s (0x7FF ticks), NOT every ~0.5 s
-         * (0x7F).  kprintf busy-waits per character on the UART, and 3 APs
-         * spamming ~90 bytes every half-second is real serial I/O under
-         * TCG - measurable slowdown of everything else, including the
-         * cursor. */
-        if ((c->ap_ticks & 0x7FF) == 0x7FF)
-            kprintf("smp: AP %u alive, ticks=%lu, rq=%u, work=%lu\n",
-                    cpu, (unsigned long)c->ap_ticks,
-                    (unsigned)__atomic_load_n(&c->ap_rq_count, __ATOMIC_RELAXED),
-                    (unsigned long)__atomic_load_n(&g_ap_work, __ATOMIC_RELAXED));
         /* idle: a wake IPI (vec 62) or our own timer interrupts the hlt;
          * if a user task was switched to, its excursion iretq's back to
          * this point (ap_idle_rsp was saved on the way in) */

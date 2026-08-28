@@ -711,12 +711,30 @@ static void net_pump(void) {
     }
 }
 
+/* QEMU user-net (slirp) defaults.  When no DHCP server answers, fall back to
+ * the well-known slirp address so outbound networking still works in a VM:
+ *   10.0.2.15/24  gw 10.0.2.2  dns 10.0.2.3
+ * (10.0.2.2 is the host, so a server on the host is reachable from the
+ * guest, and 10.0.2.3 is slirp's DNS proxy.)  On real hardware these
+ * addresses simply never forward anywhere - harmless. */
+void net_slirp_fallback(void) {
+    if (g_ip) return;                 /* already have a real lease */
+    g_ip   = (10u << 24) | (0u << 16) | (2u << 8) | 15u;
+    g_mask = 0xFFFFFF00u;
+    g_gw   = (10u << 24) | (0u << 16) | (2u << 8) | 2u;
+    g_dns  = (10u << 24) | (0u << 16) | (2u << 8) | 3u;
+    route_add(g_ip & g_mask, g_mask, 0, RT_LINK);
+    route_add(0, 0, g_gw, RT_DEFAULT);
+    kprintf("net: no DHCP server - using slirp defaults "
+            "10.0.2.15/24 gw 10.0.2.2 dns 10.0.2.3\n");
+}
+
 /* ---- public entry: drain NIC + drive DHCP ---- */
 void net_service(void) {
     net_pump();
 
-    /* drive DHCP until we have an address */
-    if (g_dhcp_state != DHCP_DONE) {
+    /* drive DHCP until we have an address (or give up quietly) */
+    if (g_dhcp_state != DHCP_DONE && nic_present()) {
         if (g_dhcp_state == 0) {
             /* entropy for the xid */
             u64 tsc; __asm__ volatile("rdtsc" : "=A"(tsc) :: "memory");
@@ -725,9 +743,19 @@ void net_service(void) {
             dhcp_send(DHCP_DISCOVER, 0, 0);
             kprintf("net: DHCP DISCOVER (xid=0x%x)\n", g_xid);
         } else if (pit_ticks() - g_dhcp_last > MS_TO_TICKS(200)) {
-            if (g_dhcp_state == DHCP_DISCOVER) dhcp_send(DHCP_DISCOVER, 0, 0);
-            else if (g_dhcp_state == DHCP_REQUEST)
+            static int retries;
+            /* A silent network (no DHCP server) must not make us re-send
+             * DISCOVER forever: ~8 tries over ~1.6 s, then stop.  Without
+             * this the BSP keeps transmitting every 200 ms for the whole
+             * session - constant churn under emulation. */
+            if (++retries > 8) {
+                g_dhcp_state = DHCP_DONE;
+                net_slirp_fallback();   /* QEMU defaults so net still works */
+            } else if (g_dhcp_state == DHCP_DISCOVER) {
+                dhcp_send(DHCP_DISCOVER, 0, 0);
+            } else if (g_dhcp_state == DHCP_REQUEST) {
                 dhcp_send(DHCP_REQUEST, g_offer_ip, g_server_id);
+            }
         }
     }
 

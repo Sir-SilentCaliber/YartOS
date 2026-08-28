@@ -9,11 +9,11 @@
  * real curl from the host.
  *
  * Design notes:
- *  - one transmit buffer per connection (2048 B); ACKs slide snd_una;
+ *  - one transmit buffer per connection (TCP_SNDBUF); ACKs slide snd_una;
  *    the whole unacked buffer is retransmitted on a single timer.
- *  - one receive buffer per connection (4096 B); the advertised window
- *    is fixed to the buffer size; out-of-order segments are dropped and
- *    the peer retransmits - correct, if not fancy.
+ *  - one receive buffer per connection (TCP_RXBUF); the advertised window
+ *    is the FREE space, and a window update is sent when userland drains;
+ *    out-of-order segments are dropped and the peer retransmits.
  *  - driven by net_service()/tcp_poll() (polling, like the rest of the
  *    stack) plus synchronous syscall wrappers.
  */
@@ -24,8 +24,12 @@
 #include <yart/spinlock.h>
 
 #define TCP_MAX_CONN    8
-#define TCP_SNDBUF      2048
-#define TCP_RXBUF       4096
+#define TCP_SNDBUF      8192
+/* 65535 is the largest window a 16-bit TCP header field can advertise, and
+ * it is what makes large downloads (e.g. `apk add` pulling a package) work:
+ * with a 4 KiB buffer the window closed after a few segments, the peer
+ * stopped, and the transfer stalled at ~11 KiB. */
+#define TCP_RXBUF       65535
 #define TCP_MAX_DATA    1400          /* fits one Ethernet frame          */
 
 #define TCP_RETRANS_TICKS  MS_TO_TICKS(250)   /* retransmit every 250 ms  */
@@ -101,8 +105,14 @@ static int tcp_send_seg(tcp_conn_t *c, u8 flags, u32 seq, u32 ack,
     u32 a = hton32(ack); memcpy(seg + 8, &a, 4);
     seg[12] = (u8)(hlen / 4) << 4;                 /* data offset */
     seg[13] = flags;
-    seg[14] = (u8)(TCP_RXBUF >> 8);                /* window 4096    */
-    seg[15] = (u8)(TCP_RXBUF & 0xFF);
+    /* Advertise the ACTUAL free space, not the whole buffer: a full rx
+     * buffer must report window 0 or the peer keeps sending and its
+     * segments get dropped (the old constant window stalled transfers). */
+    {
+        u16 win = (u16)(TCP_RXBUF - c->rx_len);
+        seg[14] = (u8)(win >> 8);
+        seg[15] = (u8)(win & 0xFF);
+    }
     seg[16] = 0; seg[17] = 0;                      /* checksum below */
     seg[18] = 0; seg[19] = 0;                      /* urgent ptr     */
     if (flags & TF_SYN) {
@@ -468,6 +478,13 @@ int net_tcp_recv(int id, u8 *buf, int cap) {
         memcpy(buf, c->rx, (size_t)n);
         memmove(c->rx, c->rx + n, (size_t)(c->rx_len - n));
         c->rx_len -= (u16)n;
+        /* Window update: we just freed rx space, so tell the peer it may
+         * send more.  Without this, once the buffer fills (window 0) the
+         * peer waits forever and the download stalls.  Pure ACK with the
+         * reopened window (safe here: same pattern as the RX path). */
+        if (c->st == TCP_ESTABLISHED && c->used)
+            tcp_send_seg(c, TF_ACK, c->snd_una + c->snd_len, c->rcv_nxt,
+                         NULL, 0);
     }
     /* closing conn whose buffer is now empty: the close is complete */
     if (c->rx_len == 0 && c->st == TCP_CLOSING)

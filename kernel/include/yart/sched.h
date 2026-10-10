@@ -82,6 +82,7 @@ typedef struct task {
     u8             supp_gid_count;
     u16            umask;          /* file-creation mask (022 default)         */
     bool           elev_allowed;   /* may elevate to root (admin user)    */
+    bool           syscall_from_user; /* caller context, survives task switches */
     char           account[32];    /* account name for password checks    */
     u64            kstack_top;     /* RSP0 for ring3->ring0 entries      */
     u64            saved_rsp;      /* cpu_regs_t frame on the kstack     */

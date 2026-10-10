@@ -147,6 +147,28 @@ static u32 rd_u32(const unsigned char *p) {
     return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
 }
 
+static int valid_pkg_token(const char *s) {
+    if (!s || !((s[0] >= 'a' && s[0] <= 'z') ||
+                (s[0] >= 'A' && s[0] <= 'Z') ||
+                (s[0] >= '0' && s[0] <= '9'))) return 0;
+    for (int i = 0; i < 32 && s[i]; i++) {
+        char c = s[i];
+        if (i >= 31) return 0;
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-' ||
+              c == '+' || c == '.')) return 0;
+    }
+    return 1;
+}
+
+/* Current .ypkg packages are single native app binaries. Keep the install
+ * surface narrow: an archive may only provide /bin/<its-own-package-name>. */
+static int valid_pkg_file_path(const char *path, const char *name) {
+    return path && name && path[0] == '/' && path[1] == 'b' &&
+           path[2] == 'i' && path[3] == 'n' && path[4] == '/' &&
+           strcmp(path + 5, name) == 0;
+}
+
 static int read_header(const char *path, ypkg_header_t *h) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
@@ -163,15 +185,19 @@ static int read_header(const char *path, ypkg_header_t *h) {
     fs_copystr(h->desc, (char *)buf + 76, 128);
     fs_copystr(h->icon, (char *)buf + 204, 32);
     h->desktop = rd_u32(buf + 236);
+    if (h->version != 1 || h->nfiles == 0 || h->nfiles > 64 ||
+        h->desktop > 1 || !valid_pkg_token(h->name) ||
+        !valid_pkg_token(h->appver) ||
+        (h->desktop && !valid_pkg_token(h->icon))) return -1;
     return 0;
 }
 
-/* Installing touches /bin and /usr/share — root-owned paths — so apk must
- * elevate first, exactly like `sudo apk` on Alpine.  YartOS's doas(password)
- * elevates the admin account (the demo account "demo", password "yart"). */
-static int apk_elevate(apk_emit_t emit) {
-    if (doas("yart") == 0) return 0;
-    emit("apk: requires root (doas failed)");
+/* Installing touches system paths. Never embed the demo account password in
+ * the package manager: until an authenticated privileged installer exists,
+ * only an already-root process may mutate the system package state. */
+static int apk_require_root(apk_emit_t emit) {
+    if (geteuid() == 0) return 0;
+    emit("apk: root required; automatic password elevation is disabled");
     return -1;
 }
 
@@ -275,7 +301,8 @@ static int find_pkg(const char *name, char *out, int cap) {
 
 static int add_pkg(const char *name, apk_emit_t emit) {
     if (!name || !name[0]) { emit("apk: specify a package name (e.g. apk add calc)"); return 1; }
-    if (apk_elevate(emit) != 0) return -1;
+    if (!valid_pkg_token(name)) { emit("apk: invalid package name"); return -1; }
+    if (apk_require_root(emit) != 0) return -1;
     if (is_installed(name)) { emit("apk: already installed"); return 0; }
     char path[160];
     char *raw = (char *)mmap(16 * 1024 * 1024);
@@ -325,6 +352,11 @@ static int add_pkg(const char *name, apk_emit_t emit) {
 
     ypkg_header_t h;
     if (read_header(path, &h) != 0) { munmap((long)raw); emit("apk: bad package"); return -1; }
+    if (strcmp(h.name, name) != 0 || h.nfiles != 1) {
+        munmap((long)raw);
+        emit("apk: package identity or file count is invalid");
+        return -1;
+    }
 
     char line[220];
     fs_copystr(line, "installing ", sizeof line);
@@ -347,27 +379,45 @@ static int add_pkg(const char *name, apk_emit_t emit) {
     db[0] = 0;
 
     u32 off = sizeof(ypkg_header_t);
+    char installed_path[192] = {0};
+    char desktop_path[180] = {0};
+    int desktop_written = 0;
     int ok = 1;
     const char *why = "";
     for (u32 f = 0; f < h.nfiles && ok; f++) {
-        if (off + 4 > (u32)n) { ok = 0; why = "truncated (plen)"; break; }
+        u32 total = (u32)n;
+        if (off > total || total - off < 4) { ok = 0; why = "truncated (plen)"; break; }
         u32 plen = rd_u32((unsigned char *)raw + off); off += 4;
-        if (off + plen + 8 > (u32)n) { ok = 0; why = "truncated (path)"; break; }
+        if (plen == 0 || plen >= sizeof(installed_path) || off > total ||
+            total - off < 8 || plen > total - off - 8) {
+            ok = 0; why = "truncated or oversized path"; break;
+        }
         char fpath[192];
-        fs_copystr(fpath, raw + off, (plen + 1 < 192 ? plen + 1 : 192));
+        for (u32 i = 0; i < plen; i++) {
+            if (!raw[off + i]) { ok = 0; why = "invalid path encoding"; break; }
+            fpath[i] = raw[off + i];
+        }
+        if (!ok) break;
+        fpath[plen] = 0;
+        if (!valid_pkg_file_path(fpath, h.name)) {
+            ok = 0; why = "package path is not allowed"; break;
+        }
         off += plen;
         u32 mode = rd_u32((unsigned char *)raw + off); off += 4;
         u32 size = rd_u32((unsigned char *)raw + off); off += 4;
-        if (off + size > (u32)n) { ok = 0; why = "truncated (data)"; break; }
+        if (mode > 1) { ok = 0; why = "invalid file mode"; break; }
+        if (off > total || size > total - off) { ok = 0; why = "truncated (data)"; break; }
 
-        char parent[192];
-        fs_copystr(parent, fpath, sizeof parent);
-        int pl = (int)strlen(parent);
-        while (pl > 0 && parent[pl - 1] != '/') pl--;
-        if (pl > 0) { parent[pl - 1] = 0; if (parent[0]) fs_mkdir_p(parent); }
-
+        int existing = open(fpath, O_RDONLY);
+        if (existing >= 0) {
+            close(existing);
+            ok = 0; why = "destination already exists"; break;
+        }
+        fs_copystr(installed_path, fpath, sizeof installed_path);
         if (fs_write_file(fpath, raw + off, (long)size) != 0) { ok = 0; why = "write failed"; break; }
-        if (mode == 1) chmod(fpath, 0755);
+        if (mode == 1 && chmod(fpath, 0755) != 0) {
+            ok = 0; why = "permission update failed"; break;
+        }
         { char wl[200]; fs_copystr(wl, "  wrote ", sizeof wl);
           int wk = (int)strlen(wl);
           for (const char *p = fpath; *p && wk < 196; p++) wl[wk++] = *p;
@@ -384,7 +434,6 @@ static int add_pkg(const char *name, apk_emit_t emit) {
 
     if (ok && h.desktop) {
         fs_mkdir_p(APK_APPS_DIR);
-        char desktop_path[180];
         fs_copystr(desktop_path, APK_APPS_DIR, sizeof desktop_path);
         int dk = (int)strlen(desktop_path); desktop_path[dk++] = '/';
         for (const char *p = h.name; *p && dk < 170; p++) desktop_path[dk++] = *p;
@@ -392,6 +441,12 @@ static int add_pkg(const char *name, apk_emit_t emit) {
         while (*suf && dk < 179) desktop_path[dk++] = *suf++;
         desktop_path[dk] = 0;
 
+        int existing = open(desktop_path, O_RDONLY);
+        if (existing >= 0) {
+            close(existing);
+            ok = 0;
+            why = "desktop entry already exists";
+        }
         char df[600];
         int dn = 0;
         const char *pre = "[Desktop Entry]\nName=";
@@ -407,14 +462,23 @@ static int add_pkg(const char *name, apk_emit_t emit) {
         const char *pre4 = "\nType=Application\n";
         while (*pre4) df[dn++] = *pre4++;
         df[dn] = 0;
-        if (fs_write_file(desktop_path, df, dn) != 0) ok = 0;
+        if (ok && fs_write_file(desktop_path, df, dn) != 0) {
+            ok = 0;
+            why = "desktop entry write failed";
+        } else if (ok) {
+            desktop_written = 1;
+        }
     }
 
     if (ok) {
         db[dbn] = 0;
-        fs_write_file(dbpath, db, dbn);
-        emit("syncing to disk...");
-        fsync(0);
+        if (fs_write_file(dbpath, db, dbn) != 0) {
+            ok = 0;
+            why = "package database write failed";
+        }
+    }
+    if (ok) {
+        emit("package files and install record flushed");
         emit("done - now in the launcher (press Super)");
         notify("apk: installed package");
         return 0;
@@ -425,18 +489,21 @@ static int add_pkg(const char *name, apk_emit_t emit) {
       for (const char *p = why; *p && wk < 158; p++) wl[wk++] = *p;
       wl[wk] = 0;
       emit(wl); }
+    if (installed_path[0]) unlink(installed_path);
+    if (desktop_written) unlink(desktop_path);
     return -1;
 }
 
 static int del_pkg(const char *name, apk_emit_t emit) {
-    if (apk_elevate(emit) != 0) return -1;
+    if (!name || !valid_pkg_token(name)) { emit("apk: invalid package name"); return -1; }
+    if (apk_require_root(emit) != 0) return -1;
     char dbpath[160];
     fs_copystr(dbpath, APK_DB_DIR, sizeof dbpath);
     int k = (int)strlen(dbpath); dbpath[k++] = '/';
     for (const char *p = name; *p && k < 150; p++) dbpath[k++] = *p;
     dbpath[k] = 0;
 
-    char db[4096];
+    char db[4097];
     long n = fs_read_file(dbpath, db, sizeof db);
     if (n <= 0) {
         char line[200];
@@ -449,25 +516,51 @@ static int del_pkg(const char *name, apk_emit_t emit) {
         emit(line);
         return -1;
     }
+    db[n] = 0;
 
     int lines[256];
     int nl = 0;
     int start = 0;
     for (int i = 0; i <= n; i++) {
         if (db[i] == '\n' || db[i] == 0) {
-            if (i > start) lines[nl++] = start;
+            if (i > start) {
+                if (nl >= (int)(sizeof lines / sizeof lines[0])) {
+                    emit("apk: corrupt install database (too many entries)");
+                    return -1;
+                }
+                lines[nl++] = start;
+            }
             start = i + 1;
             if (db[i] == 0) break;
+        }
+    }
+    for (int i = 0; i < nl; i++) {
+        int s = lines[i], e = s;
+        while (db[e] && db[e] != '\n') e++;
+        char fpath[192];
+        int len = e - s;
+        if (len <= 0 || len >= (int)sizeof fpath) {
+            emit("apk: corrupt install database (invalid path length)");
+            return -1;
+        }
+        for (int j = 0; j < len; j++) fpath[j] = db[s + j];
+        fpath[len] = 0;
+        if (!valid_pkg_file_path(fpath, name)) {
+            emit("apk: corrupt install database (unsafe path refused)");
+            return -1;
         }
     }
     for (int i = nl - 1; i >= 0; i--) {
         int s = lines[i], e = s;
         while (db[e] && db[e] != '\n') e++;
         char fpath[192];
-        int j = 0;
-        for (int q = s; q < e && j < 190; q++) fpath[j++] = db[q];
-        fpath[j] = 0;
-        unlink(fpath);
+        int len = e - s;
+        for (int j = 0; j < len; j++) fpath[j] = db[s + j];
+        fpath[len] = 0;
+        if (unlink(fpath) != 0) {
+            emit("apk: failed to remove an installed file");
+            return -1;
+        }
     }
 
     char desktop_path[180];
@@ -477,10 +570,19 @@ static int del_pkg(const char *name, apk_emit_t emit) {
     const char *suf = ".desktop";
     while (*suf && dk < 179) desktop_path[dk++] = *suf++;
     desktop_path[dk] = 0;
-    unlink(desktop_path);
+    int desktop_fd = open(desktop_path, O_RDONLY);
+    if (desktop_fd >= 0) {
+        close(desktop_fd);
+        if (unlink(desktop_path) != 0) {
+            emit("apk: failed to remove desktop entry");
+            return -1;
+        }
+    }
 
-    unlink(dbpath);
-    fsync(0);
+    if (unlink(dbpath) != 0) {
+        emit("apk: failed to remove package record");
+        return -1;
+    }
     emit("removed");
     notify("apk: package removed");
     return 0;
@@ -530,14 +632,15 @@ static int update_repo(apk_emit_t emit) {
         emit("      repo: http://" APK_REMOTE_HOST "/repo/");
         return -1;
     }
-    /* cache the index and echo it */
+    /* Cache when the caller has permission; still show the fetched index if
+     * this unprivileged session cannot write the system package database. */
     fs_mkdir_p(APK_DB_DIR);
     char db[96];
     fs_copystr(db, APK_DB_DIR, sizeof db);
     int dk = (int)strlen(db);
     const char *suf2 = "/INDEX"; while (*suf2 && dk < 95) db[dk++] = *suf2++;
     db[dk] = 0;
-    fs_write_file(db, buf, n);
+    int cached = fs_write_file(db, buf, n) == 0;
     int start = 0;
     for (long i = 0; i <= n; i++) {
         if (buf[i] == '\n' || buf[i] == 0) {
@@ -547,8 +650,12 @@ static int update_repo(apk_emit_t emit) {
         }
     }
     munmap((long)buf);
-    emit("updated");
-    return 0;
+    if (cached) {
+        emit("updated and cached");
+        return 0;
+    }
+    emit("index fetched but not cached (permission or storage error)");
+    return -1;
 }
 
 int apk_main(int argc, char **argv, apk_emit_t emit) {

@@ -3,7 +3,6 @@ import socket, time, subprocess, os, json
 from PIL import Image
 
 ROOT = "/home/user/YartOS"
-subprocess.run(["pkill", "-9", "qemu-system"], capture_output=True)
 time.sleep(0.3)
 try:
     os.unlink(f"{ROOT}/runlogs/serial.log")
@@ -169,7 +168,7 @@ time.sleep(2.0)
 
 cx, cy = 640, 400
 
-# 1. Test apk add calc
+# 1. List native packages. Calculator is already bundled in the boot image.
 cx, cy = move_cursor_to(640, 300, cx, cy)
 time.sleep(0.1)
 mouse_button("left", True)
@@ -177,8 +176,8 @@ time.sleep(0.05)
 mouse_button("left", False)
 time.sleep(0.2)
 
-type_str("apk add calc\n")
-time.sleep(2.0)
+type_str("apk list\n")
+time.sleep(1.5)
 
 # 2. Test dragging the window smoothly
 cx, cy = move_cursor_to(640, 186, cx, cy)

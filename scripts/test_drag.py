@@ -1,160 +1,205 @@
 #!/usr/bin/env python3
-import socket, time, subprocess, os, json
-from PIL import Image
+"""QEMU smoke test for dragging a window by its title bar.
+
+Uses an isolated temporary disk/socket/log and only terminates the QEMU
+process it starts. It assumes the 1280x800 test desktop and centered pointer.
+"""
+import json
+import os
+import socket
+import subprocess
+import tempfile
+import time
+
+from PIL import Image, ImageChops
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-subprocess.run(["pkill", "-9", "qemu-system"], capture_output=True)
-time.sleep(0.3)
 
-for p in ["/tmp/q.sock", "/tmp/qm.sock"]:
-    try: os.unlink(p)
-    except FileNotFoundError: pass
 
-disk_img = f"{ROOT}/yart-disk.img"
-cmd = [
-    "qemu-system-x86_64", "-cpu", "max", "-smp", "4", "-m", "1024", "-machine", "q35",
-    "-drive", "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd",
-    "-cdrom", f"{ROOT}/yart.iso",
-    "-drive", f"file={disk_img},format=raw,if=virtio",
-    "-netdev", "user,id=net0",
-    "-device", "e1000,netdev=net0",
-    "-display", "none", "-vga", "std", "-rtc", "base=localtime",
-    "-serial", f"file:{ROOT}/runlogs/serial.log",
-    "-qmp", "unix:/tmp/q.sock,server=on,wait=off",
-    "-monitor", "unix:/tmp/qm.sock,server=on,wait=off",
-    "-no-reboot", "-S"
-]
+def main():
+    iso = os.path.join(ROOT, "yart.iso")
+    if not os.path.isfile(iso):
+        raise SystemExit("Build first: make iso")
 
-proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-for _ in range(100):
-    try:
-        s = socket.socket(socket.AF_UNIX)
-        s.connect("/tmp/q.sock")
-        break
-    except OSError:
-        time.sleep(0.1)
-
-s.settimeout(5)
-sfile = s.makefile("r", encoding="utf-8")
-
-for line in sfile:
-    if "QMP" in line:
-        break
-
-def qmp_cmd(execute, args=None):
-    req = {"execute": execute}
-    if args:
-        req["arguments"] = args
-    s.sendall(json.dumps(req).encode() + b"\n")
-    for line in sfile:
-        line = line.strip()
-        if not line: continue
+    with tempfile.TemporaryDirectory(prefix="yart-drag-") as tmp:
+        qmp_path = os.path.join(tmp, "qmp.sock")
+        serial_path = os.path.join(tmp, "serial.log")
+        disk_path = os.path.join(tmp, "disk.img")
+        subprocess.run(["truncate", "-s", "64M", disk_path], check=True)
+        command = [
+            "qemu-system-x86_64", "-cpu", "qemu64", "-smp", "4", "-m", "1024",
+            "-machine", "q35", "-cdrom", iso,
+            "-drive", f"file={disk_path},format=raw,if=virtio",
+            "-netdev", "user,id=net0", "-device", "e1000,netdev=net0",
+            "-display", "none", "-vga", "std", "-rtc", "base=localtime",
+            "-serial", f"file:{serial_path}",
+            "-qmp", f"unix:{qmp_path},server=on,wait=off",
+            "-no-reboot", "-S",
+        ]
+        proc = subprocess.Popen(
+            command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
+        )
+        qmp = None
         try:
-            data = json.loads(line)
-            if "return" in data or "error" in data:
-                return data
-        except Exception:
-            pass
+            print("[*] Waiting for QEMU...")
+            for _ in range(100):
+                if proc.poll() is not None:
+                    raise RuntimeError(f"QEMU exited early: {proc.stderr.read()}")
+                try:
+                    qmp = socket.socket(socket.AF_UNIX)
+                    qmp.settimeout(5)
+                    qmp.connect(qmp_path)
+                    break
+                except OSError:
+                    if qmp:
+                        qmp.close()
+                    qmp = None
+                    time.sleep(0.1)
+            if qmp is None:
+                raise TimeoutError("QEMU did not open its QMP socket")
 
-qmp_cmd("qmp_capabilities")
-qmp_cmd("cont")
+            reader = qmp.makefile("r", encoding="utf-8")
+            greeting = json.loads(reader.readline())
+            if "QMP" not in greeting:
+                raise RuntimeError("QEMU did not send a QMP greeting")
 
-def key_ev(name, down):
-    qmp_cmd("input-send-event", {
-        "events": [{"type": "key", "data": {"key": {"type": "qcode", "data": name}, "down": down}}]
-    })
-    time.sleep(0.04)
+            def qmp_cmd(execute, arguments=None):
+                request = {"execute": execute}
+                if arguments is not None:
+                    request["arguments"] = arguments
+                qmp.sendall(json.dumps(request).encode() + b"\n")
+                for line in reader:
+                    data = json.loads(line)
+                    if "return" in data:
+                        return data["return"]
+                    if "error" in data:
+                        raise RuntimeError(f"QMP {execute} failed: {data['error']}")
+                raise RuntimeError(f"QMP disconnected during {execute}")
 
-def tap(name):
-    key_ev(name, True)
-    time.sleep(0.05)
-    key_ev(name, False)
-    time.sleep(0.08)
+            qmp_cmd("qmp_capabilities")
+            qmp_cmd("cont")
 
-def type_str(st):
-    for ch in st:
-        if ch == ' ':
-            tap("spc")
-        elif ch == '\n':
+            def key_event(name, down):
+                qmp_cmd("input-send-event", {
+                    "events": [{
+                        "type": "key",
+                        "data": {"key": {"type": "qcode", "data": name}, "down": down},
+                    }]
+                })
+                time.sleep(0.05)
+
+            def tap(name):
+                key_event(name, True)
+                key_event(name, False)
+
+            def type_text(text):
+                for char in text:
+                    tap("spc" if char == " " else "ret" if char == "\n" else char)
+
+            def mouse_move(dx, dy):
+                qmp_cmd("input-send-event", {
+                    "events": [
+                        {"type": "rel", "data": {"axis": "x", "value": dx}},
+                        {"type": "rel", "data": {"axis": "y", "value": dy}},
+                    ]
+                })
+                time.sleep(0.08)
+
+            def mouse_button(button, down):
+                qmp_cmd("input-send-event", {
+                    "events": [{"type": "btn", "data": {"button": button, "down": down}}]
+                })
+                time.sleep(0.08)
+
+            print("[*] Waiting for desktop...")
+            booted = False
+            for _ in range(120):
+                if proc.poll() is not None:
+                    raise RuntimeError(f"QEMU exited during boot: {proc.stderr.read()}")
+                try:
+                    with open(serial_path, encoding="utf-8", errors="replace") as log:
+                        if "wallpaper loaded successfully" in log.read():
+                            booted = True
+                            break
+                except FileNotFoundError:
+                    pass
+                time.sleep(0.5)
+            if not booted:
+                raise TimeoutError("YartOS did not reach the desktop; inspect the QEMU serial log")
+            time.sleep(2)
+
+            # Unlock the factory demo session and open Nyra.
             tap("ret")
-        else:
-            tap(ch)
+            time.sleep(0.3)
+            type_text("yart\n")
+            time.sleep(1.5)
+            key_event("meta_l", True)
+            tap("t")
+            key_event("meta_l", False)
+            time.sleep(2)
 
-def mouse_move(dx, dy):
-    qmp_cmd("input-send-event", {
-        "events": [
-            {"type": "rel", "data": {"axis": "x", "value": dx}},
-            {"type": "rel", "data": {"axis": "y", "value": dy}}
-        ]
-    })
-    time.sleep(0.04)
+            # The missing package must fail closed, not elevate the shell or
+            # start a connection to the development-only repository.
+            with open(serial_path, encoding="utf-8", errors="replace") as log:
+                serial_before = log.read()
+            type_text("apk add discord\n")
+            time.sleep(1)
+            if proc.poll() is not None:
+                raise AssertionError("QEMU exited after apk add discord")
+            with open(serial_path, encoding="utf-8", errors="replace") as log:
+                serial_after = log.read()
+            serial_delta = serial_after[len(serial_before):]
+            if "elevated to root via doas" in serial_delta:
+                raise AssertionError("apk add unexpectedly elevated Nyra to root")
+            if "tcp: connecting to 10.0.2.2:8000" in serial_delta:
+                raise AssertionError("apk add contacted the unavailable dev repository")
+            print("[PASS] apk add discord stayed unprivileged and did not contact the dev repository")
+            time.sleep(0.5)
 
-def mouse_button(button, down):
-    qmp_cmd("input-send-event", {
-        "events": [
-            {"type": "btn", "data": {"button": button, "down": down}}
-        ]
-    })
-    time.sleep(0.04)
+            def screenshot(filename):
+                path = os.path.join(tmp, filename)
+                qmp_cmd("screendump", {"filename": path})
+                with Image.open(path) as image:
+                    return image.convert("RGB").copy()
 
-print("[*] Waiting for boot...")
-for _ in range(60):
-    if os.path.exists(f"{ROOT}/runlogs/serial.log"):
-        with open(f"{ROOT}/runlogs/serial.log", "r") as f:
-            if "wallpaper loaded successfully" in f.read():
-                break
-    time.sleep(0.5)
-time.sleep(3.0)
+            # Park the cursor outside the window so the before/after captures
+            # differ because of the drag, not because the cursor moved.
+            mouse_move(-410, -320)   # centered (640,400) -> neutral (230,80)
+            time.sleep(0.4)
+            before = screenshot("before.ppm")
 
-def shot(name):
-    ppm_path = f"{ROOT}/{name}.ppm"
-    png_path = f"{ROOT}/{name}.png"
-    res = qmp_cmd("screendump", {"filename": ppm_path})
-    time.sleep(0.3)
-    if os.path.exists(ppm_path):
-        img = Image.open(ppm_path)
-        img.save(png_path)
-        os.unlink(ppm_path)
-        print(f"[*] Saved screenshot: {png_path}")
+            # Console title bar is at approximately (430,180). Drag it +100px.
+            mouse_move(200, 100)
+            mouse_button("left", True)
+            for _ in range(10):
+                mouse_move(10, 10)
+            mouse_button("left", False)
+            time.sleep(0.8)
+            mouse_move(-300, -200)   # return cursor to the same neutral point
+            time.sleep(0.4)
+            after = screenshot("after.ppm")
 
-# Unlock
-tap("ret")
-time.sleep(0.4)
-type_str("yart\n")
-time.sleep(1.5)
+            if before.size != after.size:
+                raise AssertionError("screen size changed during drag test")
+            delta = ImageChops.difference(before.crop((280, 130, 700, 360)),
+                                          after.crop((280, 130, 700, 360))).convert("L")
+            changed_pixels = sum(pixel > 24 for pixel in delta.getdata())
+            if changed_pixels < 2000:
+                raise AssertionError(
+                    f"title-bar drag did not visibly move the window "
+                    f"({changed_pixels} changed pixels)"
+                )
+            print(f"[PASS] title-bar drag changed {changed_pixels} pixels in the test region")
+        finally:
+            if qmp:
+                qmp.close()
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=3)
 
-# Open terminal
-key_ev("meta_l", True)
-time.sleep(0.08)
-tap("t")
-time.sleep(0.08)
-key_ev("meta_l", False)
-time.sleep(2.0)
 
-# Move mouse to (250, 80) on "Console" title bar:
-for _ in range(10):
-    mouse_move(-30, -25)
-    time.sleep(0.02)
-time.sleep(0.3)
-shot("drag_1_hover")
-
-# Press left mouse button on title bar
-mouse_button("left", True)
-time.sleep(0.2)
-
-# Drag by (+300, +200): 10 steps of dx=+30, dy=+20
-for _ in range(10):
-    mouse_move(30, 20)
-    time.sleep(0.04)
-time.sleep(0.2)
-
-# Release left mouse button
-mouse_button("left", False)
-time.sleep(0.5)
-
-shot("drag_2_moved")
-
-s.close()
-proc.terminate()
-print("[*] Drag test finished!")
+if __name__ == "__main__":
+    main()

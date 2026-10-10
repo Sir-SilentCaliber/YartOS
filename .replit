@@ -1,0 +1,8 @@
+modules = ["python-3.12", "bash"]
+
+[nix]
+channel = "stable-25_05"
+packages = ["OVMF", "freetype", "lcms2", "libimagequant", "libjpeg", "librsvg", "libtiff", "libwebp", "libxcrypt", "nasm", "openjpeg", "qemu", "tcl", "tk", "xorriso", "zlib"]
+
+[agent]
+expertMode = true

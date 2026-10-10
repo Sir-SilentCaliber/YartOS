@@ -3,7 +3,6 @@ import socket, time, subprocess, os, json
 from PIL import Image
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-subprocess.run(["pkill", "-9", "qemu-system"], capture_output=True)
 time.sleep(0.3)
 try:
     os.unlink(f"{ROOT}/runlogs/serial.log")
@@ -198,9 +197,9 @@ time.sleep(0.05)
 mouse_button("left", False)
 time.sleep(0.2)
 
-# Test apk add discord in the terminal:
+# Verify the missing package is rejected without implicit root elevation.
 type_str("apk add discord\n")
-time.sleep(6.0)
+time.sleep(1.0)
 
 shot("stage_3_apk_output")
 

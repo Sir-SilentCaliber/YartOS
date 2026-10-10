@@ -190,7 +190,8 @@ static bool doas_check(task_t *t, const char *password) {
  * elevating, e.g. the lock screen). */
 
 static char g_klog_line[256];
-static bool g_sys_from_user;   /* set per syscall from the frame CS */
+static task_t *cur(void) { return sched_current(); }
+#define g_sys_from_user (cur() && cur()->syscall_from_user)
 
 /* ---------- user pointer validation ---------- */
 #define USER_BUF_MAX   (1u << 20)
@@ -204,8 +205,6 @@ static bool uptr(u64 p, u64 len) {
 
 /* Permission helper: kernel-mode callers (trusted) always pass; user callers
  * are checked against the current task's effective uid. */
-static task_t *cur(void) { return sched_current(); }
-
 static bool perm_ok(vnode_t *v, int want) {
     if (!g_sys_from_user) return true;
     task_t *t = cur();
@@ -1491,6 +1490,12 @@ static i64 sys_doas(const char *password) {
     kprintf("syscall: task %d '%s' elevated to root via doas\n",
             t->pid, t->name);
     return 0;
+}
+
+static i64 sys_geteuid(void) {
+    task_t *t = cur();
+    if (!t || !g_sys_from_user) return -1;
+    return (i64)t->euid;
 }
 
 /* SYS_AUTH_VERIFY: confirm the session password WITHOUT elevating. */
@@ -3667,14 +3672,19 @@ static int linux_dispatch(cpu_regs_t *r) {
 }
 
 static void syscall_handler(cpu_regs_t *r) {
+    task_t *syscall_task = cur();
+    if (syscall_task)
+        syscall_task->syscall_from_user = ((r->cs & 3) == 3);
     check_user_segments(r);
-    g_sys_from_user = ((r->cs & 3) == 3);
     if (cur() == g_wm_task) {
         extern int g_desktop_wd;
         watchdog_kick(g_desktop_wd);
     }
     if (g_sys_from_user && cur()->linux_abi) {
-        if (linux_dispatch(r) == 1) return;   /* handled (or -ENOSYS) */
+        if (linux_dispatch(r) == 1) {
+            if (syscall_task) syscall_task->syscall_from_user = false;
+            return;   /* handled (or -ENOSYS) */
+        }
         /* else: translated -> fall through to the YartOS switch */
     }
     u64 a0 = r->rdi, a1 = r->rsi, a2 = r->rdx;
@@ -3787,12 +3797,13 @@ static void syscall_handler(cpu_regs_t *r) {
     case SYS_DUP2:         r->rax = (u64)sys_dup2((int)a0, (int)a1); break;
     case SYS_SYMLINK:      r->rax = (u64)sys_symlink((const char *)a0, (const char *)a1); break;
     case SYS_READLINK:     r->rax = (u64)sys_readlink((const char *)a0, (char *)a1, a2); break;
+    case SYS_GETEUID:      r->rax = (u64)sys_geteuid(); break;
     default:
         kprintf("syscall: bad #%lu\n", r->rax);
         r->rax = (u64)-1;
     }
 
-
+    if (syscall_task) syscall_task->syscall_from_user = false;
 }
 
 /* ------------------------------------------------------------------ */

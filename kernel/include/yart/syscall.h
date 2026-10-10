@@ -101,6 +101,7 @@ enum {
     SYS_DUP2         = 91, /* duplicate an fd onto a specific number (POSIX dup2)      */
     SYS_SYMLINK      = 92, /* create a symlink: symlink(target, linkpath)              */
     SYS_READLINK     = 93, /* read a symlink target: readlink(path, buf, size)         */
+    SYS_GETEUID      = 94, /* return the calling task's effective uid                   */
     SYS_MAX
 };
 

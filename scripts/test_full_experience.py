@@ -5,7 +5,6 @@ from PIL import Image
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.makedirs(f"{ROOT}/runlogs", exist_ok=True)
 
-subprocess.run(["pkill", "-9", "qemu-system"], capture_output=True)
 time.sleep(0.3)
 
 for p in ["/tmp/q.sock", "/tmp/qm.sock"]:
@@ -131,10 +130,10 @@ type_str("apk list\n")
 time.sleep(1.5)
 shot("step4_apk_list")
 
-# 5. In Nyra terminal, run apk add discord (remote package network query test)
-print("[*] Running apk add discord...")
+# 5. Verify apk rejects unprivileged installs instead of silently elevating.
+print("[*] Checking apk add discord privilege gate...")
 type_str("apk add discord\n")
-time.sleep(3.5)
+time.sleep(1.0)
 shot("step5_apk_discord")
 
 # 6. Run /bin/calc

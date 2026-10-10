@@ -22,23 +22,32 @@ int fs_mkdir_p(const char *path) {
 }
 
 long fs_read_file(const char *path, char *buf, long cap) {
+    if (!path || !buf || cap <= 0) return -1;
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
     long total = 0;
     for (;;) {
-        if (total >= cap - 1) break;
+        if (total >= cap - 1) {
+            char extra;
+            long n = read(fd, &extra, 1);
+            if (n > 0) { close(fd); return -1; }
+            if (n < 0) { close(fd); return -1; }
+            break;
+        }
         long want = cap - 1 - total;
         if (want > FS_CHUNK) want = FS_CHUNK;   /* kernel caps a read/write at 1 MiB */
         long n = read(fd, buf + total, (size_t)want);
-        if (n <= 0) break;
+        if (n < 0) { close(fd); return -1; }
+        if (n == 0) break;
         total += n;
     }
-    close(fd);
+    if (close(fd) != 0) return -1;
     buf[total] = 0;
     return total;
 }
 
 int fs_write_file(const char *path, const void *buf, long len) {
+    if (!path || len < 0 || (!buf && len > 0)) return -1;
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC);
     if (fd < 0) return -1;
     long off = 0;
@@ -49,12 +58,13 @@ int fs_write_file(const char *path, const void *buf, long len) {
         if (w <= 0) break;
         off += w;
     }
-    fsync(fd);
-    close(fd);
-    return (off == len) ? 0 : -1;
+    long synced = fsync(fd);
+    long closed = close(fd);
+    return (off == len && synced == 0 && closed == 0) ? 0 : -1;
 }
 
 int fs_append_file(const char *path, const void *buf, long len) {
+    if (!path || len < 0 || (!buf && len > 0)) return -1;
     int fd = open(path, O_WRONLY | O_CREAT | O_APPEND);
     if (fd < 0) return -1;
     long off = 0;
@@ -65,9 +75,9 @@ int fs_append_file(const char *path, const void *buf, long len) {
         if (w <= 0) break;
         off += w;
     }
-    fsync(fd);
-    close(fd);
-    return (off == len) ? 0 : -1;
+    long synced = fsync(fd);
+    long closed = close(fd);
+    return (off == len && synced == 0 && closed == 0) ? 0 : -1;
 }
 
 void fs_itoa(long v, char *out) {

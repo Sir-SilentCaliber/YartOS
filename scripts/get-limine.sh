@@ -6,5 +6,7 @@ cd "$ROOT"
 if [ ! -d limine ]; then
   git clone --depth=1 --branch=v7.x-binary https://github.com/limine-bootloader/limine.git
 fi
-make -C limine
+# The Replit/Nix environment exports CFLAGS and LDFLAGS for its own tools.
+# Do not leak those flags into Limine's independent host-tool build.
+env -u CFLAGS -u CPPFLAGS -u LDFLAGS make -C limine
 echo "Limine ready at $ROOT/limine"

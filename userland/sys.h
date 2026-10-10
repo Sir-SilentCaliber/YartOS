@@ -122,6 +122,7 @@ enum {
     SYS_DUP2         = 91,
     SYS_SYMLINK      = 92,
     SYS_READLINK     = 93,
+    SYS_GETEUID      = 94,
 };
 
 #define O_RDONLY 0x0
@@ -157,6 +158,7 @@ static inline long waitpid_nohang(long pid, int *status) { return _sc4(SYS_WAITP
 static inline long pipe(int *fds) { return _sc(SYS_PIPE, (long)fds, 0, 0); }
 #define PIPE_WOULD_BLOCK (-2)
 static inline long doas(const char *password) { return _sc(SYS_DOAS, (long)password, 0, 0); }
+static inline long geteuid(void) { return _sc(SYS_GETEUID, 0, 0, 0); }
 static inline long chmod(const char *path, long mode) { return _sc(SYS_CHMOD, (long)path, mode, 0); }
 static inline long drop_priv(void) { return _sc(SYS_DROP, 0, 0, 0); }
 static inline long kill(long pid) { return _sc(SYS_KILL, pid, 0, 0); }

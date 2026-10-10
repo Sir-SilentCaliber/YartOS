@@ -13,6 +13,8 @@ else
   OBJCOPY := $(CROSS)-objcopy
 endif
 AS       := nasm
+HOSTCC   ?= gcc
+HOSTCFLAGS ?= -std=gnu11
 
 KERNEL   := build/yart.elf
 USER_ELF := build/init.elf
@@ -66,14 +68,14 @@ CFLAGS := -std=gnu11 -ffreestanding -fno-stack-protector -fno-stack-check       
           -Ikernel/include -MMD -MP                                              \
           -DYART_VERSION='"0.8.0-max"'
 
-LDFLAGS := -nostdlib -static -m elf_x86_64 -z max-page-size=0x1000 \
+LDFLAGS := -nostdlib -static -m elf_x86_64 -z max-page-size=0x1000 -z noexecstack \
            -T kernel/linker.ld
 
 ASFLAGS := -f elf64 -Ikernel/arch/x86_64/
 
 UCFLAGS := -std=gnu11 -ffreestanding -fno-stack-protector -fPIC -fPIE -msse2 \
            -mno-red-zone -O3 -Wall -Wextra -Iuserland -Ibuild
-ULDFLAGS := -nostdlib -static -pie -m elf_x86_64 -z max-page-size=0x1000 \
+ULDFLAGS := -nostdlib -static -pie -m elf_x86_64 -z max-page-size=0x1000 -z noexecstack \
             -T userland/init.ld
 
 REQUIRED_TOOLS := nasm xorriso git python3
@@ -103,7 +105,7 @@ all: $(KERNEL) $(USER_ELF) $(WM_ELF) build/nyra.elf build/files.elf build/settin
 
 assets: $(KORA_BIN) $(KORA_H) $(WP_BIN) $(CUR_BIN) $(CUR_H)
 
-$(KORA_BIN) $(KORA_H): scripts/gen_assets.py
+$(KORA_BIN) $(KORA_H) &: scripts/gen_assets.py
 	@mkdir -p build
 	@chmod +x scripts/gen_assets.py 2>/dev/null || true
 	python3 scripts/gen_assets.py
@@ -148,7 +150,7 @@ build/start.o: userland/start.c userland/sys.h
 build/init.o: userland/init.c userland/sys.h userland/gfx.h
 	@mkdir -p build
 	$(CC) $(UCFLAGS) -c userland/init.c -o build/init.o
-build/wm_main.o: userland/wm_main.c userland/sys.h
+build/wm_main.o: userland/wm_main.c userland/sys.h userland/wm.h $(KORA_H)
 	@mkdir -p build
 	$(CC) $(UCFLAGS) -c userland/wm_main.c -o build/wm_main.o
 build/theme.o: userland/theme/theme.c userland/theme/theme.h userland/sys.h
@@ -156,17 +158,17 @@ build/theme.o: userland/theme/theme.c userland/theme/theme.h userland/sys.h
 build/wm.o: userland/wm.c userland/wm.h userland/sys.h userland/gfx.h userland/cursors.h userland/theme/theme.h userland/jpeg_enc.h $(KORA_H) $(CUR_H) assets
 	@mkdir -p build
 	$(CC) $(UCFLAGS) -c userland/wm.c -o build/wm.o
-build/wm_damage.o: userland/wm_damage.c userland/wm.h
+build/wm_damage.o: userland/wm_damage.c userland/wm.h $(KORA_H)
 	$(CC) $(UCFLAGS) -c userland/wm_damage.c -o build/wm_damage.o
-build/wm_windows.o: userland/wm_windows.c userland/wm.h
+build/wm_windows.o: userland/wm_windows.c userland/wm.h $(KORA_H)
 	$(CC) $(UCFLAGS) -c userland/wm_windows.c -o build/wm_windows.o
-build/wm_dock.o: userland/wm_dock.c userland/wm.h
+build/wm_dock.o: userland/wm_dock.c userland/wm.h $(KORA_H)
 	$(CC) $(UCFLAGS) -c userland/wm_dock.c -o build/wm_dock.o
-build/wm_panel.o: userland/wm_panel.c userland/wm.h
+build/wm_panel.o: userland/wm_panel.c userland/wm.h $(KORA_H)
 	$(CC) $(UCFLAGS) -c userland/wm_panel.c -o build/wm_panel.o
-build/wm_launcher.o: userland/wm_launcher.c userland/wm.h
+build/wm_launcher.o: userland/wm_launcher.c userland/wm.h $(KORA_H)
 	$(CC) $(UCFLAGS) -c userland/wm_launcher.c -o build/wm_launcher.o
-build/wm_overlays.o: userland/wm_overlays.c userland/wm.h
+build/wm_overlays.o: userland/wm_overlays.c userland/wm.h $(KORA_H)
 	$(CC) $(UCFLAGS) -c userland/wm_overlays.c -o build/wm_overlays.o
 build/gfx.o: userland/gfx.c userland/gfx.h userland/sys.h $(KORA_H) assets
 	@mkdir -p build
@@ -474,38 +476,38 @@ HOST_IS_LINUX := $(shell uname -s | grep -qi linux && echo 1 || echo 0)
 # verifying the Linux-ABI layer.
 initrd_root/bin/test_linux: tests/test_linux.S
 	@mkdir -p initrd_root/bin
-	gcc -nostdlib -static -no-pie -o $@ tests/test_linux.S
+	$(HOSTCC) $(HOSTCFLAGS) -nostdlib -static -no-pie -o $@ tests/test_linux.S
 	@chmod 755 $@
 
 # threads (clone+futex) + sockets + execve test, and its execve target
 initrd_root/bin/test_linux2: tests/test_linux2.S
 	@mkdir -p initrd_root/bin
-	gcc -nostdlib -static -no-pie -o $@ tests/test_linux2.S
+	$(HOSTCC) $(HOSTCFLAGS) -nostdlib -static -no-pie -o $@ tests/test_linux2.S
 	@chmod 755 $@
 
 initrd_root/bin/test_echo: tests/test_echo.S
 	@mkdir -p initrd_root/bin
-	gcc -nostdlib -static -no-pie -o $@ tests/test_echo.S
+	$(HOSTCC) $(HOSTCFLAGS) -nostdlib -static -no-pie -o $@ tests/test_echo.S
 	@chmod 755 $@
 
 initrd_root/bin/test_tls: tests/test_tls.S
 	@mkdir -p initrd_root/bin
-	gcc -nostdlib -static -no-pie -o $@ tests/test_tls.S
+	$(HOSTCC) $(HOSTCFLAGS) -nostdlib -static -no-pie -o $@ tests/test_tls.S
 	@chmod 755 $@
 
 # DYNAMIC LINKING demo: a real dynamic linker (interpreter) + shared lib +
 # a dynamically-linked program.  All are genuine Linux ELF objects.
 initrd_root/lib/ld-yart.so: tests/ld-yart.c
 	@mkdir -p initrd_root/lib
-	gcc -shared -fPIC -nostdlib -Wl,-e,_start -o $@ tests/ld-yart.c
+	$(HOSTCC) $(HOSTCFLAGS) -shared -fPIC -nostdlib -Wl,-e,_start -o $@ tests/ld-yart.c
 
 initrd_root/lib/libgreet.so: tests/libgreet.c
 	@mkdir -p initrd_root/lib
-	gcc -shared -fPIC -nostdlib -o $@ tests/libgreet.c
+	$(HOSTCC) $(HOSTCFLAGS) -shared -fPIC -nostdlib -o $@ tests/libgreet.c
 
 initrd_root/bin/dynhello: tests/dynhello.c initrd_root/lib/ld-yart.so initrd_root/lib/libgreet.so
 	@mkdir -p initrd_root/bin
-	gcc -nostdlib -pie -fPIC -Wl,--dynamic-linker=/lib/ld-yart.so \
+	$(HOSTCC) $(HOSTCFLAGS) -nostdlib -pie -fPIC -Wl,--dynamic-linker=/lib/ld-yart.so \
 	    -o $@ tests/dynhello.c -L initrd_root/lib -lgreet
 	@chmod 755 $@
 
@@ -513,33 +515,33 @@ initrd_root/bin/dynhello: tests/dynhello.c initrd_root/lib/ld-yart.so initrd_roo
 # variables (exercises __tls_get_addr + DTPMOD64/DTPOFF64 + static TLS).
 initrd_root/lib/libtls.so: tests/libtls.c
 	@mkdir -p initrd_root/lib
-	gcc -shared -fPIC -nostdlib -o $@ tests/libtls.c
+	$(HOSTCC) $(HOSTCFLAGS) -shared -fPIC -nostdlib -o $@ tests/libtls.c
 
 initrd_root/bin/tlsdemo: tests/tlsdemo.c initrd_root/lib/ld-yart.so initrd_root/lib/libtls.so
 	@mkdir -p initrd_root/bin
-	gcc -nostdlib -pie -fPIC -Wl,--dynamic-linker=/lib/ld-yart.so \
+	$(HOSTCC) $(HOSTCFLAGS) -nostdlib -pie -fPIC -Wl,--dynamic-linker=/lib/ld-yart.so \
 	    -o $@ tests/tlsdemo.c -L initrd_root/lib -ltls
 	@chmod 755 $@
 
 # IFUNC demo: a .so exporting an STT_GNU_IFUNC symbol (the resolver path).
 initrd_root/lib/libifunc.so: tests/libifunc.c
 	@mkdir -p initrd_root/lib
-	gcc -shared -fPIC -nostdlib -o $@ tests/libifunc.c
+	$(HOSTCC) $(HOSTCFLAGS) -shared -fPIC -nostdlib -o $@ tests/libifunc.c
 
 initrd_root/bin/ifuncdemo: tests/ifuncdemo.c initrd_root/lib/ld-yart.so initrd_root/lib/libifunc.so
 	@mkdir -p initrd_root/bin
-	gcc -nostdlib -pie -fPIC -Wl,--dynamic-linker=/lib/ld-yart.so \
+	$(HOSTCC) $(HOSTCFLAGS) -nostdlib -pie -fPIC -Wl,--dynamic-linker=/lib/ld-yart.so \
 	    -o $@ tests/ifuncdemo.c -L initrd_root/lib -lifunc
 	@chmod 755 $@
 
 # COPY-relocation demo (a .so referencing a global defined in the program).
 initrd_root/lib/libcopy.so: tests/libcopy.c
 	@mkdir -p initrd_root/lib
-	gcc -shared -fPIC -nostdlib -o $@ tests/libcopy.c
+	$(HOSTCC) $(HOSTCFLAGS) -shared -fPIC -nostdlib -o $@ tests/libcopy.c
 
 initrd_root/bin/copydemo: tests/copydemo.c initrd_root/lib/ld-yart.so initrd_root/lib/libcopy.so
 	@mkdir -p initrd_root/bin
-	gcc -nostdlib -pie -fPIC -Wl,--dynamic-linker=/lib/ld-yart.so \
+	$(HOSTCC) $(HOSTCFLAGS) -nostdlib -pie -fPIC -Wl,--dynamic-linker=/lib/ld-yart.so \
 	    -o $@ tests/copydemo.c -L initrd_root/lib -lcopy
 	@chmod 755 $@
 

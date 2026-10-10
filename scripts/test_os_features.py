@@ -5,7 +5,6 @@ from PIL import Image
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.makedirs(f"{ROOT}/runlogs", exist_ok=True)
 
-subprocess.run(["pkill", "-9", "qemu-system"], capture_output=True)
 time.sleep(0.3)
 
 for p in ["/tmp/q.sock", "/tmp/qm.sock"]:
@@ -120,10 +119,10 @@ type_str("apk list\n")
 time.sleep(1.5)
 shot("shot03_apk_list")
 
-# Test apk add discord
-print("[*] Running apk add discord...")
+# Verify an unprivileged install attempt fails closed.
+print("[*] Checking apk add discord privilege gate...")
 type_str("apk add discord\n")
-time.sleep(3.5)
+time.sleep(1.0)
 shot("shot04_apk_discord")
 
 # Run calc

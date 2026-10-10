@@ -48,11 +48,12 @@ docker run --rm -v "$PWD":/src yartos make -j"$(nproc)" iso
 
 Verify the tree has no stray build artifacts: `make portable-check`.
 
-## Linux compatibility layer (static + dynamic ELF)
+## Experimental Linux compatibility layer
 
-YartOS runs **genuine Linux x86_64 ELF binaries** through a translated
-syscall ABI (`kernel/arch/x86_64/syscall.c`) and a from-scratch **dynamic
-linker** (`tests/ld-yart.c`, installed as `/lib/ld-yart.so`):
+YartOS has an experimental Linux x86_64 syscall/ELF compatibility layer
+(`kernel/arch/x86_64/syscall.c`) and a small dynamic-linker test
+(`tests/ld-yart.c`). It is intended for selected test binaries, not as a
+complete Linux environment:
 
 - **Static ET_EXEC** binaries — file/console/process syscalls, `stat`,
   `getdents64`, `uname`, `mmap`, `writev`, `clock_gettime`, the auxiliary
@@ -64,12 +65,26 @@ linker** (`tests/ld-yart.c`, installed as `/lib/ld-yart.so`):
 Prove it from the terminal (Nyra): `linuxtest`, `linuxtest2`, `dynhello`,
 `tlstest`.  Honest limit: the linker resolves the common relocations + TLS
 base; glibc/musl-class TLS *data* relocations and IFUNC are the next step.
+This is not enough to run Alpine's package ecosystem. Alpine packages expect
+a Linux-compatible kernel ABI, musl runtime, device/filesystem interfaces,
+and often threads and graphics libraries. An Alpine root filesystem alone
+does not supply those pieces.
 
-## Package manager (apk)
+## Native package manager
 
-`apk add/del/list/search/info` installs native `.ypkg` packages; GUI packages
-drop a `/usr/share/applications/*.desktop` entry the compositor auto-scans,
-so installed apps appear in the Super launcher (`apk add calc` → press Super).
+The `apk` command is YartOS's own package tool, not Alpine's `apk-tools`.
+It reads custom `.ypkg` archives containing native YartOS binaries; it cannot
+install Alpine `.apk` archives or ordinary Linux applications. The standard
+desktop binaries are already bundled into the boot image.
+
+Installing or removing packages requires an already-authorized root process.
+Automatic password elevation was disabled because the previous implementation
+embedded the factory demo password. The desktop shell does not yet provide a
+secure interactive privileged installer, so ordinary users cannot currently
+run `apk add` or `apk del`. The configured remote endpoint
+(`10.0.2.2:8000`) is a QEMU host-side development test server, not a public
+package repository; packages are not signed. Do not treat this as a secure
+software-update channel.
 
 ## Layout
 

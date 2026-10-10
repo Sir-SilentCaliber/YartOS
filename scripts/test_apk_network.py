@@ -3,7 +3,6 @@ import socket, time, subprocess, os, json, http.server, threading
 from PIL import Image
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-subprocess.run(["pkill", "-9", "qemu-system"], capture_output=True)
 time.sleep(0.3)
 try:
     os.unlink(f"{ROOT}/runlogs/serial.log")
@@ -164,11 +163,12 @@ type_str("apk list\n")
 time.sleep(2.5)
 shot("shot_1_apk_list")
 
-# Test apk add discord (downloads from 10.0.2.2:8000/repo/discord.ypkg)
-print("[*] Running apk add discord...")
+# Verify the unprivileged package manager does not elevate or contact the
+# development-only repository.
+print("[*] Checking apk add discord privilege gate...")
 type_str("apk add discord\n")
-time.sleep(8.0)
-shot("shot_2_apk_discord_installed")
+time.sleep(1.0)
+shot("shot_2_apk_discord_blocked")
 
 # Run the installed package /bin/discord
 print("[*] Running installed /bin/discord...")

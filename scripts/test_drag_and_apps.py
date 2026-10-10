@@ -3,7 +3,6 @@ import socket, time, subprocess, os, json, http.server, threading
 from PIL import Image
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-subprocess.run(["pkill", "-9", "qemu-system"], capture_output=True)
 time.sleep(0.3)
 try:
     os.unlink(f"{ROOT}/runlogs/serial.log")

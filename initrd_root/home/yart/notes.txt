@@ -1,0 +1,6 @@
+# Notes
+
+- the editor saves with Ctrl+S, quits with Ctrl+Q
+- arrow keys navigate, backspace deletes, enter inserts a newline
+- the terminal does real syscalls (open/read/write/mkdir/unlink/...)
+- the file manager is double-click-to-open

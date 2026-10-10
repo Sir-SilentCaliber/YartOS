@@ -1,0 +1,201 @@
+#pragma once
+#include <yart/types.h>
+#include <yart/fs.h>
+#include <yart/mm.h>
+#include <yart/hal.h>   /* cpu_regs_t */
+#include <yart/drivers.h> /* mouse_event_t (per-task input queues) */
+typedef struct task task_t;
+struct cpu_local_s;
+typedef struct cpu_local_s cpu_local_t;
+
+#define TASK_NAME_LEN 16
+#define MAX_FD 64
+#define KSTACK_SIZE KB(16)
+#define TASK_KBDQ   64          /* per-task keyboard ring (input fanout) */
+#define TASK_MOUSEQ 16          /* per-task mouse ring                   */
+
+enum {
+    FD_TYPE_FILE = 0,
+    FD_TYPE_PIPE = 1,
+    FD_TYPE_EVENTFD = 2,
+    FD_TYPE_EPOLL = 3,
+    FD_TYPE_PTY_MASTER = 4,
+    FD_TYPE_PTY_SLAVE = 5,
+    FD_TYPE_DEV_NULL = 6,
+    FD_TYPE_DEV_ZERO = 7,
+    FD_TYPE_DEV_RANDOM = 8,
+    FD_TYPE_DEV_TTY = 9
+};
+
+typedef struct {
+    vnode_t *vn;
+    u64      pos;
+    u32      flags;
+    bool     in_use;
+    /* pipes: when is_pipe, vn is NULL and `pipe` owns the buffer */
+    bool     is_pipe;
+    bool     pipe_is_read_end;   /* true = read end, false = write end */
+    struct yart_pipe *pipe;
+    u8       type;               /* FD_TYPE_* */
+    u32      pty_id;
+    u64      eventfd_val;
+    void    *epoll_data;
+} fd_entry_t;
+
+/* Kernel pipe: a single fixed ring buffer with end-closed tracking.
+ * Reads/writes return -2 (EAGAIN-ish "would block") when the buffer is
+ * empty/full - userland cooperatively sleeps and retries.  The struct
+ * is refcounted per open fd (fork duplicates fds, so refs can exceed 2). */
+#define PIPE_BUF_SIZE 4096
+typedef struct yart_pipe {
+    u8   buf[PIPE_BUF_SIZE];
+    u32  head, tail;      /* ring indices (count = (head - tail) mod SZ) */
+    u32  count;
+    int  refs;            /* open fds referencing this pipe               */
+    int  read_ends;       /* open read-end fds                            */
+    int  write_ends;      /* open write-end fds                           */
+} yart_pipe_t;
+
+typedef enum { TASK_READY, TASK_RUNNING, TASK_BLOCKED, TASK_ZOMBIE,
+               TASK_STOPPED } task_state_t;   /* STOPPED = SIGSTOP'd (job control) */
+
+/* One process.  The scheduler saves/restores a full cpu_regs_t frame on each
+ * task's private kernel stack; the frame is the one the ISR pushed, so a
+ * switch is just "remember which frame, restore another, iretq". */
+typedef struct task {
+    u32            pid, ppid;
+    char           name[TASK_NAME_LEN];
+    task_state_t   state;
+    int            exit_status;
+    bool           is_user;        /* false = kernel/desktop task        */
+    bool           linux_abi;      /* runs a LINUX-ABI binary (foreign    */
+                                   /* ELF: ET_EXEC, Linux syscall numbers */
+                                   /* translated in syscall_handler)      */
+    u64            linux_fs_base;  /* arch_prctl(ARCH_SET_FS) value       */
+                                   /* (stored; %fs base not yet applied — */
+                                   /* real TLS/errno is deferred)          */
+    u64           *pml4;           /* NULL = kernel page tables          */
+    u32            uid;            /* real user id                       */
+    u32            euid;           /* effective uid (doas can make it 0)  */
+    u32            gid;            /* primary group id                         */
+    u32            supp_gids[8];   /* supplementary groups                     */
+    u8             supp_gid_count;
+    u16            umask;          /* file-creation mask (022 default)         */
+    bool           elev_allowed;   /* may elevate to root (admin user)    */
+    char           account[32];    /* account name for password checks    */
+    u64            kstack_top;     /* RSP0 for ring3->ring0 entries      */
+    u64            saved_rsp;      /* cpu_regs_t frame on the kstack     */
+    u8             fpu_area[512] __attribute__((aligned(16)));  /* FXSAVE */
+    u64            mmap_next;   /* next free VA for mmap() (per process)   */
+    u64            last_sched;  /* pit_ticks() when last switched to (watchdog
+                                   uses this to spot a READY-but-starved task) */
+    u64            brk;         /* program break (top of the data segment)     */
+    u64            brk_base;    /* bottom of the heap region                   */
+    u64            sig_handlers[32]; /* per-signal handler VAs (0 = default)   */
+    u64            sig_restorer[32]; /* SA_RESTORER trampoline addresses        */
+    u64            sig_flags[32];    /* SA_* flags                              */
+    u64            sig_pending;     /* pending signal bitmask (1<<sig)         */
+    u64            sig_blocked;     /* blocked signal bitmask                   */
+    u64            clear_child_tid; /* set_tid_address / CLONE_CHILD_CLEARTID  */
+    u64            set_child_tid;   /* CLONE_CHILD_SETTID                      */
+    u64            robust_list_head;/* set_robust_list                         */
+    u64            sigaltstack_sp;  /* sigaltstack                             */
+    u64            sigaltstack_size;
+    u32            sigaltstack_flags;
+    u32            pgid;            /* process group ID                        */
+    u32            sid;             /* session ID                              */
+    u64            mem_pages;      /* physical pages this task currently uses */
+    u64            mem_limit_pages;/* cap (default 256 MiB)                  */
+    fd_entry_t     fds[MAX_FD];
+    vnode_t       *cwd;
+    bool           waiting;        /* blocked on waitpid (reserved)      */
+    u32            wait_pid;
+    /* Per-task input queues.  The kernel fanout (sys_input_kbd/mouse)
+     * pushes keyboard events to the focused task (or the wm) and mouse
+     * events to BOTH the wm (cursor movement) and the focused task. */
+    int            kbd_q[TASK_KBDQ];
+    volatile u32   kbd_qh, kbd_qt;
+    mouse_event_t  mouse_q[TASK_MOUSEQ];
+    volatile u32   m_qh, m_qt;
+    user_region_t  regions[MAX_USER_REGIONS];   /* per-process demand map */
+    int            region_count;
+    /* SMP scheduling linkage.  `next` chains the GLOBAL all-tasks list
+     * (sched_find/waitpid/reap); `rq_next` chains THIS CPU's ready queue.
+     * They MUST be separate: queue ops rewire rq_next and would corrupt the
+     * global list if they shared one pointer. */
+    struct cpu_local_s *rq_cpu;  /* which CPU's ready queue this task is on
+                                    (NULL = not queued)                   */
+    struct task   *rq_next;
+    struct task   *next;
+} task_t;
+
+void    sched_init(void);
+task_t *sched_tasks(void);          /* head of the global all-tasks list   */
+void sched_dump_sleepers(void);     /* debug: dump the sleep queue          */
+void sched_kick_starved(task_t *t); /* self-heal a lost wake (requeue+IPI)  */
+task_t *sched_current(void);
+/* OOM killer (called from pmm_alloc_page when RAM is exhausted): kill the
+ * user task holding the most physical pages so the OS survives. */
+int     sched_oom_kill_one(void);
+void    oom_selftest(void);
+bool    sched_current_is_user(void);
+u32     sched_current_uid(void);    /* 0 when no task (boot/root) */
+u32     sched_current_euid(void);
+u32     sched_current_egid(void);
+int     sched_current_groups(u32 *out, int max);  /* [primary, supp...]     */
+u16     sched_current_umask(void);
+u16     sched_set_umask(u16 m);                    /* returns old            */
+/* per-task memory accounting (enforced by the VMM) */
+u64     sched_mem_used(void);
+u64     sched_mem_limit(void);
+void    sched_charge_pages(i64 delta);   /* +reserve -release  */
+
+task_t *sched_create_user(const char *name, u64 entry, u64 user_rsp,
+                          u64 *pml4, user_region_t *regions, int nregions);
+task_t *sched_fork(task_t *parent, cpu_regs_t *frame);   /* NULL on error */
+
+u64     sched_tick(u64 current_rsp);      /* timer IRQ: maybe preempt     */
+u64     sched_after_isr(u64 current_rsp); /* syscall/fault: maybe switch  */
+u64     sched_fault_recover(u64 rsp);      /* corrupt-frame fault: drop ctx */
+void    sched_yield(void);                /* cooperative hand-off         */
+void    sched_exit(int status);           /* zombie + wake parent; no ret */
+void    sched_idle_sleep(void);           /* idle hand-off then hlt       */
+/* SMP: an AP runs this when it has a ready task on ITS runqueue.
+ * Returns true if it found + resumed work.  The AP calls it in its loop. */
+bool    sched_ap_try_work(cpu_local_t *c);
+void    sched_queue_ap_work(cpu_local_t *c, void (*fn)(void *), void *arg);
+int     sched_migrate_to_ap(cpu_local_t *c, task_t *t);
+void    sched_ap_steal(cpu_local_t *c);   /* idle AP: steal work (LB) */
+/* smp.c: least-loaded online CPU (AP) for a new task; NULL if no APs. */
+cpu_local_t *smp_least_loaded(void);
+cpu_local_t *smp_get_ap_area(u32 idx);   /* per-AP area by cpu id (1..7) */
+int     sched_waitpid(u32 pid, int *status_out, int flags);  /* WNOHANG=1 */
+void    sched_reap_orphans(void);
+/* SIGKILL: mark another task dead (exit_status -9); it never runs again
+ * and is reaped by its parent or the orphan reaper.  Returns 0 on success,
+ * -1 if the pid is invalid / not killable. */
+int     sched_kill(u32 pid);
+int     sched_signal(u32 pid, u32 sig);   /* deliver a signal (SIGKILL=9) */
+u32     sched_next_pid(void);
+task_t *sched_find(u32 pid);
+
+/* Called by the VMM: claim the boot-time reserved user regions for a task
+ * (they were reserved before the task existed). */
+void    vmm_take_boot_regions(task_t *t);
+void    sched_sleep_ms(u32 ms);        /* block the current task for ms   */
+
+/* ---- Linux ABI: futex (basic WAIT/WAKE) + shared-PML4 thread clone ----
+ * futex: the Linux fast userspace mutex.  WAIT blocks the current task on a
+ * userspace u32 address; WAKE unblocks up to `max` waiters on that address.
+ * clone(CLONE_VM|CLONE_THREAD|...): a THREAD shares the parent's address
+ * space (same PML4, refcounted so the last thread to exit frees it) and
+ * resumes at the same instruction with a new stack + TLS base. */
+void    sched_futex_wait(u64 addr);
+int     sched_futex_wake(u64 addr, int max);
+int     sched_futex_requeue(u64 uaddr1, u64 uaddr2, int max_wake, int max_requeue);
+task_t *sched_clone_thread(task_t *parent, cpu_regs_t *frame,
+                           u64 child_stack, u64 tls, u64 ptid, u64 ctid, u64 flags);
+void    sched_pml4_ref(u64 *pml4);                 /* thread shares pml4   */
+int     sched_pml4_unref(u64 *pml4);               /* 1 = last ref (free it)*/
+bool    sched_pml4_is_shared(u64 *pml4);           /* shared with a thread  */
+void    sched_exit_group(u64 *pml4, int status);   /* kill all threads (TGID)*/

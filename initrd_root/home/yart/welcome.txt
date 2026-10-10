@@ -1,0 +1,13 @@
+Welcome to Yart OS.
+
+This file lives in /home/yart/welcome.txt and was loaded from the initrd
+at boot.  Open a terminal and try:
+
+    ls
+    cat welcome.txt
+    pwd
+    cd /etc
+    ls
+    nano /home/yart/notes.txt
+
+Press F1 anywhere to open the application drawer.
